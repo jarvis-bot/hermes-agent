@@ -1132,6 +1132,38 @@ class Event:
 # Schema
 # ---------------------------------------------------------------------------
 
+_IDEMPOTENCY_NAMED_INDEX = "idx_tasks_idempotency"
+_IDEMPOTENCY_DEFAULT_INDEX = "idx_tasks_idempotency_default"
+_IDEMPOTENCY_NAMED_PREDICATE = (
+    "tenant IS NOT NULL AND idempotency_key IS NOT NULL"
+)
+_IDEMPOTENCY_DEFAULT_PREDICATE = (
+    "tenant IS NULL AND idempotency_key IS NOT NULL"
+)
+_IDEMPOTENCY_DELETE_TRIGGER = "trg_tasks_protect_idempotency_owner_delete"
+_IDEMPOTENCY_DELETE_PREDICATE = "OLD.idempotency_key IS NOT NULL"
+_IDEMPOTENCY_DELETE_MESSAGE = "permanent idempotency owner cannot be deleted"
+_IDEMPOTENCY_UPDATE_TRIGGER = "trg_tasks_protect_idempotency_owner_update"
+_IDEMPOTENCY_UPDATE_PREDICATE = (
+    "((OLD.idempotency_key IS NOT NULL AND "
+    "(NEW.idempotency_key IS NOT OLD.idempotency_key OR "
+    "NEW.tenant IS NOT OLD.tenant)) OR "
+    "(NEW.idempotency_key IS NOT NULL AND EXISTS "
+    "(SELECT 1 FROM tasks WHERE tasks.id IS NOT NEW.id AND "
+    "tasks.tenant IS NEW.tenant AND "
+    "tasks.idempotency_key IS NEW.idempotency_key)))"
+)
+_IDEMPOTENCY_UPDATE_MESSAGE = "keyed task has immutable idempotency identity"
+_IDEMPOTENCY_REUSE_TRIGGER = "trg_tasks_protect_idempotency_owner_replacement"
+_IDEMPOTENCY_REUSE_PREDICATE = (
+    "(EXISTS (SELECT 1 FROM tasks WHERE tasks.id IS NEW.id AND "
+    "tasks.idempotency_key IS NOT NULL) OR "
+    "(NEW.idempotency_key IS NOT NULL AND EXISTS "
+    "(SELECT 1 FROM tasks WHERE tasks.tenant IS NEW.tenant AND "
+    "tasks.idempotency_key IS NEW.idempotency_key)))"
+)
+_IDEMPOTENCY_REUSE_MESSAGE = "idempotency identity already has a permanent owner"
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
     id                   TEXT PRIMARY KEY,
@@ -2196,7 +2228,20 @@ def connect(
                     # threads from racing through the additive ALTER TABLE pass with
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
-                    _migrate_add_optional_columns(conn)
+                    # Connections run in autocommit mode.  Explicitly reserve the
+                    # writer lock before inspecting legacy rows, and keep every
+                    # additive migration (especially DROP/CREATE of the uniqueness
+                    # index) in one crash-atomic transaction.  A concurrent writer
+                    # can therefore run only before the scan or after the UNIQUE
+                    # index is visible; there is no unprotected intermediate state.
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        _migrate_add_optional_columns(conn)
+                        conn.execute("COMMIT")
+                    except BaseException:
+                        if conn.in_transaction:
+                            conn.execute("ROLLBACK")
+                        raise
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -2421,9 +2466,49 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # is cheap thanks to ``IF NOT EXISTS`` and stays correct on fresh DBs
     # (where the columns already exist from SCHEMA_SQL).
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)"
-    )
+    if not atomic_idempotency_capability(conn)["supported"]:
+        named_predicate = _IDEMPOTENCY_NAMED_PREDICATE
+        default_predicate = _IDEMPOTENCY_DEFAULT_PREDICATE
+        duplicate_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM (SELECT 1 FROM tasks "
+            "WHERE idempotency_key IS NOT NULL"
+            " GROUP BY tenant, idempotency_key HAVING COUNT(*) > 1)"
+        ).fetchone()["n"]
+        if duplicate_count:
+            raise sqlite3.IntegrityError(
+                "cannot enforce permanent Kanban idempotency: duplicate tasks "
+                f"exist in {int(duplicate_count)} tenant-scoped key(s); re-key "
+                "duplicates explicitly, then retry migration"
+            )
+        conn.execute(f"DROP INDEX IF EXISTS {_IDEMPOTENCY_NAMED_INDEX}")
+        conn.execute(f"DROP INDEX IF EXISTS {_IDEMPOTENCY_DEFAULT_INDEX}")
+        conn.execute(
+            f"CREATE UNIQUE INDEX {_IDEMPOTENCY_NAMED_INDEX} "
+            f"ON tasks(tenant, idempotency_key) WHERE {named_predicate}"
+        )
+        conn.execute(
+            f"CREATE UNIQUE INDEX {_IDEMPOTENCY_DEFAULT_INDEX} "
+            f"ON tasks(idempotency_key) WHERE {default_predicate}"
+        )
+        conn.execute(f"DROP TRIGGER IF EXISTS {_IDEMPOTENCY_DELETE_TRIGGER}")
+        conn.execute(
+            f"CREATE TRIGGER {_IDEMPOTENCY_DELETE_TRIGGER} "
+            f"BEFORE DELETE ON tasks WHEN {_IDEMPOTENCY_DELETE_PREDICATE} "
+            f"BEGIN SELECT RAISE(ABORT, '{_IDEMPOTENCY_DELETE_MESSAGE}'); END"
+        )
+        conn.execute(f"DROP TRIGGER IF EXISTS {_IDEMPOTENCY_UPDATE_TRIGGER}")
+        conn.execute(
+            f"CREATE TRIGGER {_IDEMPOTENCY_UPDATE_TRIGGER} "
+            "BEFORE UPDATE OF tenant, idempotency_key ON tasks "
+            f"WHEN {_IDEMPOTENCY_UPDATE_PREDICATE} "
+            f"BEGIN SELECT RAISE(ABORT, '{_IDEMPOTENCY_UPDATE_MESSAGE}'); END"
+        )
+        conn.execute(f"DROP TRIGGER IF EXISTS {_IDEMPOTENCY_REUSE_TRIGGER}")
+        conn.execute(
+            f"CREATE TRIGGER {_IDEMPOTENCY_REUSE_TRIGGER} "
+            f"BEFORE INSERT ON tasks WHEN {_IDEMPOTENCY_REUSE_PREDICATE} "
+            f"BEGIN SELECT RAISE(ABORT, '{_IDEMPOTENCY_REUSE_MESSAGE}'); END"
+        )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
@@ -2473,7 +2558,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
     ).fetchone() is not None
     if runs_exist:
-        with write_txn(conn):
+        # First-connect migrations now reserve one outer BEGIN IMMEDIATE so the
+        # uniqueness upgrade is crash/race atomic.  Preserve direct-call safety
+        # for tests and maintenance callers without nesting SQLite transactions.
+        transaction = (
+            contextlib.nullcontext(conn) if conn.in_transaction else write_txn(conn)
+        )
+        with transaction:
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
                 "       max_runtime_seconds, last_heartbeat_at, started_at "
@@ -2629,7 +2720,9 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
     if not drifted:
         return
 
-    conn.execute("BEGIN IMMEDIATE")
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
     try:
         for table in drifted:
             create_sql, index_sqls = _REBUILD_SPECS[table]
@@ -2658,12 +2751,14 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
             conn.execute(f"DROP TABLE {table}_legacy")
             for index_sql in index_sqls:
                 conn.execute(index_sql)
-        conn.execute("COMMIT")
+        if owns_transaction:
+            conn.execute("COMMIT")
     except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except sqlite3.OperationalError:
-            pass
+        if owns_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
         raise
 
 
@@ -2804,6 +2899,245 @@ def _claimer_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+def _canonical_index_predicate(index_sql: str) -> tuple[str, ...] | None:
+    """Tokenize a partial-index predicate for strict, formatting-neutral comparison."""
+    match = re.search(r"\bwhere\b(?P<predicate>.*)\Z", index_sql, flags=re.IGNORECASE)
+    if match is None:
+        return None
+    predicate = match.group("predicate").strip().removesuffix(";").strip()
+    token_pattern = re.compile(
+        r"\s+|'(?:''|[^'])*'|!=|<>|[A-Za-z_][A-Za-z0-9_]*|[()]"
+    )
+    tokens: list[str] = []
+    position = 0
+    while position < len(predicate):
+        token = token_pattern.match(predicate, position)
+        if token is None:
+            return None
+        value = token.group(0)
+        position = token.end()
+        if value.isspace():
+            continue
+        normalized = value.lower()
+        tokens.append("!=" if normalized == "<>" else normalized)
+    return tuple(tokens)
+
+
+def _canonical_trigger_sql(sql: str) -> tuple[str, ...] | None:
+    """Tokenize the trigger subset we install, preserving structural punctuation."""
+    token_pattern = re.compile(
+        r"\s+|'(?:''|[^'])*'|[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[().,;]"
+    )
+    tokens: list[str] = []
+    position = 0
+    while position < len(sql):
+        token = token_pattern.match(sql, position)
+        if token is None:
+            return None
+        value = token.group(0)
+        position = token.end()
+        if not value.isspace() and value != ";":
+            tokens.append(value.lower())
+    return tuple(tokens)
+
+
+def _deletion_protection_capability(
+    conn: sqlite3.Connection,
+) -> tuple[dict[str, Any], bool]:
+    expected_sql = (
+        f"CREATE TRIGGER {_IDEMPOTENCY_DELETE_TRIGGER} "
+        f"BEFORE DELETE ON tasks WHEN {_IDEMPOTENCY_DELETE_PREDICATE} "
+        f"BEGIN SELECT RAISE(ABORT, '{_IDEMPOTENCY_DELETE_MESSAGE}'); END"
+    )
+    expected_tokens = _canonical_trigger_sql(expected_sql)
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+        (_IDEMPOTENCY_DELETE_TRIGGER,),
+    ).fetchone()
+    verified = bool(
+        expected_tokens is not None
+        and row is not None
+        and _canonical_trigger_sql(str(row["sql"] or "")) == expected_tokens
+    )
+    return {
+        "name": _IDEMPOTENCY_DELETE_TRIGGER,
+        "timing": "before",
+        "event": "delete",
+        "table": "tasks",
+        "predicate": _IDEMPOTENCY_DELETE_PREDICATE,
+        "action": "abort",
+        "message": _IDEMPOTENCY_DELETE_MESSAGE,
+        "verified": verified,
+    }, verified
+
+
+def _identity_update_protection_capability(
+    conn: sqlite3.Connection,
+) -> tuple[dict[str, Any], bool]:
+    expected_sql = (
+        f"CREATE TRIGGER {_IDEMPOTENCY_UPDATE_TRIGGER} "
+        "BEFORE UPDATE OF tenant, idempotency_key ON tasks "
+        f"WHEN {_IDEMPOTENCY_UPDATE_PREDICATE} "
+        f"BEGIN SELECT RAISE(ABORT, '{_IDEMPOTENCY_UPDATE_MESSAGE}'); END"
+    )
+    expected_tokens = _canonical_trigger_sql(expected_sql)
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+        (_IDEMPOTENCY_UPDATE_TRIGGER,),
+    ).fetchone()
+    verified = bool(
+        expected_tokens is not None
+        and row is not None
+        and _canonical_trigger_sql(str(row["sql"] or "")) == expected_tokens
+    )
+    return {
+        "name": _IDEMPOTENCY_UPDATE_TRIGGER,
+        "timing": "before",
+        "event": "update",
+        "table": "tasks",
+        "predicate": _IDEMPOTENCY_UPDATE_PREDICATE,
+        "action": "abort",
+        "message": _IDEMPOTENCY_UPDATE_MESSAGE,
+        "verified": verified,
+    }, verified
+
+
+def _identity_reuse_protection_capability(
+    conn: sqlite3.Connection,
+) -> tuple[dict[str, Any], bool]:
+    expected_sql = (
+        f"CREATE TRIGGER {_IDEMPOTENCY_REUSE_TRIGGER} "
+        f"BEFORE INSERT ON tasks WHEN {_IDEMPOTENCY_REUSE_PREDICATE} "
+        f"BEGIN SELECT RAISE(ABORT, '{_IDEMPOTENCY_REUSE_MESSAGE}'); END"
+    )
+    expected_tokens = _canonical_trigger_sql(expected_sql)
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+        (_IDEMPOTENCY_REUSE_TRIGGER,),
+    ).fetchone()
+    verified = bool(
+        expected_tokens is not None
+        and row is not None
+        and _canonical_trigger_sql(str(row["sql"] or "")) == expected_tokens
+    )
+    return {
+        "name": _IDEMPOTENCY_REUSE_TRIGGER,
+        "timing": "before",
+        "event": "insert",
+        "table": "tasks",
+        "predicate": _IDEMPOTENCY_REUSE_PREDICATE,
+        "action": "abort",
+        "message": _IDEMPOTENCY_REUSE_MESSAGE,
+        "verified": verified,
+    }, verified
+
+
+def _index_capability(conn, index_rows, *, name, columns, predicate):
+    row = index_rows.get(name)
+    actual_columns = (
+        [item["name"] for item in conn.execute(f"PRAGMA index_info({name})")]
+        if row is not None else []
+    )
+    sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,)
+    ).fetchone()
+    actual = _canonical_index_predicate(str(sql_row["sql"] or "")) if sql_row else None
+    expected = _canonical_index_predicate(f"WHERE {predicate}")
+    unique = bool(row is not None and row["unique"])
+    partial = bool(row is not None and row["partial"])
+    exact = unique and partial and actual_columns == columns and actual == expected
+    return {
+        "name": name,
+        "unique": unique,
+        "partial": partial,
+        "columns": actual_columns,
+        "predicate": predicate if actual == expected else None,
+    }, exact
+
+
+def atomic_idempotency_capability(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Attest permanent tenant-scoped uniqueness from one SQLite snapshot."""
+    owns_transaction = not conn.in_transaction
+    try:
+        if owns_transaction:
+            conn.execute("BEGIN")
+        index_rows = {row["name"]: row for row in conn.execute("PRAGMA index_list(tasks)")}
+        named, named_exact = _index_capability(
+            conn, index_rows, name=_IDEMPOTENCY_NAMED_INDEX,
+            columns=["tenant", "idempotency_key"], predicate=_IDEMPOTENCY_NAMED_PREDICATE,
+        )
+        default, default_exact = _index_capability(
+            conn, index_rows, name=_IDEMPOTENCY_DEFAULT_INDEX,
+            columns=["idempotency_key"], predicate=_IDEMPOTENCY_DEFAULT_PREDICATE,
+        )
+        deletion_protection, trigger_exact = _deletion_protection_capability(conn)
+        identity_update_protection, update_trigger_exact = (
+            _identity_update_protection_capability(conn)
+        )
+        identity_reuse_protection, reuse_trigger_exact = (
+            _identity_reuse_protection_capability(conn)
+        )
+        duplicate_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM (SELECT 1 FROM tasks "
+            "WHERE idempotency_key IS NOT NULL "
+            "GROUP BY tenant, idempotency_key HAVING COUNT(*) > 1)"
+        ).fetchone()["n"]
+        if owns_transaction:
+            conn.execute("COMMIT")
+    except sqlite3.Error as exc:
+        if owns_transaction and conn.in_transaction:
+            conn.execute("ROLLBACK")
+        return {
+            "supported": False,
+            "diagnostic": f"schema evidence unavailable: {exc}",
+        }
+    supported = bool(
+        named_exact
+        and default_exact
+        and trigger_exact
+        and update_trigger_exact
+        and reuse_trigger_exact
+        and duplicate_count == 0
+    )
+    return {
+        "supported": supported,
+        "diagnostic": (
+            "permanent tenant-scoped uniqueness and identity immutability verified"
+            if supported
+            else "permanent tenant-scoped indexes, guards, or duplicate audit do not match"
+        ),
+        "scope": "tenant",
+        "default_tenant": "null",
+        "indexes": [named, default],
+        "duplicate_keys": int(duplicate_count),
+        "null_keys": "distinct",
+        "archived_keys": "permanent",
+        "deletion_protection": deletion_protection,
+        "identity_update_protection": identity_update_protection,
+        "identity_reuse_protection": identity_reuse_protection,
+        "attestation": "single-read-transaction",
+    }
+
+
+def atomic_idempotency_capability_read_only(
+    db_path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Inspect an existing board without creating or migrating its database."""
+    path = (db_path or kanban_db_path()).resolve()
+    try:
+        conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        return {
+            "supported": False,
+            "diagnostic": f"storage unavailable for read-only evidence: {exc}",
+        }
+    conn.row_factory = sqlite3.Row
+    try:
+        return atomic_idempotency_capability(conn)
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Task creation / mutation
 # ---------------------------------------------------------------------------
@@ -2853,7 +3187,7 @@ def create_task(
     parents — a specifier/triager is expected to promote the task to
     ``todo`` once the spec is fleshed out.
 
-    If ``idempotency_key`` is provided and a non-archived task with the
+    If ``idempotency_key`` is provided and any task with the
     same key already exists, returns the existing task's id instead of
     creating a duplicate. Useful for retried webhooks / automation that
     should not double-write.
@@ -3036,17 +3370,14 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
+    # Fast idempotency path. The partial UNIQUE index remains the authority:
+    # concurrent misses race at INSERT and the loser recovers the winner below.
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
+            "AND (tenant = ? OR (tenant IS NULL AND ? IS NULL)) "
             "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
+            (idempotency_key, tenant, tenant),
         ).fetchone()
         if row:
             return row["id"]
@@ -3191,6 +3522,14 @@ def create_task(
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
+            if idempotency_key is not None:
+                row = conn.execute(
+                    "SELECT id FROM tasks WHERE idempotency_key = ? "
+                    "AND (tenant = ? OR (tenant IS NULL AND ? IS NULL))",
+                    (idempotency_key, tenant, tenant),
+                ).fetchone()
+                if row:
+                    return row["id"]
             if attempt == 1:
                 raise
             # Retry with a fresh id.
@@ -6176,11 +6515,15 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, idempotency_key FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
+        if row["idempotency_key"] is not None:
+            raise RuntimeError(
+                f"cannot delete {task_id}: it is a permanent idempotency tombstone"
+            )
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
@@ -6204,9 +6547,17 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if cur.rowcount != 1:
+        row = conn.execute(
+            "SELECT idempotency_key FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
             return False
+        if row["idempotency_key"] is not None:
+            raise RuntimeError(
+                f"cannot delete {task_id}: it is a permanent idempotency owner"
+            )
+        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        assert cur.rowcount == 1
         conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))

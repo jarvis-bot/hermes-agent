@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import types
 import unittest.mock
@@ -162,6 +164,749 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 # Task creation + status inference
 # ---------------------------------------------------------------------------
 
+
+def test_concurrent_creators_with_same_idempotency_key_share_one_task(
+    kanban_home, monkeypatch
+):
+    """Independent connections must atomically converge on one durable task."""
+    barrier = threading.Barrier(2)
+    original_write_txn = kb.write_txn
+
+    @contextlib.contextmanager
+    def synchronized_write_txn(conn):
+        barrier.wait(timeout=5)
+        with original_write_txn(conn):
+            yield conn
+
+    monkeypatch.setattr(kb, "write_txn", synchronized_write_txn)
+
+    def create() -> str:
+        with kb.connect() as conn:
+            return kb.create_task(
+                conn,
+                title="atomic external claim",
+                idempotency_key="tutelara:trello:card-1:generation-1",
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        task_ids = list(pool.map(lambda _: create(), range(2)))
+
+    with kb.connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ?",
+            ("tutelara:trello:card-1:generation-1",),
+        ).fetchall()
+
+    assert len(rows) == 1
+    assert task_ids == [rows[0]["id"], rows[0]["id"]]
+
+
+def test_independent_processes_recover_the_exact_conflict_winner(kanban_home, tmp_path):
+    key = "tutelara:trello:card-process:generation-1"
+    gate = tmp_path / "release"
+    ready_dir = tmp_path / "ready"
+    ready_dir.mkdir()
+    code = """
+import os
+import sys
+import time
+from pathlib import Path
+from hermes_cli import kanban_db as kb
+
+ready = Path(sys.argv[1]) / str(os.getpid())
+ready.touch()
+gate = Path(sys.argv[2])
+while not gate.exists():
+    time.sleep(0.005)
+with kb.connect() as conn:
+    print(kb.create_task(conn, title="process race", idempotency_key=sys.argv[3]))
+"""
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", code, str(ready_dir), str(gate), key],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=os.environ.copy(),
+        )
+        for _ in range(4)
+    ]
+    deadline = time.monotonic() + 10
+    while len(list(ready_dir.iterdir())) != len(processes) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(list(ready_dir.iterdir())) == len(processes)
+    gate.touch()
+
+    task_ids = []
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=30)
+        assert process.returncode == 0, stderr
+        task_ids.append(stdout.strip())
+
+    with kb.connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived'",
+            (key,),
+        ).fetchall()
+
+    assert len(rows) == 1
+    assert set(task_ids) == {rows[0]["id"]}
+
+
+def test_sequential_idempotency_retry_and_crash_recovery_share_task(kanban_home):
+    """A retry from a fresh connection recovers a create not attached locally."""
+    key = "tutelara:trello:card-2:generation-1"
+    with kb.connect() as creator:
+        created = kb.create_task(creator, title="first attempt", idempotency_key=key)
+
+    # Simulate process death after remote create and before local attachment by
+    # discarding all caller state, then retrying through an independent connection.
+    with kb.connect() as retry:
+        recovered = kb.create_task(retry, title="restarted attempt", idempotency_key=key)
+        count = retry.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE idempotency_key = ?", (key,)
+        ).fetchone()["n"]
+
+    assert recovered == created
+    assert count == 1
+
+
+def test_callers_namespace_unrelated_idempotency_keys(kanban_home):
+    with kb.connect() as conn:
+        trello = kb.create_task(
+            conn, title="Trello claim", idempotency_key="trello:shared-value"
+        )
+        github = kb.create_task(
+            conn, title="GitHub claim", idempotency_key="github:shared-value"
+        )
+
+    assert trello != github
+
+
+def test_idempotency_key_is_scoped_to_exact_tenant_without_cross_tenant_leakage(
+    kanban_home,
+):
+    key = "trello:shared-card:generation-1"
+    with kb.connect() as conn:
+        default_task = kb.create_task(conn, title="default", idempotency_key=key)
+        tenant_a = kb.create_task(
+            conn, title="tenant A", tenant="tenant-a", idempotency_key=key
+        )
+        tenant_b = kb.create_task(
+            conn, title="tenant B", tenant="tenant-b", idempotency_key=key
+        )
+        tenant_a_retry = kb.create_task(
+            conn, title="tenant A retry", tenant="tenant-a", idempotency_key=key
+        )
+        default_retry = kb.create_task(conn, title="default retry", idempotency_key=key)
+
+    assert len({default_task, tenant_a, tenant_b}) == 3
+    assert tenant_a_retry == tenant_a
+    assert default_retry == default_task
+
+
+def test_null_idempotency_keys_do_not_deduplicate(kanban_home):
+    with kb.connect() as conn:
+        first = kb.create_task(conn, title="ordinary task")
+        second = kb.create_task(conn, title="another ordinary task")
+
+    assert first != second
+
+
+def test_archived_idempotency_key_permanently_converges_to_original_tombstone(kanban_home):
+    key = "tutelara:trello:card-3:generation-1"
+    with kb.connect() as conn:
+        archived = kb.create_task(conn, title="old lifecycle", idempotency_key=key)
+        assert kb.archive_task(conn, archived) is True
+        replay = kb.create_task(conn, title="replayed claim", idempotency_key=key)
+        rows = conn.execute(
+            "SELECT id, status FROM tasks WHERE idempotency_key = ?", (key,)
+        ).fetchall()
+
+    assert replay == archived
+    assert [(row["id"], row["status"]) for row in rows] == [(archived, "archived")]
+
+
+def test_idempotency_tombstone_cannot_be_deleted(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="durable claim", idempotency_key="permanent-key")
+        assert kb.archive_task(conn, task_id) is True
+        with pytest.raises(RuntimeError, match="permanent idempotency tombstone"):
+            kb.delete_archived_task(conn, task_id)
+        assert kb.create_task(conn, title="replay", idempotency_key="permanent-key") == task_id
+
+
+def test_idempotency_owner_cannot_be_hard_deleted_before_archive(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="durable claim", idempotency_key="hard-delete-key")
+        with pytest.raises(RuntimeError, match="permanent idempotency owner"):
+            kb.delete_task(conn, task_id)
+        assert kb.create_task(conn, title="replay", idempotency_key="hard-delete-key") == task_id
+
+
+def test_fresh_db_has_permanent_unique_idempotency_indexes(kanban_home):
+    with kb.connect() as conn:
+        index = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_tasks_idempotency'"
+        ).fetchone()
+        capability = kb.atomic_idempotency_capability(conn)
+
+    assert index is not None
+    assert "CREATE UNIQUE INDEX" in index["sql"]
+    assert "status" not in index["sql"].lower()
+    assert capability["supported"] is True
+    assert capability["scope"] == "tenant"
+    assert capability["default_tenant"] == "null"
+    assert capability["archived_keys"] == "permanent"
+    assert capability["attestation"] == "single-read-transaction"
+    assert [index["name"] for index in capability["indexes"]] == [
+        "idx_tasks_idempotency",
+        "idx_tasks_idempotency_default",
+    ]
+
+
+def test_duplicate_key_migration_fails_closed_with_bounded_redacted_diagnostics(tmp_path):
+    db_path = tmp_path / "duplicate-idempotency.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(kb.SCHEMA_SQL)
+    conn.executemany(
+        "INSERT INTO tasks "
+        "(id, title, status, created_at, workspace_kind, idempotency_key) "
+        "VALUES (?, ?, 'ready', 1, 'scratch', 'duplicate-key')",
+        (("t_duplicate_a", "first"), ("t_duplicate_b", "second")),
+    )
+    conn.execute("CREATE INDEX idx_tasks_idempotency ON tasks(idempotency_key)")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(sqlite3.IntegrityError) as exc_info:
+        kb.connect(db_path)
+
+    message = str(exc_info.value)
+    assert "permanent Kanban idempotency" in message
+    assert "duplicate tasks" in message
+    assert "1 tenant-scoped key" in message
+    assert "duplicate-key" not in message
+    assert "t_duplicate_a" not in message
+    assert "t_duplicate_b" not in message
+    assert len(message) < 256
+    verify = sqlite3.connect(db_path)
+    try:
+        assert verify.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2
+        index_sql = verify.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'idx_tasks_idempotency'"
+        ).fetchone()[0]
+        assert "UNIQUE" not in index_sql
+    finally:
+        verify.close()
+
+
+def test_idempotency_index_replacement_rolls_back_on_migration_crash(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "crash-during-idempotency-migration.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(kb.SCHEMA_SQL)
+    conn.execute("CREATE INDEX idx_tasks_idempotency ON tasks(idempotency_key)")
+    conn.commit()
+    conn.close()
+
+    def crash_after_drop(migration_conn):
+        migration_conn.execute("DROP INDEX idx_tasks_idempotency")
+        migration_conn.execute(
+            "CREATE TRIGGER trg_tasks_protect_idempotency_owner_update "
+            "BEFORE UPDATE OF tenant, idempotency_key ON tasks "
+            "WHEN OLD.idempotency_key IS NOT NULL "
+            "BEGIN SELECT RAISE(ABORT, 'partial guard'); END"
+        )
+        raise RuntimeError("simulated process crash point")
+
+    monkeypatch.setattr(kb, "_migrate_add_optional_columns", crash_after_drop)
+
+    with pytest.raises(RuntimeError, match="simulated process crash point"):
+        kb.connect(db_path)
+
+    verify = sqlite3.connect(db_path)
+    try:
+        index_sql = verify.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'idx_tasks_idempotency'"
+        ).fetchone()[0]
+    finally:
+        verify.close()
+    assert index_sql == "CREATE INDEX idx_tasks_idempotency ON tasks(idempotency_key)"
+    with contextlib.closing(sqlite3.connect(db_path)) as verify:
+        assert verify.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type = 'trigger' AND name = 'trg_tasks_protect_idempotency_owner_update'"
+        ).fetchone()[0] == 0
+
+
+def test_migration_holds_write_lock_across_scan_and_index_replacement(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "migration-race.db"
+    seed = sqlite3.connect(db_path)
+    seed.executescript(kb.SCHEMA_SQL)
+    seed.execute("CREATE INDEX idx_tasks_idempotency ON tasks(idempotency_key)")
+    seed.execute(
+        "INSERT INTO tasks (id, title, status, created_at, workspace_kind, idempotency_key) "
+        "VALUES ('existing', 'existing', 'ready', 1, 'scratch', 'race-key')"
+    )
+    seed.commit()
+    seed.close()
+
+    scanned = threading.Event()
+    writer_started = threading.Event()
+    writer_result: list[str] = []
+    original_sqlite_connect = kb._sqlite_connect
+
+    def traced_connect(path):
+        migration_conn = original_sqlite_connect(path)
+
+        def trace(sql):
+            if "GROUP BY tenant, idempotency_key HAVING COUNT(*) > 1" in sql:
+                scanned.set()
+                assert writer_started.wait(timeout=5)
+                # Give the independently connected writer an adversarial window.
+                time.sleep(0.2)
+
+        migration_conn.set_trace_callback(trace)
+        return migration_conn
+
+    monkeypatch.setattr(kb, "_sqlite_connect", traced_connect)
+
+    def race_writer():
+        assert scanned.wait(timeout=5)
+        writer = sqlite3.connect(db_path, timeout=5)
+        writer_started.set()
+        try:
+            writer.execute(
+                "INSERT INTO tasks "
+                "(id, title, status, created_at, workspace_kind, idempotency_key) "
+                "VALUES ('racer', 'racer', 'ready', 1, 'scratch', 'race-key')"
+            )
+            writer.commit()
+            writer_result.append("inserted")
+        except sqlite3.IntegrityError:
+            writer_result.append("rejected")
+        finally:
+            writer.close()
+
+    thread = threading.Thread(target=race_writer)
+    thread.start()
+    with contextlib.closing(kb.connect(db_path)):
+        pass
+    thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    assert writer_result == ["rejected"]
+
+
+def test_migration_rejects_duplicate_archived_tombstones_without_modifying_storage(tmp_path):
+    db_path = tmp_path / "archived-idempotency.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(kb.SCHEMA_SQL)
+    conn.executemany(
+        "INSERT INTO tasks "
+        "(id, title, status, created_at, workspace_kind, idempotency_key) "
+        "VALUES (?, ?, ?, 1, 'scratch', 'reused-key')",
+        (
+            ("t_archived_a", "old first", "archived"),
+            ("t_archived_b", "old second", "archived"),
+        ),
+    )
+    conn.execute("CREATE INDEX idx_tasks_idempotency ON tasks(idempotency_key)")
+    conn.commit()
+    before = db_path.read_bytes()
+    conn.close()
+
+    with pytest.raises(sqlite3.IntegrityError, match="duplicate tasks.*1 tenant-scoped key"):
+        kb.connect(db_path)
+
+    assert db_path.read_bytes() == before
+    verify = sqlite3.connect(db_path)
+    try:
+        assert verify.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2
+        assert "UNIQUE" not in verify.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'idx_tasks_idempotency'"
+        ).fetchone()[0]
+    finally:
+        verify.close()
+
+
+def test_migration_preserves_single_archived_owner_as_permanent_tombstone(tmp_path):
+    db_path = tmp_path / "single-archived-idempotency.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(kb.SCHEMA_SQL)
+    conn.execute(
+        "INSERT INTO tasks "
+        "(id, title, status, created_at, workspace_kind, tenant, idempotency_key) "
+        "VALUES ('t_archived', 'old claim', 'archived', 1, 'scratch', "
+        "'tenant-a', 'generation-key')"
+    )
+    conn.execute("CREATE INDEX idx_tasks_idempotency ON tasks(idempotency_key)")
+    conn.commit()
+    conn.close()
+
+    with contextlib.closing(kb.connect(db_path)) as migrated:
+        replay = kb.create_task(
+            migrated,
+            title="replayed after upgrade",
+            tenant="tenant-a",
+            idempotency_key="generation-key",
+        )
+        capability = kb.atomic_idempotency_capability(migrated)
+        with pytest.raises(sqlite3.IntegrityError, match="immutable idempotency identity"):
+            migrated.execute(
+                "UPDATE tasks SET tenant = 'tenant-b' WHERE id = 't_archived'"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="already has a permanent owner"):
+            migrated.execute(
+                "INSERT OR REPLACE INTO tasks "
+                "(id, title, status, created_at, workspace_kind, tenant, idempotency_key) "
+                "VALUES ('replacement', 'replacement', 'ready', 1, 'scratch', "
+                "'tenant-a', 'generation-key')"
+            )
+
+    assert replay == "t_archived"
+    assert capability["supported"] is True
+    assert capability["archived_keys"] == "permanent"
+
+
+def test_migration_allows_same_active_key_in_distinct_tenant_namespaces(tmp_path):
+    db_path = tmp_path / "tenant-scoped-idempotency.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(kb.SCHEMA_SQL)
+    conn.executemany(
+        "INSERT INTO tasks "
+        "(id, title, status, created_at, workspace_kind, tenant, idempotency_key) "
+        "VALUES (?, ?, 'ready', 1, 'scratch', ?, 'shared-key')",
+        (
+            ("t_default", "default", None),
+            ("t_a", "tenant A", "tenant-a"),
+            ("t_b", "tenant B", "tenant-b"),
+        ),
+    )
+    conn.execute("CREATE INDEX idx_tasks_idempotency ON tasks(idempotency_key)")
+    conn.commit()
+    conn.close()
+
+    with contextlib.closing(kb.connect(db_path)) as migrated:
+        assert kb.atomic_idempotency_capability(migrated)["supported"] is True
+        assert migrated.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = 'shared-key'"
+        ).fetchone()[0] == 3
+
+
+def test_capability_rejects_unique_index_with_weaker_extra_predicate(kanban_home):
+    with kb.connect() as conn:
+        conn.execute("DROP INDEX idx_tasks_idempotency")
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_tasks_idempotency "
+            "ON tasks(tenant, idempotency_key) "
+            "WHERE tenant IS NOT NULL AND idempotency_key IS NOT NULL "
+            "AND status != 'archived' "
+            "AND tenant = 'trusted-only'"
+        )
+
+        capability = kb.atomic_idempotency_capability(conn)
+
+    assert capability["supported"] is False
+    assert "do not match" in capability["diagnostic"]
+
+
+def test_capability_rejects_parenthesized_is_not_null_predicate_spoof(kanban_home):
+    """``IS (NOT NULL)`` means ``IS 1`` in SQLite, not ``IS NOT NULL``."""
+    with kb.connect() as conn:
+        conn.execute("DROP INDEX idx_tasks_idempotency")
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_tasks_idempotency "
+            "ON tasks(tenant, idempotency_key) "
+            "WHERE tenant IS (NOT NULL) AND idempotency_key IS NOT NULL"
+        )
+        capability = kb.atomic_idempotency_capability(conn)
+
+    assert capability["supported"] is False
+    assert capability["indexes"][0]["predicate"] is None
+
+
+def test_storage_trigger_prevents_direct_delete_of_any_keyed_task(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="storage-owned claim", idempotency_key="storage-key"
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="permanent idempotency owner"):
+            conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+
+        assert conn.execute(
+            "SELECT id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()["id"] == task_id
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "idempotency_key = NULL",
+        "idempotency_key = 'replacement-key'",
+        "tenant = 'moved-tenant'",
+        "tenant = NULL",
+    ],
+)
+def test_storage_trigger_prevents_direct_changes_to_keyed_identity(
+    kanban_home, assignment
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="immutable storage identity",
+            tenant="tenant-a",
+            idempotency_key="original-key",
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="immutable idempotency identity"):
+            conn.execute(f"UPDATE tasks SET {assignment} WHERE id = ?", (task_id,))
+
+        owner = conn.execute(
+            "SELECT tenant, idempotency_key FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        assert (owner["tenant"], owner["idempotency_key"]) == (
+            "tenant-a",
+            "original-key",
+        )
+
+
+def test_key_cannot_be_cleared_then_deleted_and_recreated(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="owner", idempotency_key="permanent-key")
+        with pytest.raises(sqlite3.IntegrityError, match="immutable idempotency identity"):
+            conn.execute(
+                "UPDATE tasks SET idempotency_key = NULL WHERE id = ?", (task_id,)
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="cannot be deleted"):
+            conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        assert kb.create_task(
+            conn, title="replayed", idempotency_key="permanent-key"
+        ) == task_id
+
+
+def test_tenant_cannot_be_moved_then_original_identity_reused(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="tenant owner",
+            tenant="tenant-a",
+            idempotency_key="permanent-key",
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable idempotency identity"):
+            conn.execute(
+                "UPDATE tasks SET tenant = 'tenant-b' WHERE id = ?", (task_id,)
+            )
+
+        assert kb.create_task(
+            conn,
+            title="original tenant replay",
+            tenant="tenant-a",
+            idempotency_key="permanent-key",
+        ) == task_id
+
+
+def test_insert_or_replace_cannot_silently_delete_and_reuse_keyed_identity(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="owner", idempotency_key="replace-key")
+
+        with pytest.raises(sqlite3.IntegrityError, match="already has a permanent owner"):
+            conn.execute(
+                "INSERT OR REPLACE INTO tasks "
+                "(id, title, status, created_at, workspace_kind, idempotency_key) "
+                "VALUES ('replacement', 'replacement', 'ready', 1, 'scratch', 'replace-key')"
+            )
+
+        assert conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = 'replace-key'"
+        ).fetchone()["id"] == task_id
+
+
+def test_replace_by_primary_key_cannot_clear_keyed_identity(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="owner", idempotency_key="replace-key")
+
+        with pytest.raises(sqlite3.IntegrityError, match="already has a permanent owner"):
+            conn.execute(
+                "INSERT OR REPLACE INTO tasks "
+                "(id, title, status, created_at, workspace_kind, idempotency_key) "
+                "VALUES (?, 'replacement', 'ready', 1, 'scratch', NULL)",
+                (task_id,),
+            )
+
+        assert conn.execute(
+            "SELECT idempotency_key FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()["idempotency_key"] == "replace-key"
+
+
+def test_update_or_replace_cannot_delete_existing_key_owner(kanban_home):
+    with kb.connect() as conn:
+        owner = kb.create_task(conn, title="owner", idempotency_key="replace-key")
+        keyless = kb.create_task(conn, title="keyless")
+
+        with pytest.raises(sqlite3.IntegrityError, match="immutable idempotency identity"):
+            conn.execute(
+                "UPDATE OR REPLACE tasks SET idempotency_key = 'replace-key' WHERE id = ?",
+                (keyless,),
+            )
+
+        assert conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = 'replace-key'"
+        ).fetchone()["id"] == owner
+        assert conn.execute(
+            "SELECT idempotency_key FROM tasks WHERE id = ?", (keyless,)
+        ).fetchone()["idempotency_key"] is None
+
+
+def test_keyed_task_allows_legitimate_non_identity_updates(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="before", idempotency_key="stable-key")
+        conn.execute(
+            "UPDATE tasks SET title = ?, priority = ? WHERE id = ?",
+            ("after", 7, task_id),
+        )
+        row = conn.execute(
+            "SELECT title, priority FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+
+    assert (row["title"], row["priority"]) == ("after", 7)
+
+
+def test_capability_requires_exact_update_and_delete_guards_in_one_snapshot(kanban_home):
+    with kb.connect() as conn:
+        capability = kb.atomic_idempotency_capability(conn)
+
+    assert capability["supported"] is True
+    assert capability["identity_update_protection"] == {
+        "name": "trg_tasks_protect_idempotency_owner_update",
+        "timing": "before",
+        "event": "update",
+        "table": "tasks",
+        "predicate": (
+            "((OLD.idempotency_key IS NOT NULL AND "
+            "(NEW.idempotency_key IS NOT OLD.idempotency_key OR "
+            "NEW.tenant IS NOT OLD.tenant)) OR "
+            "(NEW.idempotency_key IS NOT NULL AND EXISTS "
+            "(SELECT 1 FROM tasks WHERE tasks.id IS NOT NEW.id AND "
+            "tasks.tenant IS NEW.tenant AND "
+            "tasks.idempotency_key IS NEW.idempotency_key)))"
+        ),
+        "action": "abort",
+        "message": "keyed task has immutable idempotency identity",
+        "verified": True,
+    }
+    assert capability["deletion_protection"]["verified"] is True
+    assert capability["identity_reuse_protection"]["verified"] is True
+
+
+def test_capability_rejects_missing_or_tampered_delete_protection_trigger(kanban_home):
+    with kb.connect() as conn:
+        conn.execute("DROP TRIGGER trg_tasks_protect_idempotency_owner_delete")
+        conn.execute(
+            "CREATE TRIGGER trg_tasks_protect_idempotency_owner_delete "
+            "BEFORE DELETE ON tasks WHEN OLD.idempotency_key IS NULL "
+            "BEGIN SELECT RAISE(ABORT, 'permanent idempotency owner cannot be deleted'); END"
+        )
+
+        capability = kb.atomic_idempotency_capability(conn)
+
+    assert capability["supported"] is False
+    assert capability["deletion_protection"]["verified"] is False
+
+
+@pytest.mark.parametrize(
+    "trigger_sql",
+    [
+        None,
+        (
+            "CREATE TRIGGER trg_tasks_protect_idempotency_owner_update "
+            "BEFORE UPDATE OF tenant, idempotency_key ON tasks "
+            "WHEN OLD.idempotency_key IS NOT NULL "
+            "BEGIN SELECT RAISE(ABORT, 'keyed task has immutable idempotency identity'); END"
+        ),
+        (
+            "CREATE TRIGGER trg_tasks_protect_idempotency_owner_update "
+            "BEFORE UPDATE OF tenant, idempotency_key ON tasks "
+            "WHEN OLD.idempotency_key IS NOT NULL AND "
+            "((NEW.idempotency_key IS NOT OLD.idempotency_key) OR "
+            "NEW.tenant IS NOT OLD.tenant) AND NEW.status != 'archived' "
+            "BEGIN SELECT RAISE(ABORT, 'keyed task has immutable idempotency identity'); END"
+        ),
+        (
+            "CREATE TRIGGER trg_tasks_protect_idempotency_owner_update "
+            "BEFORE UPDATE OF tenant, idempotency_key ON tasks "
+            "WHEN OLD.idempotency_key IS NOT NULL AND "
+            "(NEW.idempotency_key IS NOT OLD.idempotency_key OR "
+            "NEW.tenant IS NOT OLD.tenant) "
+            "BEGIN SELECT 1; END"
+        ),
+    ],
+)
+def test_capability_rejects_missing_or_semantically_tampered_update_guard(
+    kanban_home, trigger_sql
+):
+    with kb.connect() as conn:
+        conn.execute("DROP TRIGGER trg_tasks_protect_idempotency_owner_update")
+        if trigger_sql is not None:
+            conn.execute(trigger_sql)
+
+        capability = kb.atomic_idempotency_capability(conn)
+
+    assert capability["supported"] is False
+    assert capability["identity_update_protection"]["verified"] is False
+
+
+def test_capability_rejects_weaker_replacement_guard(kanban_home):
+    with kb.connect() as conn:
+        conn.execute("DROP TRIGGER trg_tasks_protect_idempotency_owner_replacement")
+        conn.execute(
+            "CREATE TRIGGER trg_tasks_protect_idempotency_owner_replacement "
+            "BEFORE INSERT ON tasks WHEN NEW.idempotency_key IS NOT NULL "
+            "AND EXISTS (SELECT 1 FROM tasks WHERE "
+            "tasks.idempotency_key IS NEW.idempotency_key AND tasks.status != 'archived') "
+            "BEGIN SELECT RAISE(ABORT, 'idempotency identity already has a permanent owner'); END"
+        )
+
+        capability = kb.atomic_idempotency_capability(conn)
+
+    assert capability["supported"] is False
+    assert capability["identity_reuse_protection"]["verified"] is False
+
+
+def test_capability_attestation_uses_one_explicit_read_transaction(kanban_home):
+    with kb.connect() as conn:
+        statements: list[str] = []
+        conn.set_trace_callback(statements.append)
+        capability = kb.atomic_idempotency_capability(conn)
+        conn.set_trace_callback(None)
+
+    begin = next(i for i, sql in enumerate(statements) if sql == "BEGIN")
+    pragma = next(i for i, sql in enumerate(statements) if "PRAGMA index_list" in sql)
+    delete_trigger = next(
+        i
+        for i, sql in enumerate(statements)
+        if "trg_tasks_protect_idempotency_owner_delete" in sql
+    )
+    update_trigger = next(
+        i
+        for i, sql in enumerate(statements)
+        if "trg_tasks_protect_idempotency_owner_update" in sql
+    )
+    reuse_trigger = next(
+        i
+        for i, sql in enumerate(statements)
+        if "trg_tasks_protect_idempotency_owner_replacement" in sql
+    )
+    audit = next(i for i, sql in enumerate(statements) if "GROUP BY tenant" in sql)
+    commit = next(i for i, sql in enumerate(statements) if sql == "COMMIT")
+    assert begin < pragma < delete_trigger < update_trigger < reuse_trigger < audit < commit
+    assert capability["attestation"] == "single-read-transaction"
 
 
 # ---------------------------------------------------------------------------
