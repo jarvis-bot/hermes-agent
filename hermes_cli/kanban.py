@@ -250,6 +250,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- init ---
     sub.add_parser("init", help="Create kanban.db if missing (idempotent)")
 
+    # --- capabilities ---
+    p_capabilities = sub.add_parser(
+        "capabilities",
+        help="Report machine-verifiable Kanban storage capabilities",
+    )
+    p_capabilities.add_argument(
+        "--json",
+        action="store_true",
+        required=True,
+        help="Emit the versioned capability document as JSON",
+    )
+
     # --- boards (new in v2: multi-project support) ---
     p_boards = sub.add_parser(
         "boards",
@@ -347,8 +359,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--triage", action="store_true",
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
     p_create.add_argument("--idempotency-key", default=None,
-                          help="Dedup key. If a non-archived task with this key exists, "
-                               "its id is returned instead of creating a duplicate.")
+                          help="Permanent dedup key. If any task or archived tombstone "
+                               "owns this key, its id is returned instead of creating a duplicate.")
     p_create.add_argument("--max-runtime", default=None,
                           help="Per-task runtime cap. Accepts seconds (300) or "
                                "durations (90s, 30m, 2h, 1d). When exceeded, "
@@ -696,7 +708,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         dest="purge_ids",
         nargs="+",
         default=None,
-        help="Permanently delete already-archived task ids from the board",
+        help=(
+            "Permanently delete already-archived task ids without idempotency keys; "
+            "keyed archived rows are permanent tombstones and cannot be removed"
+        ),
     )
 
     # --- tail ---
@@ -1035,6 +1050,8 @@ def kanban_command(args: argparse.Namespace) -> int:
         # without ever reaching the repair path.
         if action == "repair":
             return _cmd_repair(args)
+        if action == "capabilities":
+            return _cmd_capabilities(args)
         try:
             kb.init_db()
         except Exception as exc:
@@ -1043,6 +1060,7 @@ def kanban_command(args: argparse.Namespace) -> int:
 
         handlers = {
             "init":     _cmd_init,
+            "capabilities": _cmd_capabilities,
             "create":   _cmd_create,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
@@ -1407,7 +1425,6 @@ def _parse_duration(val) -> Optional[int]:
 def _cmd_init(args: argparse.Namespace) -> int:
     path = kb.init_db()
     print(f"Kanban DB initialized at {path}")
-
     print()
     # Enumerate profiles on disk so the user knows what assignees are
     # already addressable. Multica does this auto-detection on its
@@ -1434,6 +1451,20 @@ def _cmd_init(args: argparse.Namespace) -> int:
         "The gateway hosts an embedded dispatcher that ticks every 60 seconds\n"
         "by default (config: kanban.dispatch_interval_seconds). Without a\n"
         "running gateway, tasks stay in 'ready' forever."
+    )
+    return 0
+
+
+def _cmd_capabilities(args: argparse.Namespace) -> int:
+    atomic_idempotency = kb.atomic_idempotency_capability_read_only()
+    print(
+        json.dumps(
+            {
+                "schema": "hermes-kanban-capabilities/v6",
+                "atomic_idempotency": atomic_idempotency,
+            },
+            sort_keys=True,
+        )
     )
     return 0
 

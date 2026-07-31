@@ -265,6 +265,14 @@ hermes kanban unblock  t_abc t_def
 hermes kanban block    t_abc "need input" --ids t_def t_hij
 ```
 
+Archived tasks without idempotency keys can be permanently removed with
+`hermes kanban archive --rm <id>...`. Keyed archived rows are permanent
+idempotency tombstones and cannot be removed, including through direct SQLite
+deletes. Once a row is keyed, its canonical `(tenant, idempotency_key)` identity
+also cannot be changed through direct SQLite updates; retries continue to resolve
+to their original task identity. `hermes kanban capabilities --json` reports the
+exact indexes and all storage guards from one read transaction.
+
 :::note Where an unblocked task lands
 `unblock` itself only ever moves a task to **`ready`** (all parents `done`) or
 **`todo`** (a parent is still open — the task is dependency-gated and the
