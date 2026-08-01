@@ -313,6 +313,14 @@ DEFAULT_CONFIG = {
         # Explicit opt-in: mount the host cwd into /workspace for Docker sessions.
         # Default off because passing host directories into a sandbox weakens isolation.
         "docker_mount_cwd_to_workspace": False,
+        # Access mode for the automatic cwd mount. ``rw`` preserves historical
+        # behavior; reviewer profiles can select ``ro``.
+        "docker_cwd_mount_mode": "rw",
+        # Optional container-visible prefix -> Docker-daemon-host prefix map.
+        # Needed when Hermes itself runs in Docker against the host Docker socket.
+        "docker_cwd_path_mappings": {},
+        # Optional canonical container-visible roots from which cwd may be mounted.
+        "docker_cwd_allowed_roots": [],
         # Opt-in egress lockdown for Docker terminal sessions. When false,
         # Docker runs with --network=none so commands cannot reach the network.
         "docker_network": True,

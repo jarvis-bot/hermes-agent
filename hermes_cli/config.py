@@ -1909,6 +1909,44 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
 
     issues: List[ConfigIssue] = []
 
+    # ── Docker automatic cwd mount policy ────────────────────────────────
+    terminal = config.get("terminal")
+    if isinstance(terminal, dict):
+        mount_mode = terminal.get("docker_cwd_mount_mode", "rw")
+        if mount_mode not in {"ro", "rw"}:
+            issues.append(ConfigIssue(
+                "error",
+                "terminal.docker_cwd_mount_mode must be 'ro' or 'rw'",
+                "Use 'ro' for reviewer profiles or 'rw' for backward-compatible writable mounts",
+            ))
+
+        path_mappings = terminal.get("docker_cwd_path_mappings", {})
+        if not isinstance(path_mappings, dict) or any(
+            not isinstance(source, str)
+            or not isinstance(destination, str)
+            or not os.path.isabs(source)
+            or not os.path.isabs(destination)
+            for source, destination in (
+                path_mappings.items() if isinstance(path_mappings, dict) else []
+            )
+        ):
+            issues.append(ConfigIssue(
+                "error",
+                "terminal.docker_cwd_path_mappings must map absolute paths to absolute paths",
+                "Example: {'/opt/data': '/home/ubuntu/.hermes'}",
+            ))
+
+        allowed_roots = terminal.get("docker_cwd_allowed_roots", [])
+        if not isinstance(allowed_roots, list) or any(
+            not isinstance(root, str) or not os.path.isabs(root)
+            for root in (allowed_roots if isinstance(allowed_roots, list) else [])
+        ):
+            issues.append(ConfigIssue(
+                "error",
+                "terminal.docker_cwd_allowed_roots must be a list of absolute paths",
+                "Example: ['/opt/data/reviewer-tasks']",
+            ))
+
     # ── custom_providers must be a list, not a dict ──────────────────────
     cp = config.get("custom_providers")
     if cp is not None:
@@ -3193,6 +3231,9 @@ TERMINAL_CONFIG_ENV_MAP = {
     "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
     "docker_env": "TERMINAL_DOCKER_ENV",
     "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
+    "docker_cwd_mount_mode": "TERMINAL_DOCKER_CWD_MOUNT_MODE",
+    "docker_cwd_path_mappings": "TERMINAL_DOCKER_CWD_PATH_MAPPINGS",
+    "docker_cwd_allowed_roots": "TERMINAL_DOCKER_CWD_ALLOWED_ROOTS",
     "docker_network": "TERMINAL_DOCKER_NETWORK",
     "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
     "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
@@ -4586,17 +4627,19 @@ def warn_unpinned_cron_jobs_after_model_config_change(
     )
 
 
-def _default_value_for_key(dotted_key: str):
-    """Return the leaf value declared for *dotted_key* in ``DEFAULT_CONFIG``.
-
-    Unknown keys and non-leaf paths return ``None`` so they retain the legacy
-    best-effort coercion used by ``config set``.
-    """
+def _declared_default_for_key(dotted_key: str):
+    """Return the value declared for *dotted_key* in ``DEFAULT_CONFIG``."""
     node = DEFAULT_CONFIG
     for part in dotted_key.split("."):
         if not isinstance(node, dict) or part not in node:
             return None
         node = node[part]
+    return node
+
+
+def _default_value_for_key(dotted_key: str):
+    """Return a non-mapping leaf default, preserving legacy caller behavior."""
+    node = _declared_default_for_key(dotted_key)
     return node if not isinstance(node, dict) else None
 
 
@@ -4844,7 +4887,18 @@ def set_config_value(key: str, value: str, force: bool = False):
     # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
     # retain the historical best-effort coercion behavior.
     coerced_value: Any = value
-    if not isinstance(_default_value_for_key(key), str):
+    default_value = _declared_default_for_key(key)
+    if isinstance(default_value, (list, dict)):
+        try:
+            decoded_value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            expected = "array" if isinstance(default_value, list) else "object"
+            raise ValueError(f"{key} must be a valid JSON {expected}") from exc
+        if type(decoded_value) is not type(default_value):
+            expected = "array" if isinstance(default_value, list) else "object"
+            raise ValueError(f"{key} must be a JSON {expected}")
+        coerced_value = decoded_value
+    elif not isinstance(default_value, str):
         if value.lower() in {'true', 'yes', 'on'}:
             coerced_value = True
         elif value.lower() in {'false', 'no', 'off'}:

@@ -217,6 +217,42 @@ def test_docker_mount_cwd_to_workspace_is_bridged_everywhere():
     assert "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE" in _terminal_tool_env_var_names()
 
 
+def test_docker_cwd_mount_policy_is_bridged_everywhere():
+    expected = {
+        "docker_cwd_mount_mode": "TERMINAL_DOCKER_CWD_MOUNT_MODE",
+        "docker_cwd_path_mappings": "TERMINAL_DOCKER_CWD_PATH_MAPPINGS",
+        "docker_cwd_allowed_roots": "TERMINAL_DOCKER_CWD_ALLOWED_ROOTS",
+    }
+    for key, env_var in expected.items():
+        assert key in _cli_env_map_keys()
+        assert key in _gateway_env_map_keys()
+        assert key in _save_config_env_sync_keys()
+        assert env_var in _terminal_tool_env_var_names()
+
+
+def test_terminal_env_config_parses_docker_cwd_mount_policy(monkeypatch):
+    from tools import terminal_tool
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_CWD_MOUNT_MODE", "ro")
+    monkeypatch.setenv(
+        "TERMINAL_DOCKER_CWD_PATH_MAPPINGS",
+        '{"/opt/data": "/home/ubuntu/.hermes"}',
+    )
+    monkeypatch.setenv(
+        "TERMINAL_DOCKER_CWD_ALLOWED_ROOTS",
+        '["/opt/data/reviewer-tasks"]',
+    )
+
+    config = terminal_tool._get_env_config()
+
+    assert config["docker_cwd_mount_mode"] == "ro"
+    assert config["docker_cwd_path_mappings"] == {
+        "/opt/data": "/home/ubuntu/.hermes"
+    }
+    assert config["docker_cwd_allowed_roots"] == ["/opt/data/reviewer-tasks"]
+
+
 def test_docker_env_is_bridged_everywhere():
     """Regression pin for docker_env config key being silently ignored.
 

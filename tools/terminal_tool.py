@@ -1371,6 +1371,39 @@ def _is_unusable_container_cwd(cwd: str) -> bool:
     return False
 
 
+def resolve_container_cwd_mount(
+    env_type: str, cwd: str, config: Dict[str, Any]
+) -> tuple[str, Optional[str]]:
+    """Resolve a task cwd into the container cwd and dynamic Docker bind source."""
+    host_cwd = config.get("host_cwd")
+    if env_type == "docker" and config.get("docker_mount_cwd_to_workspace", False):
+        candidate = os.path.abspath(os.path.expanduser(cwd))
+        is_container_path = candidate == "/workspace" or candidate.startswith(
+            "/workspace/"
+        )
+        is_container_path = (
+            is_container_path
+            or candidate == "/root"
+            or candidate.startswith("/root/")
+        )
+        if not is_container_path and os.path.isdir(candidate):
+            return "/workspace", candidate
+        if not is_container_path and cwd != config["cwd"]:
+            raise ValueError(f"Docker task cwd is not an existing directory: {cwd!r}")
+
+    if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
+        if cwd != config["cwd"]:
+            logger.info(
+                "Ignoring host/relative cwd override %r for %s backend "
+                "(won't exist in sandbox). Using %r instead.",
+                cwd,
+                env_type,
+                config["cwd"],
+            )
+        cwd = config["cwd"]
+    return cwd, host_cwd
+
+
 # One-shot guard for the config-fallback bridge below.  Purely an
 # optimization: after the first attempt either TERMINAL_ENV is set (bridge
 # succeeded — merged config always carries terminal.backend) or the import
@@ -1441,11 +1474,19 @@ def _get_env_config() -> Dict[str, Any]:
         docker_volumes = _parse_env_var("TERMINAL_DOCKER_VOLUMES", "[]", json.loads, "valid JSON")
         docker_env = _parse_env_var("TERMINAL_DOCKER_ENV", "{}", json.loads, "valid JSON")
         docker_extra_args = _parse_env_var("TERMINAL_DOCKER_EXTRA_ARGS", "[]", json.loads, "valid JSON")
+        docker_cwd_path_mappings = _parse_env_var(
+            "TERMINAL_DOCKER_CWD_PATH_MAPPINGS", "{}", json.loads, "valid JSON"
+        )
+        docker_cwd_allowed_roots = _parse_env_var(
+            "TERMINAL_DOCKER_CWD_ALLOWED_ROOTS", "[]", json.loads, "valid JSON"
+        )
     else:
         docker_forward_env = []
         docker_volumes = []
         docker_env = {}
         docker_extra_args = []
+        docker_cwd_path_mappings = {}
+        docker_cwd_allowed_roots = []
 
     # Default cwd: local uses the host's current directory, ssh uses the
     # remote home, Vercel uses its documented workspace root, and everything
@@ -1496,6 +1537,9 @@ def _get_env_config() -> Dict[str, Any]:
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
+        "docker_cwd_mount_mode": os.getenv("TERMINAL_DOCKER_CWD_MOUNT_MODE", "rw").strip().lower(),
+        "docker_cwd_path_mappings": docker_cwd_path_mappings,
+        "docker_cwd_allowed_roots": docker_cwd_allowed_roots,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
         # SSH-specific config
@@ -1554,7 +1598,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                         ssh_config: dict = None, container_config: dict = None,
                         local_config: dict = None,
                         task_id: str = "default",
-                        host_cwd: str = None):
+                        host_cwd: Optional[str] = None):
     """
     Create an execution environment for sandboxed command execution.
     
@@ -1601,6 +1645,9 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             volumes=volumes,
             host_cwd=host_cwd,
             auto_mount_cwd=cc.get("docker_mount_cwd_to_workspace", False),
+            cwd_mount_mode=cc.get("docker_cwd_mount_mode", "rw"),
+            cwd_path_mappings=cc.get("docker_cwd_path_mappings", {}),
+            cwd_allowed_roots=cc.get("docker_cwd_allowed_roots", []),
             forward_env=docker_forward_env,
             env=docker_env,
             run_as_host_user=cc.get("docker_run_as_host_user", False),
@@ -2268,25 +2315,7 @@ def terminal_tool(
             image = ""
 
         cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
-        # A per-task cwd override (registered by the gateway/TUI for workspace
-        # tracking, or by RL/benchmark envs) wins over config["cwd"] — but
-        # config["cwd"] was already sanitized for container backends in
-        # _get_env_config() while the override is raw. On a container backend a
-        # raw host path (e.g. a Windows desktop session's C:\Users\<user>, or a
-        # POSIX /home/<user>) reaches `docker run -w <host-path>` and the
-        # container fails to start (exit 125). Re-apply the same host/relative
-        # path guard to the *resolved* cwd so the override can't bypass it.
-        # Valid in-container override paths (RL/benchmark sandboxes that set
-        # cwd to /workspace, /root, etc.) are absolute non-host paths and pass
-        # through untouched.
-        if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
-            if cwd != config["cwd"]:
-                logger.info(
-                    "Ignoring host/relative cwd override %r for %s backend "
-                    "(won't exist in sandbox). Using %r instead.",
-                    cwd, env_type, config["cwd"],
-                )
-            cwd = config["cwd"]
+        cwd, host_cwd = resolve_container_cwd_mount(env_type, cwd, config)
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
@@ -2381,6 +2410,9 @@ def terminal_tool(
                                 "vercel_runtime": config.get("vercel_runtime", ""),
                                 "docker_volumes": config.get("docker_volumes", []),
                                 "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
+                                "docker_cwd_mount_mode": config.get("docker_cwd_mount_mode", "rw"),
+                                "docker_cwd_path_mappings": config.get("docker_cwd_path_mappings", {}),
+                                "docker_cwd_allowed_roots": config.get("docker_cwd_allowed_roots", []),
                                 "docker_forward_env": config.get("docker_forward_env", []),
                                 "docker_env": config.get("docker_env", {}),
                                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
@@ -2405,7 +2437,7 @@ def terminal_tool(
                             container_config=container_config,
                             local_config=local_config,
                             task_id=effective_task_id,
-                            host_cwd=config.get("host_cwd"),
+                            host_cwd=host_cwd,
                         )
                     except ImportError as e:
                         return json.dumps({

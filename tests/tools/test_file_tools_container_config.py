@@ -65,3 +65,17 @@ class TestFileToolsContainerConfig:
 
         assert captured["task_id"] == "default"
         assert captured["cwd"] == "/workspace/session"
+
+    def test_docker_file_environment_mounts_raw_task_workspace(self, tmp_path):
+        ticket_cwd = tmp_path / "ticket-149"
+        ticket_cwd.mkdir()
+        task_id = "ticket-149-review"
+
+        captured = self._run(
+            _make_env_config(host_cwd=str(tmp_path)),
+            task_id,
+            task_env_overrides={task_id: {"cwd": str(ticket_cwd)}},
+        )
+
+        assert captured["cwd"] == "/workspace"
+        assert captured["host_cwd"] == str(ticket_cwd)

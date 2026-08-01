@@ -38,6 +38,7 @@ _DOCKER_SEARCH_PATHS = [
 _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EGRESS_LABEL_KEY = "hermes-egress"
+_WORKSPACE_LABEL_KEY = "hermes-workspace"
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -808,6 +809,99 @@ def _ensure_docker_available() -> None:
             )
 
 
+def _is_path_within(path: Path, root: Path) -> bool:
+    """Return whether *path* is *root* or a descendant (component-bounded)."""
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _resolve_cwd_mount_source(
+    host_cwd: str,
+    *,
+    allowed_roots: list | None,
+    path_mappings: dict | None,
+) -> tuple[str, str]:
+    """Validate a container-visible cwd and return canonical + Docker-host paths."""
+    try:
+        canonical = Path(host_cwd).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Docker cwd mount source cannot be resolved: {host_cwd!r}") from exc
+    if not canonical.is_dir():
+        raise ValueError(f"Docker cwd mount source is not a directory: {canonical}")
+
+    if allowed_roots is None:
+        allowed_roots = []
+    if not isinstance(allowed_roots, list) or any(
+        not isinstance(root, str) or not os.path.isabs(root) for root in allowed_roots
+    ):
+        raise ValueError("docker_cwd_allowed_roots must be a list of absolute paths")
+    canonical_roots = [Path(root).expanduser().resolve(strict=False) for root in allowed_roots]
+    if canonical_roots and not any(_is_path_within(canonical, root) for root in canonical_roots):
+        raise ValueError(
+            f"Docker cwd mount source {canonical} is outside every allowed workspace root"
+        )
+
+    if path_mappings is None:
+        path_mappings = {}
+    if not isinstance(path_mappings, dict):
+        raise ValueError("docker_cwd_path_mappings must be a mapping of absolute paths")
+
+    matches: list[tuple[Path, Path]] = []
+    for source, destination in path_mappings.items():
+        if (
+            not isinstance(source, str)
+            or not isinstance(destination, str)
+            or not os.path.isabs(source)
+            or not os.path.isabs(destination)
+        ):
+            raise ValueError(
+                "docker_cwd_path_mappings must map absolute container paths "
+                "to absolute Docker-host paths"
+            )
+        source_path = Path(source).expanduser().resolve(strict=False)
+        if _is_path_within(canonical, source_path):
+            matches.append((source_path, Path(destination)))
+
+    if path_mappings and not matches:
+        raise ValueError(f"Docker cwd mount source {canonical} has no matching path mapping")
+    if not matches:
+        return str(canonical), str(canonical)
+
+    # Longest matching source wins, so a specific nested map safely overrides
+    # a broader parent map without string-prefix ambiguity.
+    source_path, destination = max(matches, key=lambda item: len(item[0].parts))
+    translated = destination / canonical.relative_to(source_path)
+    return str(canonical), str(translated)
+
+
+def _volume_mounts_workspace(volume: str) -> bool:
+    """Recognize a Docker ``-v`` entry targeting /workspace or its subtree."""
+    # Match from the right so Windows drive-letter sources (``C:\\...``) do
+    # not confuse destination parsing.  Nested destinations are conflicts too:
+    # a rw /workspace/subdir mount would punch through a ro /workspace mount.
+    return re.search(r":/workspace(?:/[^:]*)?(?::[^:]*)?$", volume) is not None
+
+
+def _extra_args_mount_workspace(extra_args: list[str]) -> bool:
+    """Return whether raw Docker flags can add or replace a /workspace mount."""
+    mount_flags = {"-v", "--volume", "--mount"}
+    for index, arg in enumerate(extra_args):
+        if arg in mount_flags:
+            value = extra_args[index + 1] if index + 1 < len(extra_args) else ""
+        elif any(arg.startswith(f"{flag}=") for flag in mount_flags):
+            value = arg.split("=", 1)[1]
+        else:
+            continue
+        if _volume_mounts_workspace(value):
+            return True
+        if re.search(r"(?:^|,)\s*(?:dst|destination|target)\s*=\s*/workspace(?:/|,|$)", value):
+            return True
+    return False
+
+
 class DockerEnvironment(BaseEnvironment):
     """Hardened Docker container execution with resource limits and persistence.
 
@@ -834,8 +928,11 @@ class DockerEnvironment(BaseEnvironment):
         forward_env: list[str] | None = None,
         env: dict | None = None,
         network: bool = True,
-        host_cwd: str = None,
+        host_cwd: Optional[str] = None,
         auto_mount_cwd: bool = False,
+        cwd_mount_mode: str = "rw",
+        cwd_path_mappings: dict | None = None,
+        cwd_allowed_roots: list | None = None,
         run_as_host_user: bool = False,
         extra_args: list = None,
         persist_across_processes: bool = True,
@@ -902,20 +999,29 @@ class DockerEnvironment(BaseEnvironment):
                 continue
             if ":" in vol:
                 volume_args.extend(["-v", vol])
-                if ":/workspace" in vol:
+                if _volume_mounts_workspace(vol):
                     workspace_explicitly_mounted = True
             else:
                 logger.warning(f"Docker volume '{vol}' missing colon, skipping")
 
-        host_cwd_abs = os.path.abspath(os.path.expanduser(host_cwd)) if host_cwd else ""
-        bind_host_cwd = (
-            auto_mount_cwd
-            and bool(host_cwd_abs)
-            and os.path.isdir(host_cwd_abs)
-            and not workspace_explicitly_mounted
-        )
-        if auto_mount_cwd and host_cwd and not os.path.isdir(host_cwd_abs):
-            logger.debug(f"Skipping docker cwd mount: host_cwd is not a valid directory: {host_cwd}")
+        canonical_host_cwd = ""
+        docker_host_cwd = ""
+        bind_host_cwd = auto_mount_cwd and bool(host_cwd)
+        if auto_mount_cwd and workspace_explicitly_mounted:
+            raise ValueError(
+                "docker_volumes already mounts /workspace while "
+                "docker_mount_cwd_to_workspace is enabled; remove the explicit "
+                "workspace mount or disable the automatic mount"
+            )
+        if bind_host_cwd:
+            assert host_cwd is not None
+            if cwd_mount_mode not in {"ro", "rw"}:
+                raise ValueError("docker_cwd_mount_mode must be 'ro' or 'rw'")
+            canonical_host_cwd, docker_host_cwd = _resolve_cwd_mount_source(
+                host_cwd,
+                allowed_roots=cwd_allowed_roots,
+                path_mappings=cwd_path_mappings,
+            )
 
         self._workspace_dir: Optional[str] = None
         self._home_dir: Optional[str] = None
@@ -943,11 +1049,19 @@ class DockerEnvironment(BaseEnvironment):
                 "--tmpfs", "/root:rw,exec,size=1g",
             ])
 
+        workspace_label = "off"
         if bind_host_cwd:
-            logger.info(f"Mounting configured host cwd to /workspace: {host_cwd_abs}")
-            volume_args = ["-v", f"{host_cwd_abs}:/workspace", *volume_args]
-        elif workspace_explicitly_mounted:
-            logger.debug("Skipping docker cwd mount: /workspace already mounted by user config")
+            mount_spec = f"{docker_host_cwd}:/workspace"
+            if cwd_mount_mode == "ro":
+                mount_spec += ":ro"
+            workspace_label = hashlib.sha256(mount_spec.encode("utf-8")).hexdigest()[:16]
+            logger.info(
+                "Mounting configured cwd %s via Docker host path %s to /workspace:%s",
+                canonical_host_cwd,
+                docker_host_cwd,
+                cwd_mount_mode,
+            )
+            volume_args = ["-v", mount_spec, *volume_args]
 
         # Mount credential files (OAuth tokens, etc.) declared by skills.
         # Read-only so the container can authenticate but not modify host creds.
@@ -1269,6 +1383,11 @@ class DockerEnvironment(BaseEnvironment):
                 logger.warning("Ignoring non-string docker_extra_args entry: %r", arg)
                 continue
             validated_extra.append(arg)
+        if bind_host_cwd and _extra_args_mount_workspace(validated_extra):
+            raise ValueError(
+                "docker_extra_args mounts /workspace while "
+                "docker_mount_cwd_to_workspace is enabled; remove the conflicting mount"
+            )
         if egress_env_overrides:
             _extra_collisions = _extra_args_egress_collisions(
                 validated_extra, _critical_egress_names,
@@ -1316,6 +1435,7 @@ class DockerEnvironment(BaseEnvironment):
             "--label", f"hermes-task-id={task_label}",
             "--label", f"hermes-profile={profile_name}",
             "--label", f"{_EGRESS_LABEL_KEY}={egress_label}",
+            "--label", f"{_WORKSPACE_LABEL_KEY}={workspace_label}",
         ]
         # Save args for container recreation on "No such container" recovery.
         self._image = image
@@ -1328,6 +1448,7 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
             _EGRESS_LABEL_KEY: egress_label,
+            _WORKSPACE_LABEL_KEY: workspace_label,
         }
 
         # Cross-process container reuse (issue #20561 — docs claim "ONE long-lived
@@ -1344,7 +1465,7 @@ class DockerEnvironment(BaseEnvironment):
         reused = False
         if persist_across_processes:
             existing = self._find_reusable_container(
-                task_label, profile_name, egress_label,
+                task_label, profile_name, egress_label, workspace_label,
             )
             if existing is not None:
                 container_id, state = existing
@@ -1559,6 +1680,7 @@ class DockerEnvironment(BaseEnvironment):
         profile_label = self._labels.get("hermes-profile", "")
         existing = self._find_reusable_container(
             task_label, profile_label, self._labels.get(_EGRESS_LABEL_KEY, "off"),
+            self._labels.get(_WORKSPACE_LABEL_KEY, "off"),
         )
         if existing is not None:
             cid, state = existing
@@ -1723,6 +1845,7 @@ class DockerEnvironment(BaseEnvironment):
         task_label: str,
         profile_label: str,
         egress_label: str,
+        workspace_label: str = "off",
     ) -> Optional[tuple[str, str]]:
         """Look for an existing container labeled for this (task, profile).
 
@@ -1742,6 +1865,12 @@ class DockerEnvironment(BaseEnvironment):
                 "--filter", f"label=hermes-task-id={task_label}",
                 "--filter", f"label=hermes-profile={profile_label}",
             ]
+            if workspace_label != "off":
+                # Bind mounts and their access mode are immutable.  A reviewer
+                # requesting :ro must never reuse an older rw/other-path container.
+                filters.extend([
+                    "--filter", f"label={_WORKSPACE_LABEL_KEY}={workspace_label}"
+                ])
             if egress_label != "off":
                 filters.extend(["--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"])
                 fmt = "{{.ID}}\t{{.State}}"

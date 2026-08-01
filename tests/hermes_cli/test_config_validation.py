@@ -90,6 +90,26 @@ class TestConfigIssueDataclass:
         assert a == b
 
 
+class TestDockerCwdMountPolicyValidation:
+    def test_rejects_invalid_mount_mode(self):
+        issues = validate_config_structure({
+            "terminal": {"docker_cwd_mount_mode": "write-mostly"},
+        })
+        assert any(i.severity == "error" and "docker_cwd_mount_mode" in i.message for i in issues)
+
+    def test_rejects_non_absolute_path_mapping(self):
+        issues = validate_config_structure({
+            "terminal": {"docker_cwd_path_mappings": {"relative": "/host"}},
+        })
+        assert any(i.severity == "error" and "docker_cwd_path_mappings" in i.message for i in issues)
+
+    def test_rejects_non_absolute_allowed_root(self):
+        issues = validate_config_structure({
+            "terminal": {"docker_cwd_allowed_roots": ["relative"]},
+        })
+        assert any(i.severity == "error" and "docker_cwd_allowed_roots" in i.message for i in issues)
+
+
 class TestUnknownTopLevelKeys:
     """Arbitrary top-level keys must NOT warn — they are bridged to os.environ.
 

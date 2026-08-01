@@ -49,6 +49,9 @@ def _make_dummy_env(**kwargs):
         network=kwargs.get("network", True),
         host_cwd=kwargs.get("host_cwd"),
         auto_mount_cwd=kwargs.get("auto_mount_cwd", False),
+        cwd_mount_mode=kwargs.get("cwd_mount_mode", "rw"),
+        cwd_path_mappings=kwargs.get("cwd_path_mappings"),
+        cwd_allowed_roots=kwargs.get("cwd_allowed_roots"),
         env=kwargs.get("env"),
         run_as_host_user=kwargs.get("run_as_host_user", False),
         extra_args=kwargs.get("extra_args", []),
@@ -97,6 +100,139 @@ def test_auto_mount_host_cwd_adds_volume(monkeypatch, tmp_path):
     assert run_calls, "docker run should have been called"
     run_args_str = " ".join(run_calls[0][0])
     assert f"{project_dir}:/workspace" in run_args_str
+
+
+def test_auto_mount_host_cwd_read_only_adds_ro_volume(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(project_dir),
+        auto_mount_cwd=True,
+        cwd_mount_mode="ro",
+    )
+
+    run_args = next(c[0] for c in calls if c[0][1] == "run")
+    assert f"{project_dir}:/workspace:ro" in run_args
+    reuse_probe = next(c[0] for c in calls if c[0][1:3] == ["ps", "-a"])
+    assert any(arg.startswith("label=hermes-workspace=") for arg in reuse_probe)
+
+
+def test_auto_mount_translates_container_path_to_docker_host_path(monkeypatch, tmp_path):
+    container_root = tmp_path / "container-data"
+    project_dir = container_root / "tasks" / "review-target"
+    project_dir.mkdir(parents=True)
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(project_dir),
+        auto_mount_cwd=True,
+        cwd_path_mappings={str(container_root): "/home/ubuntu/.hermes"},
+    )
+
+    run_args = next(c[0] for c in calls if c[0][1] == "run")
+    assert "/home/ubuntu/.hermes/tasks/review-target:/workspace" in run_args
+    assert f"{project_dir}:/workspace" not in run_args
+
+
+def test_auto_mount_rejects_cwd_outside_allowed_roots(monkeypatch, tmp_path):
+    allowed = tmp_path / "allowed"
+    rejected = tmp_path / "rejected"
+    allowed.mkdir()
+    rejected.mkdir()
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="allowed workspace root"):
+        _make_dummy_env(
+            host_cwd=str(rejected),
+            auto_mount_cwd=True,
+            cwd_allowed_roots=[str(allowed)],
+        )
+
+
+def test_auto_mount_rejects_symlink_escape_from_allowed_root(monkeypatch, tmp_path):
+    allowed = tmp_path / "allowed"
+    outside = tmp_path / "outside"
+    allowed.mkdir()
+    outside.mkdir()
+    escaped = allowed / "escaped"
+    escaped.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="allowed workspace root"):
+        _make_dummy_env(
+            host_cwd=str(escaped),
+            auto_mount_cwd=True,
+            cwd_allowed_roots=[str(allowed)],
+        )
+
+
+def test_auto_mount_rejects_cwd_without_required_path_mapping(monkeypatch, tmp_path):
+    project_dir = tmp_path / "project"
+    unrelated = tmp_path / "unrelated"
+    project_dir.mkdir()
+    unrelated.mkdir()
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="path mapping"):
+        _make_dummy_env(
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_path_mappings={str(unrelated): "/docker-host/unrelated"},
+        )
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["-v", "/tmp/override:/workspace"],
+        ["--volume=/tmp/override:/workspace/subdir:ro"],
+        ["--mount", "type=bind,src=/tmp/override,dst=/workspace"],
+        ["--mount=type=bind,src=/tmp/override,target=/workspace/subdir"],
+    ],
+)
+def test_auto_mount_rejects_extra_args_workspace_mounts(monkeypatch, tmp_path, extra_args):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+
+    with pytest.raises(ValueError, match="docker_extra_args mounts /workspace"):
+        _make_dummy_env(
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+            extra_args=extra_args,
+        )
+
+
+@pytest.mark.parametrize(
+    "volume",
+    [
+        "/somewhere/else:/workspace:ro",
+        "/somewhere/else:/workspace/generated",
+        r"C:\review-target:/workspace:ro",
+    ],
+)
+def test_auto_mount_rejects_explicit_workspace_volume(monkeypatch, tmp_path, volume):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="docker_volumes.*workspace"):
+        _make_dummy_env(
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            volumes=[volume],
+        )
 
 
 def test_non_persistent_cleanup_removes_container(monkeypatch):
@@ -469,6 +605,7 @@ def test_labels_attribute_populated_after_init(monkeypatch):
         "hermes-task-id": "abc",
         "hermes-profile": "default",
         "hermes-egress": "off",
+        "hermes-workspace": "off",
     }
 
 
