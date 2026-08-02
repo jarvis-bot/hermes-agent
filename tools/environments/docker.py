@@ -41,6 +41,7 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EGRESS_LABEL_KEY = "hermes-egress"
 _WORKSPACE_LABEL_KEY = "hermes-workspace"
 _TMP_STORAGE_LABEL_KEY = "hermes-tmp-storage"
+_POLICY_LABEL_KEY = "hermes-policy"
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -124,8 +125,11 @@ def _sanitize_label_value(value: str) -> str:
     if not isinstance(value, str) or not value:
         return "unknown"
     cleaned = _LABEL_VALUE_OK_RE.sub("_", value)
-    cleaned = cleaned[:63] or "unknown"
-    return cleaned
+    if cleaned == value and len(cleaned) <= 63:
+        return cleaned
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    prefix = cleaned[:50] or "unknown"
+    return f"{prefix}-{digest}"
 
 
 def _get_active_profile_name() -> str:
@@ -608,6 +612,10 @@ def _extra_args_egress_collisions(
                     collisions.append(name)
         elif arg in network_flags or any(arg.startswith(f"{flag}=") for flag in network_flags):
             collisions.append(arg)
+        for attached in _short_option_values(extra_args, i, "e"):
+            name = attached.lstrip("=").split("=", 1)[0]
+            if name in critical_names:
+                collisions.append(name)
         i += 1
     return sorted(set(collisions))
 
@@ -621,6 +629,7 @@ def _extra_args_reserved_label_collisions(extra_args: list[str]) -> list[str]:
         _EGRESS_LABEL_KEY,
         _WORKSPACE_LABEL_KEY,
         _TMP_STORAGE_LABEL_KEY,
+        _POLICY_LABEL_KEY,
     }
     collisions: list[str] = []
     for index, arg in enumerate(extra_args):
@@ -635,7 +644,7 @@ def _extra_args_reserved_label_collisions(extra_args: list[str]) -> list[str]:
                 value = extra_args[index + 1]
         elif arg.startswith(("-l=", "--label=")):
             value = arg.split("=", 1)[1]
-        attached_values = _attached_short_option_values(arg, "l")
+        attached_values = _short_option_values(extra_args, index, "l")
         values = [value, *attached_values]
         for candidate in values:
             if candidate:
@@ -975,6 +984,14 @@ def _attached_short_option_values(arg: str, option: str) -> list[str]:
         if char not in {"d", "i", "P", "q", "t"}:
             break
     return []
+
+
+def _short_option_values(extra_args: list[str], index: int, option: str) -> list[str]:
+    """Return attached or following values for a bundled Docker short option."""
+    values = _attached_short_option_values(extra_args[index], option)
+    if values == [""] and index + 1 < len(extra_args):
+        return [extra_args[index + 1]]
+    return values
 
 
 def _volume_mounts_workspace(volume: str) -> bool:

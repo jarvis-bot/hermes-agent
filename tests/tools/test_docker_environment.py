@@ -753,20 +753,28 @@ def test_run_command_tags_hermes_agent_label(monkeypatch):
     )
 
 
-def test_label_sanitizer_rejects_invalid_characters():
-    """Docker label values must be alnum + ``_.-`` and ≤63 chars. Profile or
-    task names containing slashes, colons, or unicode would otherwise emit
-    invalid labels that round-trip badly through ``docker ps --filter``."""
+def test_label_sanitizer_rejects_invalid_characters_without_aliasing():
+    """Docker label values must be safe, bounded, and collision-resistant."""
     assert docker_env._sanitize_label_value("plain-name_1.0") == "plain-name_1.0"
-    assert docker_env._sanitize_label_value("with/slash") == "with_slash"
-    assert docker_env._sanitize_label_value("with:colon") == "with_colon"
-    assert docker_env._sanitize_label_value("emoji-😀-here") == "emoji-_-here"
+
+    slash = docker_env._sanitize_label_value("with/slash")
+    colon = docker_env._sanitize_label_value("with:slash")
+    assert slash.startswith("with_slash-")
+    assert colon.startswith("with_slash-")
+    assert slash != colon
+
+    unicode_value = docker_env._sanitize_label_value("emoji-😀-here")
+    assert unicode_value.startswith("emoji-_-here-")
+    assert all(character.isascii() and (character.isalnum() or character in "_.-") for character in unicode_value)
+
     # Empty / non-string inputs must collapse to a queryable token, not "".
     assert docker_env._sanitize_label_value("") == "unknown"
     assert docker_env._sanitize_label_value(None) == "unknown"  # type: ignore[arg-type]
-    # >63 chars must truncate, not error.
+    # >63 chars must remain bounded while differing inputs remain distinguishable.
     long_value = "x" * 100
-    assert len(docker_env._sanitize_label_value(long_value)) == 63
+    sanitized_long = docker_env._sanitize_label_value(long_value)
+    assert len(sanitized_long) == 63
+    assert sanitized_long != docker_env._sanitize_label_value("x" * 99 + "y")
 
 
 def test_run_command_sanitizes_unsafe_task_id(monkeypatch):
@@ -780,10 +788,9 @@ def test_run_command_sanitizes_unsafe_task_id(monkeypatch):
     _make_dummy_env(task_id="task/with:weird*chars")
 
     labels = _labels_in_run_args(_run_args_from_calls(calls))
-    # Each non-OK character becomes an underscore; the safe chars survive.
-    assert "hermes-task-id=task_with_weird_chars" in labels, (
-        f"sanitized task-id label missing; got: {sorted(labels)}"
-    )
+    task_labels = [label for label in labels if label.startswith("hermes-task-id=")]
+    assert len(task_labels) == 1
+    assert task_labels[0].startswith("hermes-task-id=task_with_weird_chars-")
 
 
 def test_labels_attribute_populated_after_init(monkeypatch):
@@ -935,7 +942,16 @@ def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):
     assert run_invocations, "egress-enabled containers require a fresh docker run"
 
 
-def test_extra_args_proxy_override_refuses_under_egress(monkeypatch):
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["-e", "HTTPS_PROXY="],
+        ["-eHTTPS_PROXY="],
+        ["-eOPENROUTER_API_KEY"],
+        ["-deOPENROUTER_API_KEY"],
+    ],
+)
+def test_extra_args_proxy_override_refuses_under_egress(monkeypatch, extra_args):
     """docker_extra_args are appended after Hermes args, so egress enforcement
     must reject critical overrides before Docker sees them."""
 
@@ -945,14 +961,17 @@ def test_extra_args_proxy_override_refuses_under_egress(monkeypatch):
         "_egress_proxy_args_for_docker",
         lambda: (
             [],
-            {"HTTPS_PROXY": "http://host.docker.internal:9090"},
+            {
+                "HTTPS_PROXY": "http://host.docker.internal:9090",
+                "OPENROUTER_API_KEY": "proxy-token",
+            },
             [],
         ),
     )
     _mock_subprocess_run(monkeypatch)
 
-    with pytest.raises(RuntimeError, match="docker_extra_args.*HTTPS_PROXY"):
-        _make_dummy_env(extra_args=["-e", "HTTPS_PROXY="])
+    with pytest.raises(RuntimeError, match="docker_extra_args"):
+        _make_dummy_env(extra_args=extra_args)
 
 
 def test_reuse_starts_stopped_container_before_attaching(monkeypatch):
