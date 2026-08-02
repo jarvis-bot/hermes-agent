@@ -134,7 +134,7 @@ def _sanitize_label_value(value: str) -> str:
 
 
 def _readonly_tree_digest(root: Path) -> str:
-    """Hash a read-only source tree without following symlinks or Git objects.
+    """Hash a complete read-only source tree without following symlinks.
 
     Permission bits are part of the identity because Git tracks the executable
     bit and reviewers must not reuse a container across a mode-only change.
@@ -145,11 +145,7 @@ def _readonly_tree_digest(root: Path) -> str:
     if root.is_file():
         paths = [root]
     else:
-        paths = sorted(
-            path
-            for path in root.rglob("*")
-            if ".git" not in path.relative_to(root).parts
-        )
+        paths = sorted(root.rglob("*"))
     # Include the source object itself as well as its descendants.  ``lstat``
     # deliberately authenticates symlinks rather than their targets.
     for path in [root, *paths] if paths != [root] else paths:
@@ -266,6 +262,15 @@ def _path_identity(path: str, *, content_digest: bool = False) -> dict[str, obje
             head, commit = _git_commit_identity(git_entry)
             identity["git_head"] = head
             identity["git_ref"] = commit
+            # A linked worktree's .git file points outside the mounted source,
+            # so the source-tree digest above authenticates only the pointer.
+            # Authenticate the referenced metadata too: replacement refs,
+            # config, index and attributes can all change Git's interpretation
+            # while HEAD itself remains unchanged.
+            if content_digest and git_entry.is_file():
+                marker = git_entry.read_text(encoding="utf-8").strip()
+                git_dir = (git_entry.parent / marker[7:].strip()).resolve(strict=True)
+                identity["git_metadata_sha256"] = _readonly_tree_digest(git_dir)
         except (OSError, ValueError) as exc:
             if content_digest:
                 raise ValueError(
@@ -288,12 +293,15 @@ def _volume_source_identities(
         if source.startswith("/"):
             mode = spec.rsplit(":", 1)[-1].split(",")
             destination = spec.split(":", 2)[1] if ":" in spec else ""
+            is_read_only_workspace = "ro" in mode and (
+                destination == "/workspace"
+                or destination.startswith("/workspace/")
+            )
             identity = _path_identity(
                 source,
                 content_digest=(
-                    "ro" in mode
-                    and destination == "/workspace"
-                    and not canonical_workspace
+                    is_read_only_workspace
+                    and not (canonical_workspace and destination == "/workspace")
                 ),
             )
             if "ro" not in mode:

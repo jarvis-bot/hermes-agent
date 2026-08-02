@@ -462,6 +462,51 @@ def test_read_only_workspace_resolves_packed_git_head(monkeypatch, tmp_path):
     assert first_label != second_label
 
 
+def test_read_only_workspace_git_metadata_participates_in_policy(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    git_dir = project_dir / ".git"
+    replace_dir = git_dir / "refs" / "replace"
+    replace_dir.mkdir(parents=True)
+    assigned_sha = "1" * 40
+    (git_dir / "HEAD").write_text(assigned_sha + "\n", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    options = {
+        "cwd": "/workspace",
+        "host_cwd": str(project_dir),
+        "auto_mount_cwd": True,
+        "cwd_mount_mode": "ro",
+    }
+
+    _make_dummy_env(**options)
+    first_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    first_label = next(arg for arg in first_run if arg.startswith("hermes-policy="))
+
+    (replace_dir / assigned_sha).write_text("2" * 40 + "\n", encoding="utf-8")
+    _make_dummy_env(**options)
+    second_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    second_label = next(arg for arg in second_run if arg.startswith("hermes-policy="))
+
+    assert first_label != second_label
+
+
+def test_read_only_workspace_submount_is_revalidated(monkeypatch, tmp_path):
+    component_dir = tmp_path / "component"
+    component_dir.mkdir()
+    candidate = component_dir / "candidate.txt"
+    candidate.write_text("reviewed", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(volumes=[f"{component_dir}:/workspace/component:ro"])
+
+    candidate.write_text("changed after mount", encoding="utf-8")
+    result = env.execute("true")
+
+    assert result["returncode"] == 126
+    assert "read-only workspace changed" in result["output"]
+
+
 def test_mapped_read_only_workspace_uses_canonical_source_identity(monkeypatch, tmp_path):
     container_root = tmp_path / "container-data"
     project_dir = container_root / "review-target"
