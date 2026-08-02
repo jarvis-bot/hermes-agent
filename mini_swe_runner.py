@@ -144,8 +144,9 @@ def create_environment(
             from hermes_cli.config import load_config
 
             terminal_config = load_config().get("terminal") or {}
-            kwargs["tmp_storage"] = terminal_config.get(
-                "docker_tmp_storage", "tmpfs"
+            kwargs["tmp_storage"] = os.getenv(
+                "TERMINAL_DOCKER_TMP_STORAGE",
+                terminal_config.get("docker_tmp_storage", "tmpfs"),
             )
         return DockerEnvironment(image=image, cwd=cwd, timeout=timeout, **kwargs)
     
