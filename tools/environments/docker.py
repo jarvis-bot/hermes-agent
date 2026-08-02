@@ -184,22 +184,32 @@ def _packed_git_ref(git_dir: Path, ref_name: str) -> Optional[str]:
     return None
 
 
-def _git_commit_identity(git_entry: Path) -> tuple[str, str]:
-    """Return ``(HEAD text, commit)`` for normal and linked Git worktrees."""
+def _git_metadata_dirs(git_entry: Path) -> tuple[Path, Path]:
+    """Return the worktree-specific and common Git metadata directories."""
     if git_entry.is_file():
         marker = git_entry.read_text(encoding="utf-8").strip()
         if not marker.startswith("gitdir:"):
             raise ValueError(f"invalid Git metadata marker: {git_entry}")
-        git_dir = (git_entry.parent / marker[7:].strip()).resolve(strict=True)
+        git_dir_text = marker[7:].strip()
+        if not git_dir_text:
+            raise ValueError(f"invalid Git metadata marker: {git_entry}")
+        git_dir = (git_entry.parent / git_dir_text).resolve(strict=True)
     else:
         git_dir = git_entry.resolve(strict=True)
 
     common_dir = git_dir
     commondir_file = git_dir / "commondir"
     if commondir_file.is_file():
-        common_dir = (
-            git_dir / commondir_file.read_text(encoding="utf-8").strip()
-        ).resolve(strict=True)
+        common_dir_text = commondir_file.read_text(encoding="utf-8").strip()
+        if not common_dir_text:
+            raise ValueError(f"invalid Git common metadata marker: {commondir_file}")
+        common_dir = (git_dir / common_dir_text).resolve(strict=True)
+    return git_dir, common_dir
+
+
+def _git_commit_identity(git_entry: Path) -> tuple[str, str]:
+    """Return ``(HEAD text, commit)`` for normal and linked Git worktrees."""
+    git_dir, common_dir = _git_metadata_dirs(git_entry)
 
     head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
     if not head.startswith("ref:"):
@@ -268,9 +278,9 @@ def _path_identity(path: str, *, content_digest: bool = False) -> dict[str, obje
             # config, index and attributes can all change Git's interpretation
             # while HEAD itself remains unchanged.
             if content_digest and git_entry.is_file():
-                marker = git_entry.read_text(encoding="utf-8").strip()
-                git_dir = (git_entry.parent / marker[7:].strip()).resolve(strict=True)
+                git_dir, common_dir = _git_metadata_dirs(git_entry)
                 identity["git_metadata_sha256"] = _readonly_tree_digest(git_dir)
+                identity["git_common_metadata_sha256"] = _readonly_tree_digest(common_dir)
         except (OSError, ValueError) as exc:
             if content_digest:
                 raise ValueError(
