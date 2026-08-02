@@ -27,6 +27,8 @@ def _mock_subprocess_run(monkeypatch):
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
             if cmd[1] == "run":
                 return subprocess.CompletedProcess(cmd, 0, stdout="fake-container-id\n", stderr="")
+            if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="[]\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
@@ -121,6 +123,30 @@ def test_disk_tmp_storage_uses_container_writable_layer(monkeypatch):
     assert "no-new-privileges" in run_args
 
 
+def test_disk_tmp_storage_rejects_image_declared_tmp_volume(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    docker_env._cgroup_limits_ok = True
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+        if cmd[1] == "run":
+            return subprocess.CompletedProcess(cmd, 0, stdout="disk-container\n", stderr="")
+        if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
+            mounts = '[{"Type":"volume","Destination":"/tmp"}]\n'
+            return subprocess.CompletedProcess(cmd, 0, stdout=mounts, stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    with pytest.raises(RuntimeError, match="container writable layer"):
+        _make_dummy_env(tmp_storage="disk", persist_across_processes=False)
+
+    assert ["/usr/bin/docker", "rm", "-f", "disk-container"] in calls
+
+
 def test_default_tmp_storage_preserves_hardened_tmpfs(monkeypatch):
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     calls = _mock_subprocess_run(monkeypatch)
@@ -172,8 +198,16 @@ def test_extra_args_cannot_override_reserved_reuse_labels(monkeypatch, extra_arg
         ["--volume=scratch:/tmp/cache"],
         ["-vscratch:/tmp"],
         ["-itvscratch:/tmp/cache"],
+        ["-Pvscratch:/tmp/cache"],
         ["--mount", "type=tmpfs,target=/tmp"],
         ["--mount=type=volume,source=scratch,destination=/tmp/cache"],
+        ['--mount=type=volume,source=scratch,"target=/tmp"'],
+        ["--mount=type=volume,source=scratch,target=/x/../tmp/cache"],
+        ["--mount=type=volume,source=scratch,TARGET=/tmp/cache"],
+        ["--volume=scratch:/x/../tmp"],
+        ["--tmpfs=//tmp/cache:size=1g"],
+        ["--volumes-from", "tmp-donor"],
+        ["--volumes-from=tmp-donor"],
     ],
 )
 def test_extra_args_cannot_override_tmp_storage_policy(monkeypatch, extra_args):
@@ -191,6 +225,77 @@ def test_docker_volumes_cannot_override_tmp_storage_policy(monkeypatch, volume):
 
     with pytest.raises(ValueError, match="use docker_tmp_storage"):
         _make_dummy_env(volumes=[volume])
+
+
+def test_attached_env_value_is_not_misparsed_as_volume(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(extra_args=["-eFOOv=/tmp/cache"], persist_across_processes=False)
+
+    run_args = next(c[0] for c in calls if c[0][1] == "run")
+    assert "-eFOOv=/tmp/cache" in run_args
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["-v", "/host/review:/workspace:ro"],
+        ["-Pvscratch:/workspace/cache:ro"],
+        ["--mount=type=bind,source=/host/review,target=/workspace"],
+        ["--mount=type=bind,source=/host/review,target=/x/../workspace"],
+        ["--mount=type=bind,source=/host/review,Destination=/workspace"],
+        ["--volume=/host/review://workspace:ro"],
+        ["--volume", "/workspace/cache"],
+        ["-dv/workspace/cache"],
+        ["--tmpfs=/x/../workspace/cache:size=1g"],
+        ["--volumes-from", "workspace-donor"],
+    ],
+)
+def test_extra_args_cannot_mount_workspace_without_reuse_fingerprint(
+    monkeypatch, extra_args
+):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="container reuse isolation"):
+        _make_dummy_env(extra_args=extra_args)
+
+
+@pytest.mark.parametrize("network_arg", [["--network=host"], ["--net", "bridge"]])
+def test_network_disabled_rejects_extra_arg_override(monkeypatch, network_arg):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="docker_network=false"):
+        _make_dummy_env(network=False, extra_args=network_arg)
+
+
+def test_explicit_workspace_mount_participates_in_reuse_fingerprint(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(volumes=["/host/review:/workspace:ro"])
+
+    run_args = next(c[0] for c in calls if c[0][1] == "run")
+    workspace_label = next(
+        arg.split("=", 1)[1]
+        for arg in run_args
+        if arg.startswith("hermes-workspace=")
+    )
+    assert workspace_label != "off"
+    reuse_probe = next(c[0] for c in calls if c[0][1:3] == ["ps", "-a"])
+    assert f"label=hermes-workspace={workspace_label}" in reuse_probe
+
+
+def test_workspace_off_participates_in_reuse_fingerprint(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env()
+
+    reuse_probe = next(c[0] for c in calls if c[0][1:3] == ["ps", "-a"])
+    assert "label=hermes-workspace=off" in reuse_probe
 
 
 def test_auto_mount_host_cwd_read_only_adds_ro_volume(monkeypatch, tmp_path):
@@ -745,6 +850,10 @@ def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
                 return subprocess.CompletedProcess(cmd, 0, stdout="reused-cid\n", stderr="")
             if sub == "run":
                 return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
+            if sub == "inspect" and "{{.HostConfig.NetworkMode}}" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="bridge\n", stderr="")
+            if sub == "inspect" and "{{json .Mounts}}" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="[]\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
@@ -808,6 +917,10 @@ def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             if sub == "run":
                 return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
+            if sub == "inspect" and "{{.HostConfig.NetworkMode}}" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="bridge\n", stderr="")
+            if sub == "inspect" and "{{json .Mounts}}" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="[]\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
@@ -957,6 +1070,8 @@ def test_find_reusable_handles_empty_label_string(monkeypatch):
                     stdout="safe-cid\trunning\t\n",
                     stderr="",
                 )
+            if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="[]\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
@@ -1426,6 +1541,8 @@ def _mock_subprocess_run_with_entrypoint(monkeypatch, entrypoint_json):
                 return subprocess.CompletedProcess(cmd, 0, stdout=entrypoint_json + "\n", stderr="")
             if cmd[1] == "run":
                 return subprocess.CompletedProcess(cmd, 0, stdout="fake-container-id\n", stderr="")
+            if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="[]\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)

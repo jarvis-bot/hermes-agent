@@ -227,8 +227,8 @@ terminal:
     - "/home/user/data:/data:ro"   # :ro for read-only
   docker_extra_args:               # Extra flags appended verbatim to `docker run`
     - "--gpus=all"
-    - "--network=host"
   docker_network: true             # false = air-gap the container (--network=none)
+  docker_tmp_storage: tmpfs        # tmpfs (512 MB default) or disk writable layer
 
   # Resource limits
   container_cpu: 1                 # CPU cores (0 = unlimited)
@@ -248,9 +248,11 @@ terminal:
 
 **`docker_env`** vs **`docker_forward_env`**: the former injects literal `KEY=value` pairs you specify in the config (the values live in your `config.yaml` or are passed as a JSON dict via `TERMINAL_DOCKER_ENV='{"DEBUG":"1"}'`). The latter forwards values from your shell or `~/.hermes/.env`, so the actual secret never appears in the config file. Use `docker_forward_env` for tokens and `docker_env` for static knobs the container needs.
 
-**`terminal.docker_extra_args`** (also overridable via `TERMINAL_DOCKER_EXTRA_ARGS='["--gpus=all"]'`) lets you pass additional `docker run` flags that Hermes doesn't surface as first-class keys — `--gpus`, `--network`, `--add-host`, alternative `--security-opt` overrides, etc. Each entry must be a string; the list is appended last to the assembled `docker run` invocation so it can override Hermes' defaults if needed. Reserved Hermes identity labels, label files, and conflicting `/workspace` mounts are rejected. Use sparingly — other flags that conflict with sandbox hardening (capability drops or `--user`) can weaken isolation.
+**`terminal.docker_extra_args`** (also overridable via `TERMINAL_DOCKER_EXTRA_ARGS='["--gpus=all"]'`) lets you pass additional `docker run` flags that Hermes doesn't surface as first-class keys — `--gpus`, `--add-host`, alternative `--security-opt` overrides, etc. Each entry must be a string. Reserved Hermes identity labels, label files, network selection, and conflicting `/workspace` or `/tmp` mounts are rejected because those immutable settings participate in reusable-container isolation. Use sparingly — other flags that conflict with sandbox hardening (capability drops or `--user`) can weaken isolation.
 
 **`terminal.docker_network`** (default `true`; env: `TERMINAL_DOCKER_NETWORK`) — set to `false` to run the sandbox container with `--network=none`, cutting off all network egress from agent commands. This applies to the execution container used by `terminal`, `execute_code`, and the file tools. Because containers persist across Hermes processes, flipping this to `false` while an older networked container exists will remove that container and start a fresh air-gapped one (a warning is logged); background processes running inside it are lost. Prefer this key over passing `--network=none` through `docker_extra_args`.
+
+On the first run after upgrading to a version that supports `docker_tmp_storage`, Hermes starts a fresh labeled container rather than reusing an older container whose `/tmp` policy cannot be authenticated by its reuse labels. The old container and its background processes remain detached from Hermes; remove that stale container after confirming the replacement is healthy.
 
 **Requirements:** Docker Desktop or Docker Engine installed and running. Hermes probes `$PATH` plus common macOS install locations (`/usr/local/bin/docker`, `/opt/homebrew/bin/docker`, Docker Desktop app bundle). Podman is supported out of the box: set `HERMES_DOCKER_BINARY=podman` (or the full path) to force it when both are installed.
 

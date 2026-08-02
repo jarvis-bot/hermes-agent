@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -923,23 +924,57 @@ def _resolve_cwd_mount_source(
 def _volume_mounts_path(volume: str, container_path: str) -> bool:
     """Recognize a Docker ``-v`` entry targeting a path or its subtree."""
     # Match from the right so Windows drive-letter sources (``C:\\...``) do
-    # not confuse destination parsing. A nested mount can punch through policy
-    # applied at the parent path.
-    target = re.escape(container_path.rstrip("/"))
-    return re.search(rf":{target}(?:/[^:]*)?(?::[^:]*)?$", volume) is not None
+    # not confuse destination parsing. Canonicalize the destination because the
+    # container runtime resolves repeated separators and ``..`` components.
+    match = re.search(r":(/[^:]*)(?::[^:]*)?$", volume)
+    return bool(
+        match and _container_path_is_at_or_below(match.group(1), container_path)
+    )
+
+
+def _container_path_is_at_or_below(candidate: str, protected: str) -> bool:
+    """Return whether a container path resolves to a protected path/subtree."""
+    candidate = candidate.strip().replace('"', "").replace("'", "")
+    if not candidate.startswith("/"):
+        return False
+    # posixpath intentionally preserves exactly two leading slashes; Docker
+    # does not provide a separate namespace there, so collapse all of them.
+    canonical = posixpath.normpath("/" + candidate.lstrip("/"))
+    root = posixpath.normpath("/" + protected.lstrip("/"))
+    return canonical == root or canonical.startswith(root + "/")
+
+
+def _mount_spec_targets_path(spec: str, container_path: str) -> bool:
+    """Recognize a Docker ``--mount`` CSV destination after normalization."""
+    normalized = spec.replace('"', "").replace("'", "")
+    for field in normalized.split(","):
+        key, separator, value = field.partition("=")
+        if separator and key.strip().lower() in {"dst", "destination", "target"}:
+            if _container_path_is_at_or_below(value.strip(), container_path):
+                return True
+    return False
 
 
 def _attached_short_option_values(arg: str, option: str) -> list[str]:
-    """Return possible values for a Docker short option bundled in one token.
+    """Return a Docker short-option value bundled in one token.
 
-    Docker accepts both ``-vVALUE`` and bundles such as ``-itvVALUE``. Return
-    every suffix following the requested option so validation stays fail-closed
-    even when a value itself contains the same letter.
+    Docker accepts both ``-vVALUE`` and bundles such as ``-itvVALUE``. Only
+    no-value flags may precede the value-taking option; once another
+    value-taking option such as ``-e`` starts, later characters are its value
+    rather than more bundled flags.
     """
     if not arg.startswith("-") or arg.startswith("--"):
         return []
     token = arg[1:]
-    return [token[index + 1:] for index, char in enumerate(token) if char == option]
+    for index, char in enumerate(token):
+        if char == option:
+            return [token[index + 1:]]
+        # Docker run's value-free short flags may be bundled before another
+        # short option.  Stop at every value-taking flag so characters in that
+        # option's value are never reinterpreted as flags.
+        if char not in {"d", "i", "P", "q", "t"}:
+            break
+    return []
 
 
 def _volume_mounts_workspace(volume: str) -> bool:
@@ -949,18 +984,30 @@ def _volume_mounts_workspace(volume: str) -> bool:
 
 def _extra_args_mount_workspace(extra_args: list[str]) -> bool:
     """Return whether raw Docker flags can add or replace a /workspace mount."""
-    mount_flags = {"-v", "--volume", "--mount"}
+    mount_flags = {"-v", "--volume", "--mount", "--tmpfs"}
     for index, arg in enumerate(extra_args):
+        if arg == "--volumes-from" or arg.startswith("--volumes-from="):
+            # A donor can contain a writable /workspace destination and its
+            # mutable mount set cannot participate in our reuse fingerprint.
+            return True
         if arg in mount_flags:
             value = extra_args[index + 1] if index + 1 < len(extra_args) else ""
         elif any(arg.startswith(f"{flag}=") for flag in mount_flags):
             value = arg.split("=", 1)[1]
         else:
-            continue
-        if _volume_mounts_workspace(value):
-            return True
-        if re.search(r"(?:^|,)\s*(?:dst|destination|target)\s*=\s*/workspace(?:/|,|$)", value):
-            return True
+            value = ""
+        values = [value, *_attached_short_option_values(arg, "v")]
+        for candidate in values:
+            candidate = candidate.lstrip("=")
+            if _volume_mounts_workspace(candidate):
+                return True
+            # Docker also accepts destination-only anonymous volumes and
+            # destination-only --tmpfs values.
+            direct_target = candidate.split(":", 1)[0]
+            if _container_path_is_at_or_below(direct_target, "/workspace"):
+                return True
+            if _mount_spec_targets_path(candidate, "/workspace"):
+                return True
     return False
 
 
@@ -968,6 +1015,10 @@ def _extra_args_mount_tmp(extra_args: list[str]) -> bool:
     """Return whether raw Docker flags can replace /tmp storage policy."""
     mount_flags = {"-v", "--volume", "--mount", "--tmpfs"}
     for index, arg in enumerate(extra_args):
+        if arg == "--volumes-from" or arg.startswith("--volumes-from="):
+            # The donor's destinations cannot be validated without inspecting
+            # mutable external container state, so fail closed.
+            return True
         if arg in mount_flags:
             value = extra_args[index + 1] if index + 1 < len(extra_args) else ""
         elif any(arg.startswith(f"{flag}=") for flag in mount_flags):
@@ -979,11 +1030,21 @@ def _extra_args_mount_tmp(extra_args: list[str]) -> bool:
             candidate = candidate.lstrip("=")
             if _volume_mounts_path(candidate, "/tmp"):
                 return True
-            if re.match(r"^/tmp(?:/|:|$)", candidate):
+            tmpfs_target = candidate.split(":", 1)[0]
+            if _container_path_is_at_or_below(tmpfs_target, "/tmp"):
                 return True
-            if re.search(r"(?:^|,)\s*(?:dst|destination|target)\s*=\s*/tmp(?:/|,|$)", candidate):
+            if _mount_spec_targets_path(candidate, "/tmp"):
                 return True
     return False
+
+
+def _extra_args_override_network(extra_args: list[str]) -> bool:
+    """Return whether raw Docker flags select a network mode."""
+    return any(
+        arg in {"--network", "--net"}
+        or arg.startswith(("--network=", "--net="))
+        for arg in extra_args
+    )
 
 
 class DockerEnvironment(BaseEnvironment):
@@ -1036,6 +1097,9 @@ class DockerEnvironment(BaseEnvironment):
         self._container_name: str = ""
         self._image_uses_s6_init: bool = False
         self._all_run_args: list[str] = []
+        self._network_enabled = network
+        self._tmp_storage = tmp_storage
+        self._workspace_requires_ro = False
         logger.info(f"DockerEnvironment volumes: {volumes}")
         # Ensure volumes is a list (config.yaml could be malformed)
         if volumes is not None and not isinstance(volumes, list):
@@ -1140,6 +1204,19 @@ class DockerEnvironment(BaseEnvironment):
             ])
 
         workspace_label = "off"
+        if workspace_explicitly_mounted:
+            workspace_specs = sorted(
+                volume_args[index + 1]
+                for index, arg in enumerate(volume_args[:-1])
+                if arg == "-v" and _volume_mounts_workspace(volume_args[index + 1])
+            )
+            workspace_label = hashlib.sha256(
+                "\0".join(workspace_specs).encode("utf-8")
+            ).hexdigest()[:16]
+            self._workspace_requires_ro = any(
+                "ro" in spec.rsplit(":", 1)[-1].split(",")
+                for spec in workspace_specs
+            )
         if bind_host_cwd:
             mount_spec = f"{docker_host_cwd}:/workspace"
             if cwd_mount_mode == "ro":
@@ -1152,6 +1229,7 @@ class DockerEnvironment(BaseEnvironment):
                 cwd_mount_mode,
             )
             volume_args = ["-v", mount_spec, *volume_args]
+            self._workspace_requires_ro = cwd_mount_mode == "ro"
 
         # Mount credential files (OAuth tokens, etc.) declared by skills.
         # Read-only so the container can authenticate but not modify host creds.
@@ -1474,15 +1552,33 @@ class DockerEnvironment(BaseEnvironment):
                 logger.warning("Ignoring non-string docker_extra_args entry: %r", arg)
                 continue
             validated_extra.append(arg)
-        if bind_host_cwd and _extra_args_mount_workspace(validated_extra):
+        if any(
+            arg == "--volumes-from" or arg.startswith("--volumes-from=")
+            for arg in validated_extra
+        ):
             raise ValueError(
-                "docker_extra_args mounts /workspace while "
-                "docker_mount_cwd_to_workspace is enabled; remove the conflicting mount"
+                "docker_extra_args mounts /workspace or /tmp through an opaque "
+                "donor with --volumes-from; this cannot participate in container "
+                "reuse isolation. use docker_tmp_storage and explicit "
+                "docker_volumes instead"
+            )
+        if _extra_args_mount_workspace(validated_extra):
+            raise ValueError(
+                "docker_extra_args mounts /workspace or its subdirectories; "
+                "this is not allowed in raw arguments. "
+                "use docker_volumes or docker_mount_cwd_to_workspace so the mount "
+                "participates in container reuse isolation"
             )
         if _extra_args_mount_tmp(validated_extra):
             raise ValueError(
                 "docker_extra_args cannot mount /tmp or its subdirectories; "
                 "use docker_tmp_storage to select the /tmp policy"
+            )
+        if _extra_args_override_network(validated_extra):
+            raise ValueError(
+                "docker_extra_args cannot select a network mode; in particular it "
+                "cannot override terminal.docker_network=false. use "
+                "terminal.docker_network for reusable-container isolation"
             )
         reserved_label_collisions = _extra_args_reserved_label_collisions(validated_extra)
         if reserved_label_collisions:
@@ -1580,22 +1676,22 @@ class DockerEnvironment(BaseEnvironment):
                 # networked container despite the config.  On mismatch we
                 # remove the stale container and start fresh — leaving it in
                 # place would let the next label-based reuse pick it up again.
-                # Only the lockdown direction is guarded: a ``none``-mode
-                # container under a default-network config is left alone so
-                # operators using ``docker_extra_args: ["--network=none"]``
-                # don't get their container churned on every startup.
-                mode_mismatch = False
-                actual_mode = None
-                if not network:
-                    actual_mode = self._container_network_mode(container_id)
-                    mode_mismatch = actual_mode != "none"
+                # Raw network selection is rejected, so the effective mode must
+                # match in both directions: enabled must not reuse ``none``, and
+                # disabled must reuse only ``none``.
+                actual_mode = self._container_network_mode(container_id)
+                mode_mismatch = (
+                    actual_mode is None
+                    or (not network and actual_mode != "none")
+                    or (network and actual_mode == "none")
+                )
                 if mode_mismatch:
                     logger.warning(
-                        "Existing container %s has NetworkMode=%s but "
-                        "docker_network=false requests an air-gapped "
-                        "container — removing it and starting fresh "
-                        "(task=%s, profile=%s).",
+                        "Existing container %s has NetworkMode=%s but the requested "
+                        "docker_network policy requires %s — removing it and starting "
+                        "fresh (task=%s, profile=%s).",
                         container_id[:12], actual_mode or "unknown",
+                        "network access" if network else "an air-gapped container",
                         task_label, profile_name,
                     )
                     try:
@@ -1682,6 +1778,13 @@ class DockerEnvironment(BaseEnvironment):
                 raise
             self._container_id = result.stdout.strip()
             logger.info(f"Started container {container_name} ({self._container_id[:12]})")
+
+        policy_error = self._effective_policy_violation(self._container_id)
+        if policy_error:
+            container_id = self._container_id
+            self._remove_rejected_container(container_id)
+            self._container_id = None
+            raise RuntimeError(policy_error)
 
         # Build the init-time env forwarding args (used only by init_session
         # to inject host env vars into the snapshot; subsequent commands get
@@ -1840,7 +1943,29 @@ class DockerEnvironment(BaseEnvironment):
                 logger.error("Recovery: failed to create new container: %s", e)
                 return False
 
-        # 3. Re-initialize session snapshot in the (re)created container.
+        # 3. Revalidate immutable policies before using the recovered container.
+        mode = self._container_network_mode(self._container_id)
+        mode_mismatch = (
+            mode is None
+            or (not self._network_enabled and mode != "none")
+            or (self._network_enabled and mode == "none")
+        )
+        if mode_mismatch:
+            logger.error(
+                "Recovery rejected container %s with NetworkMode=%s",
+                self._container_id[:12], mode or "unknown",
+            )
+            self._remove_rejected_container(self._container_id)
+            self._container_id = None
+            return False
+        policy_error = self._effective_policy_violation(self._container_id)
+        if policy_error:
+            logger.error("Recovery rejected container: %s", policy_error)
+            self._remove_rejected_container(self._container_id)
+            self._container_id = None
+            return False
+
+        # 4. Re-initialize session snapshot in the (re)created container.
         try:
             self._snapshot_ready = False
             self.init_session()
@@ -1945,6 +2070,105 @@ class DockerEnvironment(BaseEnvironment):
         mode = result.stdout.strip()
         return mode or None
 
+    def _container_has_mount_at_or_below(
+        self,
+        container_id: str,
+        container_path: str,
+        *,
+        include_root: bool = True,
+        writable_only: bool = False,
+    ) -> bool:
+        """Fail closed if effective Docker mounts overlap a protected path."""
+        try:
+            result = subprocess.run(
+                [
+                    self._docker_exe,
+                    "inspect",
+                    "--format",
+                    "{{json .Mounts}}",
+                    container_id,
+                ],
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=30,
+                check=True,
+                stdin=subprocess.DEVNULL,
+            )
+            mounts = json.loads(result.stdout)
+            if not isinstance(mounts, list):
+                return True
+            root = posixpath.normpath("/" + container_path.lstrip("/"))
+            for mount in mounts:
+                if not isinstance(mount, dict):
+                    continue
+                destination = mount.get("Destination")
+                if not isinstance(destination, str):
+                    continue
+                canonical = posixpath.normpath("/" + destination.lstrip("/"))
+                if _container_path_is_at_or_below(destination, container_path):
+                    if include_root or canonical != root:
+                        if not writable_only or mount.get("RW") is not False:
+                            return True
+            return False
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+            json.JSONDecodeError,
+        ) as e:
+            logger.warning(
+                "Could not verify effective mounts for container %s: %s",
+                container_id[:12],
+                e,
+            )
+            return True
+
+    def _effective_policy_violation(self, container_id: str) -> Optional[str]:
+        """Return a fail-closed effective-mount policy error, if any."""
+        if self._tmp_storage == "disk":
+            if self._container_has_mount_at_or_below(container_id, "/tmp"):
+                return (
+                    "docker_tmp_storage=disk requires /tmp on the container "
+                    "writable layer, but the effective image/container declares "
+                    "a mount at /tmp"
+                )
+        elif self._container_has_mount_at_or_below(
+            container_id, "/tmp", include_root=False
+        ):
+            return "effective container mounts bypass the hardened /tmp tmpfs"
+        if self._workspace_requires_ro and self._container_has_mount_at_or_below(
+            container_id,
+            "/workspace",
+            include_root=False,
+            writable_only=True,
+        ):
+            return "effective container mounts bypass the read-only /workspace"
+        return None
+
+    def _remove_rejected_container(self, container_id: str) -> bool:
+        """Best-effort bounded cleanup that never masks a policy failure."""
+        try:
+            result = subprocess.run(
+                [self._docker_exe, "rm", "-f", container_id],
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=30,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.error(
+                "Failed to remove rejected container %s: %s", container_id[:12], e
+            )
+            return False
+        if result.returncode != 0:
+            logger.error(
+                "Failed to remove rejected container %s: %s",
+                container_id[:12], result.stderr.strip(),
+            )
+            return False
+        return True
+
     def _find_reusable_container(
         self,
         task_label: str,
@@ -1971,13 +2195,10 @@ class DockerEnvironment(BaseEnvironment):
                 "--filter", f"label=hermes-task-id={task_label}",
                 "--filter", f"label=hermes-profile={profile_label}",
                 "--filter", f"label={_TMP_STORAGE_LABEL_KEY}={tmp_storage}",
+                # Workspace mounts and their access mode are immutable. Match
+                # even "off" so removing a mount cannot reuse stale host access.
+                "--filter", f"label={_WORKSPACE_LABEL_KEY}={workspace_label}",
             ]
-            if workspace_label != "off":
-                # Bind mounts and their access mode are immutable.  A reviewer
-                # requesting :ro must never reuse an older rw/other-path container.
-                filters.extend([
-                    "--filter", f"label={_WORKSPACE_LABEL_KEY}={workspace_label}"
-                ])
             if egress_label != "off":
                 filters.extend(["--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"])
                 fmt = "{{.ID}}\t{{.State}}"

@@ -135,6 +135,7 @@ terminal:
   docker_image: "nikolaik/python-nodejs:python3.11-nodejs20"
   docker_mount_cwd_to_workspace: false  # 将启动目录挂载到 /workspace
   docker_run_as_host_user: false   # 参见下方"以宿主用户身份运行容器"
+  docker_tmp_storage: tmpfs        # tmpfs（默认 512MB）或容器磁盘可写层
   docker_forward_env:              # 转发到容器的环境变量
     - "GITHUB_TOKEN"
   docker_volumes:                  # 宿主目录挂载
@@ -142,8 +143,6 @@ terminal:
     - "/home/user/data:/data:ro"   # :ro 表示只读
   docker_extra_args:               # 附加到 `docker run` 的额外标志
     - "--gpus=all"
-    - "--network=host"
-
   # 资源限制
   container_cpu: 1                 # CPU 核心数（0 = 不限制）
   container_memory: 5120           # MB（0 = 不限制）
@@ -151,7 +150,11 @@ terminal:
   container_persistent: true       # 跨会话持久化 /workspace 和 /root
 ```
 
-**`terminal.docker_extra_args`**（也可通过 `TERMINAL_DOCKER_EXTRA_ARGS='["--gpus=all"]'` 覆盖）允许传递 Hermes 未作为一级键公开的任意 `docker run` 标志 —— `--gpus`、`--network`、`--add-host`、替代 `--security-opt` 覆盖等。每个条目必须是字符串；该列表最后附加到组装好的 `docker run` 调用中，因此可以在需要时覆盖 Hermes 的默认值。请谨慎使用 —— 与沙箱加固（权限删除、`--user`、workspace 绑定挂载）冲突的标志将悄然削弱隔离性。
+**`terminal.docker_extra_args`**（也可通过 `TERMINAL_DOCKER_EXTRA_ARGS='["--gpus=all"]'` 覆盖）允许传递 Hermes 未作为一级键公开的其他 `docker run` 标志。Hermes 会拒绝保留标签、标签文件、网络模式选择以及冲突的 `/workspace` 或 `/tmp` 挂载，因为这些不可变设置参与可重用容器隔离。其余条目最后附加到命令中，因此仍应谨慎使用。
+
+**`terminal.docker_tmp_storage`**（默认 `tmpfs`；环境变量：`TERMINAL_DOCKER_TMP_STORAGE`）严格接受 `tmpfs` 或 `disk`。`tmpfs` 保持经过加固、限制为 512MB 的 `/tmp`；`disk` 不挂载 `/tmp` tmpfs，而使用容器可写层，适用于大型构建或审查副本。请使用此键，不要通过 `docker_volumes` 或 `docker_extra_args` 覆盖 `/tmp`。
+
+首次升级到支持 `docker_tmp_storage` 的版本时，Hermes 会启动带策略标签的新容器，而不会重用无法通过标签验证 `/tmp` 策略的旧容器。旧容器及其中的后台进程会与 Hermes 脱离；请在确认替代容器健康后移除旧容器。
 
 **要求：** 已安装并运行 Docker Desktop 或 Docker Engine。Hermes 会探测 `$PATH` 以及常见的 macOS 安装位置（`/usr/local/bin/docker`、`/opt/homebrew/bin/docker`、Docker Desktop 应用包）。开箱即用支持 Podman：设置 `HERMES_DOCKER_BINARY=podman`（或完整路径）以在两者都安装时强制使用它。
 
@@ -163,7 +166,7 @@ terminal:
 - `--cap-drop ALL`，仅添加回 `DAC_OVERRIDE`、`CHOWN`、`FOWNER`
 - `--security-opt no-new-privileges`
 - `--pids-limit 256`
-- `/tmp`（512MB）、`/var/tmp`（256MB）、`/run`（64MB）的大小限制 tmpfs
+- 默认情况下 `/tmp`（512MB）、`/var/tmp`（256MB）、`/run`（64MB）使用大小限制 tmpfs；`docker_tmp_storage: disk` 仅将 `/tmp` 改为容器可写层
 
 **凭据转发：** `docker_forward_env` 中列出的环境变量首先从您的 shell 环境解析，然后回退到 `~/.hermes/.env`。技能也可以声明 `required_environment_variables`，这些变量会自动合并。
 
