@@ -285,6 +285,9 @@ DEFAULT_CONFIG = {
         "auto_source_bashrc": True,
         "docker_image": "nikolaik/python-nodejs:python3.11-nodejs20",
         "docker_forward_env": [],
+        # ``tmpfs`` keeps the hardened, size-limited /tmp default. ``disk``
+        # uses the container writable layer for workloads larger than 512 MB.
+        "docker_tmp_storage": "tmpfs",
         # Explicit environment variables to set inside Docker containers.
         # Unlike docker_forward_env (which reads values from the host process),
         # docker_env lets you specify exact key-value pairs — useful when Hermes

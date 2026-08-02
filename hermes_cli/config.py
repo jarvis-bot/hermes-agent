@@ -1912,6 +1912,14 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
     # ── Docker automatic cwd mount policy ────────────────────────────────
     terminal = config.get("terminal")
     if isinstance(terminal, dict):
+        tmp_storage = terminal.get("docker_tmp_storage", "tmpfs")
+        if not isinstance(tmp_storage, str) or tmp_storage not in {"tmpfs", "disk"}:
+            issues.append(ConfigIssue(
+                "error",
+                "terminal.docker_tmp_storage must be 'tmpfs' or 'disk'",
+                "Use 'tmpfs' for the hardened 512 MB default or 'disk' for the container writable layer",
+            ))
+
         mount_mode = terminal.get("docker_cwd_mount_mode", "rw")
         if mount_mode not in {"ro", "rw"}:
             issues.append(ConfigIssue(
@@ -3216,6 +3224,7 @@ TERMINAL_CONFIG_ENV_MAP = {
     "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
     "docker_image": "TERMINAL_DOCKER_IMAGE",
     "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
+    "docker_tmp_storage": "TERMINAL_DOCKER_TMP_STORAGE",
     "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
     "modal_image": "TERMINAL_MODAL_IMAGE",
     "daytona_image": "TERMINAL_DAYTONA_IMAGE",

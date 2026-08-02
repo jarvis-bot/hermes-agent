@@ -303,21 +303,20 @@ hermes pairing clear-pending
 
 ### Docker 安全标志
 
-每个容器均使用以下标志运行（定义于 `tools/environments/docker.py`）：
+每个容器均使用以下基础标志运行（定义于 `tools/environments/docker.py`）：
 
 ```python
-_SECURITY_ARGS = [
+_BASE_SECURITY_ARGS = [
     "--cap-drop", "ALL",                          # 丢弃所有 Linux capabilities
     "--cap-add", "DAC_OVERRIDE",                  # root 可写入绑定挂载目录
     "--cap-add", "CHOWN",                         # 包管理器需要文件所有权
     "--cap-add", "FOWNER",                        # 包管理器需要文件所有权
     "--security-opt", "no-new-privileges",         # 阻止权限提升
-    "--pids-limit", "256",                         # 限制进程数量
-    "--tmpfs", "/tmp:rw,nosuid,size=512m",         # 有大小限制的 /tmp
     "--tmpfs", "/var/tmp:rw,noexec,nosuid,size=256m",  # 禁止执行的 /var/tmp
-    "--tmpfs", "/run:rw,noexec,nosuid,size=64m",   # 禁止执行的 /run
 ]
 ```
+
+主机支持所需 cgroup 控制器时才会添加进程数限制。默认情况下，`/tmp` 使用 `rw,nosuid,size=512m` tmpfs；对于需要更大空间的工作负载，`terminal.docker_tmp_storage: disk` 会让 `/tmp` 保留在容器可写层。用户提供的挂载不能替换 `/tmp`，因此复用策略标签始终反映实际存储。`/run` tmpfs 会按镜像挂载（默认使用加固的 `noexec`，仅对需要从 `/run` 执行的 s6-overlay 镜像使用 `exec`）。
 
 ### 资源限制
 

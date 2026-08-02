@@ -1,5 +1,7 @@
 """Tests for config.yaml structure validation (validate_config_structure)."""
 
+import pytest
+
 
 from hermes_cli.config import (
     DEFAULT_CONFIG,
@@ -91,6 +93,20 @@ class TestConfigIssueDataclass:
 
 
 class TestDockerCwdMountPolicyValidation:
+    @pytest.mark.parametrize("value", ["DISK", "", "volume", True, None])
+    def test_rejects_invalid_tmp_storage(self, value):
+        issues = validate_config_structure({
+            "terminal": {"docker_tmp_storage": value},
+        })
+        assert any(i.severity == "error" and "docker_tmp_storage" in i.message for i in issues)
+
+    @pytest.mark.parametrize("value", ["tmpfs", "disk"])
+    def test_accepts_valid_tmp_storage(self, value):
+        issues = validate_config_structure({
+            "terminal": {"docker_tmp_storage": value},
+        })
+        assert not any("docker_tmp_storage" in i.message for i in issues)
+
     def test_rejects_invalid_mount_mode(self):
         issues = validate_config_structure({
             "terminal": {"docker_cwd_mount_mode": "write-mostly"},

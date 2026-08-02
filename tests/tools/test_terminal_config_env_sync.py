@@ -230,6 +230,84 @@ def test_docker_cwd_mount_policy_is_bridged_everywhere():
         assert env_var in _terminal_tool_env_var_names()
 
 
+def test_docker_tmp_storage_is_bridged_everywhere():
+    assert "docker_tmp_storage" in _cli_env_map_keys()
+    assert "docker_tmp_storage" in _gateway_env_map_keys()
+    assert "docker_tmp_storage" in _save_config_env_sync_keys()
+    assert "TERMINAL_DOCKER_TMP_STORAGE" in _terminal_tool_env_var_names()
+
+
+def test_sibling_container_config_sites_carry_docker_tmp_storage():
+    """Every tool path that can create Docker must preserve /tmp policy."""
+    import ast
+    from pathlib import Path
+
+    modules = [
+        "tools/terminal_tool.py",
+        "tools/file_tools.py",
+        "tools/code_execution_tool.py",
+        "agent/prompt_builder.py",
+    ]
+    sites = 0
+    for relative_path in modules:
+        tree = ast.parse(Path(relative_path).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            keys = {key.value for key in node.keys if isinstance(key, ast.Constant)}
+            if "docker_run_as_host_user" in keys:
+                sites += 1
+                assert "docker_tmp_storage" in keys, (
+                    f"{relative_path} builds a container_config without "
+                    f"docker_tmp_storage (line {node.lineno})"
+                )
+    assert sites >= len(modules)
+
+
+def test_terminal_env_config_parses_docker_tmp_storage(monkeypatch):
+    from tools import terminal_tool
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_TMP_STORAGE", "disk")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["docker_tmp_storage"] == "disk"
+
+
+def test_config_yaml_disk_tmp_storage_reaches_docker_constructor(tmp_path, monkeypatch):
+    """Exercise config.yaml through CLI bridging and the terminal factory."""
+    import cli
+    from tools import terminal_tool
+
+    (tmp_path / "config.yaml").write_text(
+        "terminal:\n  backend: docker\n  docker_tmp_storage: disk\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_hermes_home", tmp_path)
+    cli.load_cli_config()
+
+    runtime_config = terminal_tool._get_env_config()
+    captured = {}
+
+    class CapturingDockerEnvironment:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(terminal_tool, "_DockerEnvironment", CapturingDockerEnvironment)
+    monkeypatch.setattr(terminal_tool, "_maybe_reap_docker_orphans", lambda config: None)
+
+    terminal_tool._create_environment(
+        "docker",
+        runtime_config["docker_image"],
+        "/workspace",
+        60,
+        container_config=runtime_config,
+    )
+
+    assert captured["tmp_storage"] == "disk"
+
+
 def test_terminal_env_config_parses_docker_cwd_mount_policy(monkeypatch):
     from tools import terminal_tool
 

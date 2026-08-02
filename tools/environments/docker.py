@@ -39,6 +39,7 @@ _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EGRESS_LABEL_KEY = "hermes-egress"
 _WORKSPACE_LABEL_KEY = "hermes-workspace"
+_TMP_STORAGE_LABEL_KEY = "hermes-tmp-storage"
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -329,7 +330,9 @@ def find_docker() -> Optional[str]:
 #       non-root user via --user, since no privilege drop is needed
 #       in that mode.
 # Block privilege escalation.
-# /tmp is size-limited and nosuid but allows exec (needed by pip/npm builds).
+# /tmp is size-limited and nosuid by default but allows exec (needed by
+# pip/npm builds). Profiles with large writable review copies may opt into the
+# container's disk-backed writable layer instead.
 #
 # Note: ``--pids-limit`` is *not* in this list — it lives in ``resource_args``
 # and is gated on ``_cgroup_limits_available(image)`` because it requires the
@@ -342,9 +345,9 @@ _BASE_SECURITY_ARGS = [
     "--cap-add", "CHOWN",
     "--cap-add", "FOWNER",
     "--security-opt", "no-new-privileges",
-    "--tmpfs", "/tmp:rw,nosuid,size=512m",
     "--tmpfs", "/var/tmp:rw,noexec,nosuid,size=256m",
 ]
+_TMP_TMPFS_ARGS = ["--tmpfs", "/tmp:rw,nosuid,size=512m"]
 
 # Default per-container PID limit. Applied as ``--pids-limit`` only when the
 # cgroup ``pids`` controller is available (see ``_cgroup_limits_available``).
@@ -608,7 +611,44 @@ def _extra_args_egress_collisions(
     return sorted(set(collisions))
 
 
-def _build_security_args(run_as_host_user: bool, run_exec: bool = False) -> list[str]:
+def _extra_args_reserved_label_collisions(extra_args: list[str]) -> list[str]:
+    """Return labels in ``docker_extra_args`` reserved for Hermes identity."""
+    reserved = {
+        "hermes-agent",
+        "hermes-task-id",
+        "hermes-profile",
+        _EGRESS_LABEL_KEY,
+        _WORKSPACE_LABEL_KEY,
+        _TMP_STORAGE_LABEL_KEY,
+    }
+    collisions: list[str] = []
+    for index, arg in enumerate(extra_args):
+        value = ""
+        if arg in {"--label-file"} or arg.startswith("--label-file="):
+            # A file can define any reserved key and is intentionally not read
+            # here: config validation must not turn arbitrary paths into I/O.
+            collisions.append("--label-file")
+            continue
+        if arg in {"-l", "--label"}:
+            if index + 1 < len(extra_args):
+                value = extra_args[index + 1]
+        elif arg.startswith(("-l=", "--label=")):
+            value = arg.split("=", 1)[1]
+        attached_values = _attached_short_option_values(arg, "l")
+        values = [value, *attached_values]
+        for candidate in values:
+            if candidate:
+                name = candidate.lstrip("=").split("=", 1)[0]
+                if name in reserved:
+                    collisions.append(name)
+    return sorted(set(collisions))
+
+
+def _build_security_args(
+    run_as_host_user: bool,
+    run_exec: bool = False,
+    tmp_storage: str = "tmpfs",
+) -> list[str]:
     """Return the security/cap/tmpfs args tailored to the privilege mode.
 
     ``run_exec`` mounts ``/run`` with ``exec`` instead of the hardened
@@ -616,8 +656,11 @@ def _build_security_args(run_as_host_user: bool, run_exec: bool = False) -> list
     entrypoint execs ``/run/s6/basedir/bin/init`` during startup; see
     ``_image_uses_init_entrypoint``.
     """
+    if tmp_storage not in {"tmpfs", "disk"}:
+        raise ValueError("docker_tmp_storage must be 'tmpfs' or 'disk'")
+    tmp_args = list(_TMP_TMPFS_ARGS) if tmp_storage == "tmpfs" else []
     run_tmpfs = list(_RUN_TMPFS_EXEC if run_exec else _RUN_TMPFS_NOEXEC)
-    args = list(_BASE_SECURITY_ARGS) + run_tmpfs
+    args = list(_BASE_SECURITY_ARGS) + tmp_args + run_tmpfs
     if run_as_host_user:
         return args
     return args + list(_PRIVDROP_CAP_ARGS)
@@ -877,12 +920,31 @@ def _resolve_cwd_mount_source(
     return str(canonical), str(translated)
 
 
+def _volume_mounts_path(volume: str, container_path: str) -> bool:
+    """Recognize a Docker ``-v`` entry targeting a path or its subtree."""
+    # Match from the right so Windows drive-letter sources (``C:\\...``) do
+    # not confuse destination parsing. A nested mount can punch through policy
+    # applied at the parent path.
+    target = re.escape(container_path.rstrip("/"))
+    return re.search(rf":{target}(?:/[^:]*)?(?::[^:]*)?$", volume) is not None
+
+
+def _attached_short_option_values(arg: str, option: str) -> list[str]:
+    """Return possible values for a Docker short option bundled in one token.
+
+    Docker accepts both ``-vVALUE`` and bundles such as ``-itvVALUE``. Return
+    every suffix following the requested option so validation stays fail-closed
+    even when a value itself contains the same letter.
+    """
+    if not arg.startswith("-") or arg.startswith("--"):
+        return []
+    token = arg[1:]
+    return [token[index + 1:] for index, char in enumerate(token) if char == option]
+
+
 def _volume_mounts_workspace(volume: str) -> bool:
     """Recognize a Docker ``-v`` entry targeting /workspace or its subtree."""
-    # Match from the right so Windows drive-letter sources (``C:\\...``) do
-    # not confuse destination parsing.  Nested destinations are conflicts too:
-    # a rw /workspace/subdir mount would punch through a ro /workspace mount.
-    return re.search(r":/workspace(?:/[^:]*)?(?::[^:]*)?$", volume) is not None
+    return _volume_mounts_path(volume, "/workspace")
 
 
 def _extra_args_mount_workspace(extra_args: list[str]) -> bool:
@@ -899,6 +961,28 @@ def _extra_args_mount_workspace(extra_args: list[str]) -> bool:
             return True
         if re.search(r"(?:^|,)\s*(?:dst|destination|target)\s*=\s*/workspace(?:/|,|$)", value):
             return True
+    return False
+
+
+def _extra_args_mount_tmp(extra_args: list[str]) -> bool:
+    """Return whether raw Docker flags can replace /tmp storage policy."""
+    mount_flags = {"-v", "--volume", "--mount", "--tmpfs"}
+    for index, arg in enumerate(extra_args):
+        if arg in mount_flags:
+            value = extra_args[index + 1] if index + 1 < len(extra_args) else ""
+        elif any(arg.startswith(f"{flag}=") for flag in mount_flags):
+            value = arg.split("=", 1)[1]
+        else:
+            value = ""
+        values = [value, *_attached_short_option_values(arg, "v")]
+        for candidate in values:
+            candidate = candidate.lstrip("=")
+            if _volume_mounts_path(candidate, "/tmp"):
+                return True
+            if re.match(r"^/tmp(?:/|:|$)", candidate):
+                return True
+            if re.search(r"(?:^|,)\s*(?:dst|destination|target)\s*=\s*/tmp(?:/|,|$)", candidate):
+                return True
     return False
 
 
@@ -936,6 +1020,7 @@ class DockerEnvironment(BaseEnvironment):
         run_as_host_user: bool = False,
         extra_args: list = None,
         persist_across_processes: bool = True,
+        tmp_storage: str = "tmpfs",
     ):
         if cwd == "~":
             cwd = "/root"
@@ -998,6 +1083,11 @@ class DockerEnvironment(BaseEnvironment):
             if not vol:
                 continue
             if ":" in vol:
+                if _volume_mounts_path(vol, "/tmp"):
+                    raise ValueError(
+                        "docker_volumes cannot mount /tmp or its subdirectories; "
+                        "use docker_tmp_storage to select the /tmp policy"
+                    )
                 volume_args.extend(["-v", vol])
                 if _volume_mounts_workspace(vol):
                     workspace_explicitly_mounted = True
@@ -1372,6 +1462,7 @@ class DockerEnvironment(BaseEnvironment):
         security_args = _build_security_args(
             run_as_host_user and bool(user_args),
             run_exec=image_uses_s6_init,
+            tmp_storage=tmp_storage,
         )
 
         logger.info(f"Docker volume_args: {volume_args}")
@@ -1387,6 +1478,17 @@ class DockerEnvironment(BaseEnvironment):
             raise ValueError(
                 "docker_extra_args mounts /workspace while "
                 "docker_mount_cwd_to_workspace is enabled; remove the conflicting mount"
+            )
+        if _extra_args_mount_tmp(validated_extra):
+            raise ValueError(
+                "docker_extra_args cannot mount /tmp or its subdirectories; "
+                "use docker_tmp_storage to select the /tmp policy"
+            )
+        reserved_label_collisions = _extra_args_reserved_label_collisions(validated_extra)
+        if reserved_label_collisions:
+            raise ValueError(
+                "docker_extra_args cannot override reserved Hermes labels: "
+                + ", ".join(reserved_label_collisions)
             )
         if egress_env_overrides:
             _extra_collisions = _extra_args_egress_collisions(
@@ -1436,6 +1538,7 @@ class DockerEnvironment(BaseEnvironment):
             "--label", f"hermes-profile={profile_name}",
             "--label", f"{_EGRESS_LABEL_KEY}={egress_label}",
             "--label", f"{_WORKSPACE_LABEL_KEY}={workspace_label}",
+            "--label", f"{_TMP_STORAGE_LABEL_KEY}={tmp_storage}",
         ]
         # Save args for container recreation on "No such container" recovery.
         self._image = image
@@ -1449,6 +1552,7 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-profile": profile_name,
             _EGRESS_LABEL_KEY: egress_label,
             _WORKSPACE_LABEL_KEY: workspace_label,
+            _TMP_STORAGE_LABEL_KEY: tmp_storage,
         }
 
         # Cross-process container reuse (issue #20561 — docs claim "ONE long-lived
@@ -1465,7 +1569,7 @@ class DockerEnvironment(BaseEnvironment):
         reused = False
         if persist_across_processes:
             existing = self._find_reusable_container(
-                task_label, profile_name, egress_label, workspace_label,
+                task_label, profile_name, egress_label, workspace_label, tmp_storage,
             )
             if existing is not None:
                 container_id, state = existing
@@ -1681,6 +1785,7 @@ class DockerEnvironment(BaseEnvironment):
         existing = self._find_reusable_container(
             task_label, profile_label, self._labels.get(_EGRESS_LABEL_KEY, "off"),
             self._labels.get(_WORKSPACE_LABEL_KEY, "off"),
+            self._labels.get(_TMP_STORAGE_LABEL_KEY, "tmpfs"),
         )
         if existing is not None:
             cid, state = existing
@@ -1846,6 +1951,7 @@ class DockerEnvironment(BaseEnvironment):
         profile_label: str,
         egress_label: str,
         workspace_label: str = "off",
+        tmp_storage: str = "tmpfs",
     ) -> Optional[tuple[str, str]]:
         """Look for an existing container labeled for this (task, profile).
 
@@ -1864,6 +1970,7 @@ class DockerEnvironment(BaseEnvironment):
                 "--filter", "label=hermes-agent=1",
                 "--filter", f"label=hermes-task-id={task_label}",
                 "--filter", f"label=hermes-profile={profile_label}",
+                "--filter", f"label={_TMP_STORAGE_LABEL_KEY}={tmp_storage}",
             ]
             if workspace_label != "off":
                 # Bind mounts and their access mode are immutable.  A reviewer

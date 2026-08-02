@@ -1470,6 +1470,7 @@ def _get_env_config() -> Dict[str, Any]:
         container_disk = 51200
 
     if docker_backend:
+        docker_tmp_storage = os.getenv("TERMINAL_DOCKER_TMP_STORAGE", "tmpfs")
         docker_forward_env = _parse_env_var("TERMINAL_DOCKER_FORWARD_ENV", "[]", json.loads, "valid JSON")
         docker_volumes = _parse_env_var("TERMINAL_DOCKER_VOLUMES", "[]", json.loads, "valid JSON")
         docker_env = _parse_env_var("TERMINAL_DOCKER_ENV", "{}", json.loads, "valid JSON")
@@ -1481,6 +1482,7 @@ def _get_env_config() -> Dict[str, Any]:
             "TERMINAL_DOCKER_CWD_ALLOWED_ROOTS", "[]", json.loads, "valid JSON"
         )
     else:
+        docker_tmp_storage = "tmpfs"
         docker_forward_env = []
         docker_volumes = []
         docker_env = {}
@@ -1529,6 +1531,7 @@ def _get_env_config() -> Dict[str, Any]:
         "env_type": env_type,
         "modal_mode": coerce_modal_mode(os.getenv("TERMINAL_MODAL_MODE", "auto")),
         "docker_image": os.getenv("TERMINAL_DOCKER_IMAGE", default_image),
+        "docker_tmp_storage": docker_tmp_storage,
         "docker_forward_env": docker_forward_env,
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
@@ -1653,6 +1656,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             run_as_host_user=cc.get("docker_run_as_host_user", False),
             network=docker_network,
             extra_args=docker_extra_args,
+            tmp_storage=cc.get("docker_tmp_storage", "tmpfs"),
             persist_across_processes=cc.get("docker_persist_across_processes", True),
         )
     
@@ -2408,6 +2412,7 @@ def terminal_tool(
                                 "container_persistent": config.get("container_persistent", True),
                                 "modal_mode": config.get("modal_mode", "auto"),
                                 "vercel_runtime": config.get("vercel_runtime", ""),
+                                "docker_tmp_storage": config.get("docker_tmp_storage", "tmpfs"),
                                 "docker_volumes": config.get("docker_volumes", []),
                                 "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
                                 "docker_cwd_mount_mode": config.get("docker_cwd_mount_mode", "rw"),

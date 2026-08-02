@@ -55,6 +55,7 @@ def _make_dummy_env(**kwargs):
         env=kwargs.get("env"),
         run_as_host_user=kwargs.get("run_as_host_user", False),
         extra_args=kwargs.get("extra_args", []),
+        tmp_storage=kwargs.get("tmp_storage", "tmpfs"),
         persist_across_processes=kwargs.get("persist_across_processes", True),
     )
 
@@ -100,6 +101,96 @@ def test_auto_mount_host_cwd_adds_volume(monkeypatch, tmp_path):
     assert run_calls, "docker run should have been called"
     run_args_str = " ".join(run_calls[0][0])
     assert f"{project_dir}:/workspace" in run_args_str
+
+
+def test_disk_tmp_storage_uses_container_writable_layer(monkeypatch):
+    """Disk mode must omit only the /tmp tmpfs while retaining other hardening."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(tmp_storage="disk", persist_across_processes=False)
+
+    run_args = next(c[0] for c in calls if c[0][1] == "run")
+    tmpfs_mounts = [
+        run_args[index + 1]
+        for index, arg in enumerate(run_args[:-1])
+        if arg == "--tmpfs"
+    ]
+    assert not any(mount.startswith("/tmp:") for mount in tmpfs_mounts)
+    assert any(mount.startswith("/var/tmp:") for mount in tmpfs_mounts)
+    assert "no-new-privileges" in run_args
+
+
+def test_default_tmp_storage_preserves_hardened_tmpfs(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(persist_across_processes=False)
+
+    run_args = next(c[0] for c in calls if c[0][1] == "run")
+    assert "/tmp:rw,nosuid,size=512m" in run_args
+
+
+def test_tmp_storage_participates_in_container_reuse_fingerprint(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(tmp_storage="disk")
+
+    run_args = next(c[0] for c in calls if c[0][1] == "run")
+    assert "hermes-tmp-storage=disk" in run_args
+    reuse_probe = next(c[0] for c in calls if c[0][1:3] == ["ps", "-a"])
+    assert "label=hermes-tmp-storage=disk" in reuse_probe
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--label", "hermes-tmp-storage=tmpfs"],
+        ["--label=hermes-tmp-storage=tmpfs"],
+        ["-l", "hermes-task-id=other"],
+        ["-l=hermes-profile=other"],
+        ["-dlhermes-tmp-storage=tmpfs"],
+        ["--label-file", "/tmp/labels"],
+        ["--label-file=/tmp/labels"],
+    ],
+)
+def test_extra_args_cannot_override_reserved_reuse_labels(monkeypatch, extra_args):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="reserved Hermes labels"):
+        _make_dummy_env(extra_args=extra_args)
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--tmpfs", "/tmp:size=1g"],
+        ["--tmpfs=/tmp:size=1g"],
+        ["--volume", "scratch:/tmp"],
+        ["--volume=scratch:/tmp/cache"],
+        ["-vscratch:/tmp"],
+        ["-itvscratch:/tmp/cache"],
+        ["--mount", "type=tmpfs,target=/tmp"],
+        ["--mount=type=volume,source=scratch,destination=/tmp/cache"],
+    ],
+)
+def test_extra_args_cannot_override_tmp_storage_policy(monkeypatch, extra_args):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="use docker_tmp_storage"):
+        _make_dummy_env(extra_args=extra_args)
+
+
+@pytest.mark.parametrize("volume", ["scratch:/tmp", "/host/cache:/tmp/cache:ro"])
+def test_docker_volumes_cannot_override_tmp_storage_policy(monkeypatch, volume):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="use docker_tmp_storage"):
+        _make_dummy_env(volumes=[volume])
 
 
 def test_auto_mount_host_cwd_read_only_adds_ro_volume(monkeypatch, tmp_path):
@@ -606,6 +697,7 @@ def test_labels_attribute_populated_after_init(monkeypatch):
         "hermes-profile": "default",
         "hermes-egress": "off",
         "hermes-workspace": "off",
+        "hermes-tmp-storage": "tmpfs",
     }
 
 
