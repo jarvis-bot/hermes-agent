@@ -324,9 +324,11 @@ def test_complete_container_policy_participates_in_reuse_fingerprint(
     assert first_label != second_label
 
 
-def test_read_only_workspace_object_identity_participates_in_policy(monkeypatch, tmp_path):
+def test_read_only_workspace_content_participates_in_policy(monkeypatch, tmp_path):
     project_dir = tmp_path / "review-target"
     project_dir.mkdir()
+    candidate = project_dir / "candidate.txt"
+    candidate.write_text("first candidate", encoding="utf-8")
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     calls = _mock_subprocess_run(monkeypatch)
 
@@ -340,7 +342,35 @@ def test_read_only_workspace_object_identity_participates_in_policy(monkeypatch,
     first_run = [call[0] for call in calls if call[0][1] == "run"][-1]
     first_label = next(arg for arg in first_run if arg.startswith("hermes-policy="))
 
-    (project_dir / "candidate.txt").write_text("new candidate", encoding="utf-8")
+    candidate.write_text("second candidate", encoding="utf-8")
+    _make_dummy_env(**options)
+    second_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    second_label = next(arg for arg in second_run if arg.startswith("hermes-policy="))
+
+    assert first_label != second_label
+
+
+def test_mapped_read_only_workspace_uses_canonical_source_identity(monkeypatch, tmp_path):
+    container_root = tmp_path / "container-data"
+    project_dir = container_root / "review-target"
+    project_dir.mkdir(parents=True)
+    candidate = project_dir / "candidate.txt"
+    candidate.write_text("first candidate", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    options = {
+        "cwd": "/workspace",
+        "host_cwd": str(project_dir),
+        "auto_mount_cwd": True,
+        "cwd_mount_mode": "ro",
+        "cwd_path_mappings": {str(container_root): "/docker-host/data"},
+    }
+    _make_dummy_env(**options)
+    first_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    first_label = next(arg for arg in first_run if arg.startswith("hermes-policy="))
+
+    candidate.write_text("second candidate", encoding="utf-8")
     _make_dummy_env(**options)
     second_run = [call[0] for call in calls if call[0][1] == "run"][-1]
     second_label = next(arg for arg in second_run if arg.startswith("hermes-policy="))

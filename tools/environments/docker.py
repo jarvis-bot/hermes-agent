@@ -132,7 +132,36 @@ def _sanitize_label_value(value: str) -> str:
     return f"{prefix}-{digest}"
 
 
-def _path_identity(path: str) -> dict[str, object]:
+def _readonly_tree_digest(root: Path) -> str:
+    """Hash a read-only source tree without following symlinks or Git objects."""
+    digest = hashlib.sha256()
+    if root.is_file():
+        paths = [root]
+    else:
+        paths = sorted(
+            path
+            for path in root.rglob("*")
+            if ".git" not in path.relative_to(root).parts
+        )
+    for path in paths:
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+        if path.is_symlink():
+            digest.update(b"L")
+            digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+        elif path.is_file():
+            digest.update(b"F")
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        elif path.is_dir():
+            digest.update(b"D")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _path_identity(path: str, *, content_digest: bool = False) -> dict[str, object]:
     """Return stable host-object evidence for an immutable bind source.
 
     The inode fields detect atomic directory/file replacement at an unchanged
@@ -154,6 +183,11 @@ def _path_identity(path: str) -> dict[str, object]:
         "inode": stat_result.st_ino,
         "ctime_ns": stat_result.st_ctime_ns,
     })
+    if content_digest:
+        try:
+            identity["content_sha256"] = _readonly_tree_digest(resolved)
+        except OSError:
+            identity["content_sha256"] = "unreadable"
     git_entry = resolved / ".git" if resolved.is_dir() else None
     if git_entry is not None:
         try:
@@ -187,8 +221,12 @@ def _volume_source_identities(volume_args: list[str]) -> list[dict[str, object]]
         spec = volume_args[index + 1]
         source = spec.split(":", 1)[0]
         if source.startswith("/"):
-            identity = _path_identity(source)
             mode = spec.rsplit(":", 1)[-1].split(",")
+            destination = spec.split(":", 2)[1] if ":" in spec else ""
+            identity = _path_identity(
+                source,
+                content_digest="ro" in mode and destination == "/workspace",
+            )
             if "ro" not in mode:
                 for mutable_field in ("ctime_ns", "git_head", "git_ref"):
                     identity.pop(mutable_field, None)
@@ -1242,6 +1280,7 @@ class DockerEnvironment(BaseEnvironment):
         canonical_host_cwd = ""
         docker_host_cwd = ""
         bind_host_cwd = auto_mount_cwd and bool(host_cwd)
+        canonical_workspace_identity: Optional[dict[str, object]] = None
         if auto_mount_cwd and workspace_explicitly_mounted:
             raise ValueError(
                 "docker_volumes already mounts /workspace while "
@@ -1257,6 +1296,10 @@ class DockerEnvironment(BaseEnvironment):
                 allowed_roots=cwd_allowed_roots,
                 path_mappings=cwd_path_mappings,
             )
+            if cwd_mount_mode == "ro":
+                canonical_workspace_identity = _path_identity(
+                    canonical_host_cwd, content_digest=True
+                )
 
         self._workspace_dir: Optional[str] = None
         self._home_dir: Optional[str] = None
@@ -1704,6 +1747,7 @@ class DockerEnvironment(BaseEnvironment):
             "persistent_filesystem": self._persistent,
             "run_args": all_run_args,
             "bind_sources": _volume_source_identities(volume_args),
+            "canonical_workspace": canonical_workspace_identity,
         }
         policy_label = hashlib.sha256(
             json.dumps(
