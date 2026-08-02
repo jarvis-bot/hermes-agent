@@ -127,7 +127,7 @@ Agent 拥有与您的用户账户相同的文件系统访问权限。使用 `her
 
 在具有安全加固的 Docker 容器内运行命令（所有权限已删除、无权限提升、PID 限制）。
 
-**单个持久容器，而非每条命令一个容器。** Hermes 在首次使用时启动一个长期运行的容器，并通过 `docker exec` 将每个终端、文件和 `execute_code` 调用路由到同一容器中 —— 跨会话、`/new`、`/reset` 和 `delegate_task` 子 agent，贯穿 Hermes 进程的整个生命周期。工作目录更改、已安装的包以及 `/workspace` 中的文件会从一次工具调用延续到下一次，就像本地 shell 一样。容器在关闭时停止并删除。详情请参阅下方的**容器生命周期**。
+**单个持久容器，而非每条命令一个容器。** Hermes 在首次使用时启动一个长期运行的容器，并通过 `docker exec` 将每个终端、文件和 `execute_code` 调用路由到同一容器中。默认情况下，容器会跨会话和 Hermes 进程退出继续运行；工作目录、已安装的包、后台进程以及 `/workspace` 中的文件会保留。详情请参阅下方的**容器生命周期**。
 
 ```yaml
 terminal:
@@ -136,6 +136,7 @@ terminal:
   docker_mount_cwd_to_workspace: false  # 将启动目录挂载到 /workspace
   docker_run_as_host_user: false   # 参见下方"以宿主用户身份运行容器"
   docker_tmp_storage: tmpfs        # tmpfs（默认 512MB）或容器磁盘可写层
+  docker_network: true             # false = 使用 --network=none 隔离网络
   docker_forward_env:              # 转发到容器的环境变量
     - "GITHUB_TOKEN"
   docker_volumes:                  # 宿主目录挂载
@@ -153,6 +154,8 @@ terminal:
 **`terminal.docker_extra_args`**（也可通过 `TERMINAL_DOCKER_EXTRA_ARGS='["--gpus=all"]'` 覆盖）允许传递 Hermes 未作为一级键公开的其他 `docker run` 标志。Hermes 会拒绝保留标签、标签文件、网络模式选择以及冲突的 `/workspace` 或 `/tmp` 挂载，因为这些不可变设置参与可重用容器隔离。其余条目最后附加到命令中，因此仍应谨慎使用。
 
 **`terminal.docker_tmp_storage`**（默认 `tmpfs`；环境变量：`TERMINAL_DOCKER_TMP_STORAGE`）严格接受 `tmpfs` 或 `disk`。`tmpfs` 保持经过加固、限制为 512MB 的 `/tmp`；`disk` 不挂载 `/tmp` tmpfs，而使用容器可写层，适用于大型构建或审查副本。请使用此键，不要通过 `docker_volumes` 或 `docker_extra_args` 覆盖 `/tmp`。
+
+**`terminal.docker_network`**（默认 `true`）设为 `false` 时会以 `--network=none` 启动隔离网络的容器。请使用此一级配置键；`docker_extra_args` 中的原始 `--network`/`--net` 选择会被拒绝，以确保可重用容器的网络策略可验证。
 
 首次升级到支持 `docker_tmp_storage` 的版本时，Hermes 会启动带策略标签的新容器，而不会重用无法通过标签验证 `/tmp` 策略的旧容器。旧容器及其中的后台进程会与 Hermes 脱离；请在确认替代容器健康后移除旧容器。
 

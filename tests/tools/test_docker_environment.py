@@ -288,14 +288,64 @@ def test_explicit_workspace_mount_participates_in_reuse_fingerprint(monkeypatch)
     assert f"label=hermes-workspace={workspace_label}" in reuse_probe
 
 
-def test_workspace_off_participates_in_reuse_fingerprint(monkeypatch):
+def test_managed_workspace_policy_participates_in_reuse_fingerprint(monkeypatch):
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     calls = _mock_subprocess_run(monkeypatch)
 
     _make_dummy_env()
 
     reuse_probe = next(c[0] for c in calls if c[0][1:3] == ["ps", "-a"])
-    assert "label=hermes-workspace=off" in reuse_probe
+    assert "label=hermes-workspace=managed-ephemeral" in reuse_probe
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ({"image": "python:3.11"}, {"image": "python:3.12"}),
+        ({"extra_args": ["--shm-size=64m"]}, {"extra_args": ["--shm-size=1g"]}),
+        ({"persistent_filesystem": False}, {"persistent_filesystem": True}),
+        ({"env": {"TOKEN": "before"}}, {"env": {"TOKEN": "after"}}),
+    ],
+)
+def test_complete_container_policy_participates_in_reuse_fingerprint(
+    monkeypatch, first, second
+):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+
+    calls = _mock_subprocess_run(monkeypatch)
+    _make_dummy_env(**first)
+    first_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    first_label = next(arg for arg in first_run if arg.startswith("hermes-policy="))
+
+    _make_dummy_env(**second)
+    second_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    second_label = next(arg for arg in second_run if arg.startswith("hermes-policy="))
+
+    assert first_label != second_label
+
+
+def test_read_only_workspace_object_identity_participates_in_policy(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    options = {
+        "cwd": "/workspace",
+        "host_cwd": str(project_dir),
+        "auto_mount_cwd": True,
+        "cwd_mount_mode": "ro",
+    }
+    _make_dummy_env(**options)
+    first_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    first_label = next(arg for arg in first_run if arg.startswith("hermes-policy="))
+
+    (project_dir / "candidate.txt").write_text("new candidate", encoding="utf-8")
+    _make_dummy_env(**options)
+    second_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    second_label = next(arg for arg in second_run if arg.startswith("hermes-policy="))
+
+    assert first_label != second_label
 
 
 def test_auto_mount_host_cwd_read_only_adds_ro_volume(monkeypatch, tmp_path):
@@ -808,9 +858,11 @@ def test_labels_attribute_populated_after_init(monkeypatch):
         "hermes-task-id": "abc",
         "hermes-profile": "default",
         "hermes-egress": "off",
-        "hermes-workspace": "off",
+        "hermes-workspace": "managed-ephemeral",
         "hermes-tmp-storage": "tmpfs",
+        "hermes-policy": env._labels["hermes-policy"],
     }
+    assert len(env._labels["hermes-policy"]) == 24
 
 
 # ── Cross-process container reuse (issue #20561) ──────────────────

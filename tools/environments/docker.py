@@ -132,6 +132,70 @@ def _sanitize_label_value(value: str) -> str:
     return f"{prefix}-{digest}"
 
 
+def _path_identity(path: str) -> dict[str, object]:
+    """Return stable host-object evidence for an immutable bind source.
+
+    The inode fields detect atomic directory/file replacement at an unchanged
+    pathname.  Git metadata additionally detects the common in-place review
+    checkout update without invoking Git (which would make container startup
+    depend on an optional executable).
+    """
+    candidate = Path(path)
+    identity: dict[str, object] = {"path": str(candidate)}
+    try:
+        resolved = candidate.resolve(strict=True)
+        stat_result = resolved.stat()
+    except OSError:
+        identity["missing"] = True
+        return identity
+    identity.update({
+        "resolved": str(resolved),
+        "device": stat_result.st_dev,
+        "inode": stat_result.st_ino,
+        "ctime_ns": stat_result.st_ctime_ns,
+    })
+    git_entry = resolved / ".git" if resolved.is_dir() else None
+    if git_entry is not None:
+        try:
+            if git_entry.is_file():
+                marker = git_entry.read_text(encoding="utf-8").strip()
+                if marker.startswith("gitdir:"):
+                    git_dir = (git_entry.parent / marker[7:].strip()).resolve()
+                else:
+                    git_dir = git_entry
+            else:
+                git_dir = git_entry
+            head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+            identity["git_head"] = head
+            if head.startswith("ref:"):
+                ref_path = git_dir / head[4:].strip()
+                try:
+                    identity["git_ref"] = ref_path.read_text(encoding="utf-8").strip()
+                except OSError:
+                    identity["git_ref"] = "unresolved"
+        except OSError:
+            pass
+    return identity
+
+
+def _volume_source_identities(volume_args: list[str]) -> list[dict[str, object]]:
+    """Fingerprint bind source objects represented by ``-v`` arguments."""
+    identities: list[dict[str, object]] = []
+    for index, arg in enumerate(volume_args[:-1]):
+        if arg != "-v":
+            continue
+        spec = volume_args[index + 1]
+        source = spec.split(":", 1)[0]
+        if source.startswith("/"):
+            identity = _path_identity(source)
+            mode = spec.rsplit(":", 1)[-1].split(",")
+            if "ro" not in mode:
+                for mutable_field in ("ctime_ns", "git_head", "git_ref"):
+                    identity.pop(mutable_field, None)
+            identities.append(identity)
+    return identities
+
+
 def _get_active_profile_name() -> str:
     """Return the active Hermes profile name, or ``"default"`` on any error.
 
@@ -1220,7 +1284,7 @@ class DockerEnvironment(BaseEnvironment):
                 "--tmpfs", "/root:rw,exec,size=1g",
             ])
 
-        workspace_label = "off"
+        workspace_label = "managed-persistent" if self._persistent else "managed-ephemeral"
         if workspace_explicitly_mounted:
             workspace_specs = sorted(
                 volume_args[index + 1]
@@ -1632,6 +1696,20 @@ class DockerEnvironment(BaseEnvironment):
             + env_args
             + validated_extra
         )
+        policy_payload = {
+            "version": 1,
+            "image": image,
+            "cwd": cwd,
+            "image_uses_s6_init": image_uses_s6_init,
+            "persistent_filesystem": self._persistent,
+            "run_args": all_run_args,
+            "bind_sources": _volume_source_identities(volume_args),
+        }
+        policy_label = hashlib.sha256(
+            json.dumps(
+                policy_payload, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()[:24]
         logger.info(f"Docker run_args: {all_run_args}")
 
         # Start the container directly via `docker run -d`.
@@ -1652,6 +1730,7 @@ class DockerEnvironment(BaseEnvironment):
             "--label", f"{_EGRESS_LABEL_KEY}={egress_label}",
             "--label", f"{_WORKSPACE_LABEL_KEY}={workspace_label}",
             "--label", f"{_TMP_STORAGE_LABEL_KEY}={tmp_storage}",
+            "--label", f"{_POLICY_LABEL_KEY}={policy_label}",
         ]
         # Save args for container recreation on "No such container" recovery.
         self._image = image
@@ -1666,6 +1745,7 @@ class DockerEnvironment(BaseEnvironment):
             _EGRESS_LABEL_KEY: egress_label,
             _WORKSPACE_LABEL_KEY: workspace_label,
             _TMP_STORAGE_LABEL_KEY: tmp_storage,
+            _POLICY_LABEL_KEY: policy_label,
         }
 
         # Cross-process container reuse (issue #20561 — docs claim "ONE long-lived
@@ -1683,6 +1763,7 @@ class DockerEnvironment(BaseEnvironment):
         if persist_across_processes:
             existing = self._find_reusable_container(
                 task_label, profile_name, egress_label, workspace_label, tmp_storage,
+                policy_label,
             )
             if existing is not None:
                 container_id, state = existing
@@ -1906,6 +1987,7 @@ class DockerEnvironment(BaseEnvironment):
             task_label, profile_label, self._labels.get(_EGRESS_LABEL_KEY, "off"),
             self._labels.get(_WORKSPACE_LABEL_KEY, "off"),
             self._labels.get(_TMP_STORAGE_LABEL_KEY, "tmpfs"),
+            self._labels.get(_POLICY_LABEL_KEY, ""),
         )
         if existing is not None:
             cid, state = existing
@@ -2193,6 +2275,7 @@ class DockerEnvironment(BaseEnvironment):
         egress_label: str,
         workspace_label: str = "off",
         tmp_storage: str = "tmpfs",
+        policy_label: str = "",
     ) -> Optional[tuple[str, str]]:
         """Look for an existing container labeled for this (task, profile).
 
@@ -2215,6 +2298,7 @@ class DockerEnvironment(BaseEnvironment):
                 # Workspace mounts and their access mode are immutable. Match
                 # even "off" so removing a mount cannot reuse stale host access.
                 "--filter", f"label={_WORKSPACE_LABEL_KEY}={workspace_label}",
+                "--filter", f"label={_POLICY_LABEL_KEY}={policy_label}",
             ]
             if egress_label != "off":
                 filters.extend(["--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"])
