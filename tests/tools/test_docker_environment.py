@@ -192,6 +192,34 @@ def test_disk_tmp_storage_rejects_image_volume_reached_through_tmp_symlink(monke
     assert ["/usr/bin/docker", "rm", "-f", "disk-container"] in calls
 
 
+def test_disk_tmp_storage_rejects_tmp_symlink_below_ancestor_mount(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    docker_env._cgroup_limits_ok = True
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+        if cmd[1] == "image":
+            return subprocess.CompletedProcess(cmd, 0, stdout="sha256:symlink-image\n", stderr="")
+        if cmd[1] == "run":
+            return subprocess.CompletedProcess(cmd, 0, stdout="disk-container\n", stderr="")
+        if cmd[1] == "exec" and cmd[-3:-1] == ["-f", "--"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="/workspace/tmp\n", stderr="")
+        if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
+            mounts = '[{"Type":"bind","Destination":"/workspace","RW":false}]\n'
+            return subprocess.CompletedProcess(cmd, 0, stdout=mounts, stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    with pytest.raises(RuntimeError, match="container writable layer"):
+        _make_dummy_env(tmp_storage="disk", persist_across_processes=False)
+
+    assert ["/usr/bin/docker", "rm", "-f", "disk-container"] in calls
+
+
 def test_tmp_storage_participates_in_container_reuse_fingerprint(monkeypatch):
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     calls = _mock_subprocess_run(monkeypatch)

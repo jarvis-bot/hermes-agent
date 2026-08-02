@@ -2466,9 +2466,15 @@ class DockerEnvironment(BaseEnvironment):
         container_path: str,
         *,
         include_root: bool = True,
+        include_ancestors: bool = False,
         writable_only: bool = False,
     ) -> bool:
-        """Fail closed if effective Docker mounts overlap a protected path."""
+        """Fail closed if effective Docker mounts overlap a protected path.
+
+        ``include_ancestors`` is needed for symlink-resolved protected paths:
+        a mount at ``/workspace`` also controls a resolved path such as
+        ``/workspace/tmp`` even though its destination is not below that path.
+        """
         try:
             result = subprocess.run(
                 [
@@ -2495,7 +2501,12 @@ class DockerEnvironment(BaseEnvironment):
                 if not isinstance(destination, str):
                     continue
                 canonical = posixpath.normpath("/" + destination.lstrip("/"))
-                if _container_path_is_at_or_below(destination, container_path):
+                if _container_path_is_at_or_below(
+                    destination, container_path
+                ) or (
+                    include_ancestors
+                    and _container_path_is_at_or_below(container_path, destination)
+                ):
                     if include_root or canonical != root:
                         if not writable_only or mount.get("RW") is not False:
                             return True
@@ -2549,7 +2560,9 @@ class DockerEnvironment(BaseEnvironment):
                 container_id, "/tmp"
             ) or (
                 resolved_tmp != "/tmp"
-                and self._container_has_mount_at_or_below(container_id, resolved_tmp)
+                and self._container_has_mount_at_or_below(
+                    container_id, resolved_tmp, include_ancestors=True
+                )
             ):
                 return (
                     "docker_tmp_storage=disk requires /tmp on the container "
@@ -2563,7 +2576,10 @@ class DockerEnvironment(BaseEnvironment):
             ) or (
                 resolved_tmp != "/tmp"
                 and self._container_has_mount_at_or_below(
-                    container_id, resolved_tmp, include_root=False
+                    container_id,
+                    resolved_tmp,
+                    include_root=False,
+                    include_ancestors=True,
                 )
             ):
                 return "effective container mounts bypass the hardened /tmp tmpfs"
