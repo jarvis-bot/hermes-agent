@@ -12,6 +12,7 @@ import os
 import posixpath
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import uuid
@@ -133,7 +134,13 @@ def _sanitize_label_value(value: str) -> str:
 
 
 def _readonly_tree_digest(root: Path) -> str:
-    """Hash a read-only source tree without following symlinks or Git objects."""
+    """Hash a read-only source tree without following symlinks or Git objects.
+
+    Permission bits are part of the identity because Git tracks the executable
+    bit and reviewers must not reuse a container across a mode-only change.
+    Any traversal/read error propagates so an unauthenticated workspace can
+    never collapse onto a shared reusable label.
+    """
     digest = hashlib.sha256()
     if root.is_file():
         paths = [root]
@@ -143,9 +150,13 @@ def _readonly_tree_digest(root: Path) -> str:
             for path in root.rglob("*")
             if ".git" not in path.relative_to(root).parts
         )
-    for path in paths:
+    # Include the source object itself as well as its descendants.  ``lstat``
+    # deliberately authenticates symlinks rather than their targets.
+    for path in [root, *paths] if paths != [root] else paths:
         relative = "." if path == root else path.relative_to(root).as_posix()
         digest.update(relative.encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+        digest.update(f"{stat.S_IMODE(path.lstat().st_mode):04o}".encode("ascii"))
         digest.update(b"\0")
         if path.is_symlink():
             digest.update(b"L")
@@ -161,6 +172,61 @@ def _readonly_tree_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
+def _packed_git_ref(git_dir: Path, ref_name: str) -> Optional[str]:
+    """Resolve *ref_name* from packed-refs, ignoring comments/peeled lines."""
+    packed_refs = git_dir / "packed-refs"
+    try:
+        lines = packed_refs.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return None
+    for line in lines:
+        if not line or line.startswith(("#", "^")):
+            continue
+        value, separator, name = line.partition(" ")
+        if separator and name == ref_name:
+            return value
+    return None
+
+
+def _git_commit_identity(git_entry: Path) -> tuple[str, str]:
+    """Return ``(HEAD text, commit)`` for normal and linked Git worktrees."""
+    if git_entry.is_file():
+        marker = git_entry.read_text(encoding="utf-8").strip()
+        if not marker.startswith("gitdir:"):
+            raise ValueError(f"invalid Git metadata marker: {git_entry}")
+        git_dir = (git_entry.parent / marker[7:].strip()).resolve(strict=True)
+    else:
+        git_dir = git_entry.resolve(strict=True)
+
+    common_dir = git_dir
+    commondir_file = git_dir / "commondir"
+    if commondir_file.is_file():
+        common_dir = (
+            git_dir / commondir_file.read_text(encoding="utf-8").strip()
+        ).resolve(strict=True)
+
+    head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+    if not head.startswith("ref:"):
+        if not re.fullmatch(r"[0-9a-fA-F]{40,64}", head):
+            raise ValueError(f"invalid detached Git HEAD in {git_dir}")
+        return head, head.lower()
+
+    ref_name = head[4:].strip()
+    if not ref_name or ref_name.startswith("/") or ".." in Path(ref_name).parts:
+        raise ValueError(f"invalid symbolic Git HEAD in {git_dir}")
+    for ref_root in dict.fromkeys((git_dir, common_dir)):
+        ref_path = ref_root / ref_name
+        try:
+            value = ref_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            value = _packed_git_ref(ref_root, ref_name) or ""
+        if value:
+            if not re.fullmatch(r"[0-9a-fA-F]{40,64}", value):
+                raise ValueError(f"invalid Git ref {ref_name} in {ref_root}")
+            return head, value.lower()
+    raise ValueError(f"cannot resolve Git ref {ref_name} in {git_dir}")
+
+
 def _path_identity(path: str, *, content_digest: bool = False) -> dict[str, object]:
     """Return stable host-object evidence for an immutable bind source.
 
@@ -174,7 +240,11 @@ def _path_identity(path: str, *, content_digest: bool = False) -> dict[str, obje
     try:
         resolved = candidate.resolve(strict=True)
         stat_result = resolved.stat()
-    except OSError:
+    except OSError as exc:
+        if content_digest:
+            raise ValueError(
+                f"cannot authenticate read-only workspace {path}: {exc}"
+            ) from exc
         identity["missing"] = True
         return identity
     identity.update({
@@ -186,33 +256,28 @@ def _path_identity(path: str, *, content_digest: bool = False) -> dict[str, obje
     if content_digest:
         try:
             identity["content_sha256"] = _readonly_tree_digest(resolved)
-        except OSError:
-            identity["content_sha256"] = "unreadable"
+        except OSError as exc:
+            raise ValueError(
+                f"cannot authenticate read-only workspace {resolved}: {exc}"
+            ) from exc
     git_entry = resolved / ".git" if resolved.is_dir() else None
-    if git_entry is not None:
+    if git_entry is not None and git_entry.exists():
         try:
-            if git_entry.is_file():
-                marker = git_entry.read_text(encoding="utf-8").strip()
-                if marker.startswith("gitdir:"):
-                    git_dir = (git_entry.parent / marker[7:].strip()).resolve()
-                else:
-                    git_dir = git_entry
-            else:
-                git_dir = git_entry
-            head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+            head, commit = _git_commit_identity(git_entry)
             identity["git_head"] = head
-            if head.startswith("ref:"):
-                ref_path = git_dir / head[4:].strip()
-                try:
-                    identity["git_ref"] = ref_path.read_text(encoding="utf-8").strip()
-                except OSError:
-                    identity["git_ref"] = "unresolved"
-        except OSError:
-            pass
+            identity["git_ref"] = commit
+        except (OSError, ValueError) as exc:
+            if content_digest:
+                raise ValueError(
+                    f"cannot authenticate read-only workspace Git HEAD at "
+                    f"{resolved}: {exc}"
+                ) from exc
     return identity
 
 
-def _volume_source_identities(volume_args: list[str]) -> list[dict[str, object]]:
+def _volume_source_identities(
+    volume_args: list[str], *, canonical_workspace: bool = False
+) -> list[dict[str, object]]:
     """Fingerprint bind source objects represented by ``-v`` arguments."""
     identities: list[dict[str, object]] = []
     for index, arg in enumerate(volume_args[:-1]):
@@ -225,7 +290,11 @@ def _volume_source_identities(volume_args: list[str]) -> list[dict[str, object]]
             destination = spec.split(":", 2)[1] if ":" in spec else ""
             identity = _path_identity(
                 source,
-                content_digest="ro" in mode and destination == "/workspace",
+                content_digest=(
+                    "ro" in mode
+                    and destination == "/workspace"
+                    and not canonical_workspace
+                ),
             )
             if "ro" not in mode:
                 for mutable_field in ("ctime_ns", "git_head", "git_ref"):
@@ -1219,6 +1288,9 @@ class DockerEnvironment(BaseEnvironment):
         self._network_enabled = network
         self._tmp_storage = tmp_storage
         self._workspace_requires_ro = False
+        self._readonly_workspace_sources: list[
+            tuple[str, dict[str, object]]
+        ] = []
         logger.info(f"DockerEnvironment volumes: {volumes}")
         # Ensure volumes is a list (config.yaml could be malformed)
         if volumes is not None and not isinstance(volumes, list):
@@ -1299,6 +1371,9 @@ class DockerEnvironment(BaseEnvironment):
             if cwd_mount_mode == "ro":
                 canonical_workspace_identity = _path_identity(
                     canonical_host_cwd, content_digest=True
+                )
+                self._readonly_workspace_sources.append(
+                    (canonical_host_cwd, canonical_workspace_identity)
                 )
 
         self._workspace_dir: Optional[str] = None
@@ -1739,6 +1814,16 @@ class DockerEnvironment(BaseEnvironment):
             + env_args
             + validated_extra
         )
+        bind_source_identities = _volume_source_identities(
+            volume_args,
+            canonical_workspace=canonical_workspace_identity is not None,
+        )
+        if canonical_workspace_identity is None:
+            for identity in bind_source_identities:
+                if "content_sha256" in identity:
+                    self._readonly_workspace_sources.append(
+                        (str(identity["path"]), identity)
+                    )
         policy_payload = {
             "version": 1,
             "image": image,
@@ -1746,7 +1831,7 @@ class DockerEnvironment(BaseEnvironment):
             "image_uses_s6_init": image_uses_s6_init,
             "persistent_filesystem": self._persistent,
             "run_args": all_run_args,
-            "bind_sources": _volume_source_identities(volume_args),
+            "bind_sources": bind_source_identities,
             "canonical_workspace": canonical_workspace_identity,
         }
         policy_label = hashlib.sha256(
@@ -2126,6 +2211,9 @@ class DockerEnvironment(BaseEnvironment):
         OOM kill, daemon restart), detect the error and recreate the container
         transparently before retrying once.
         """
+        workspace_error = self._readonly_workspace_identity_violation()
+        if workspace_error:
+            return {"output": workspace_error, "returncode": 126}
         result = super().execute(command, cwd, **kwargs)
         if (
             result.get("returncode", 0) != 0
@@ -2135,6 +2223,26 @@ class DockerEnvironment(BaseEnvironment):
             if self._recreate_container():
                 result = super().execute(command, cwd, **kwargs)
         return result
+
+    def _readonly_workspace_identity_violation(self) -> Optional[str]:
+        """Detect host-side mutation of an authenticated read-only bind.
+
+        Docker's ``ro`` protects the source from the container, not from other
+        host processes. Re-authenticate immediately before every command so a
+        long-lived reviewer container cannot silently observe a different tree
+        under the same creation-policy label.
+        """
+        for source, expected in self._readonly_workspace_sources:
+            try:
+                current = _path_identity(source, content_digest=True)
+            except (OSError, ValueError) as exc:
+                return f"cannot authenticate read-only workspace {source}: {exc}"
+            if current != expected:
+                return (
+                    "read-only workspace changed after container policy "
+                    f"authentication: {source}"
+                )
+        return None
 
     @staticmethod
     def _storage_opt_supported() -> bool:
@@ -2268,6 +2376,9 @@ class DockerEnvironment(BaseEnvironment):
 
     def _effective_policy_violation(self, container_id: str) -> Optional[str]:
         """Return a fail-closed effective-mount policy error, if any."""
+        workspace_error = self._readonly_workspace_identity_violation()
+        if workspace_error:
+            return workspace_error
         if self._tmp_storage == "disk":
             if self._container_has_mount_at_or_below(container_id, "/tmp"):
                 return (

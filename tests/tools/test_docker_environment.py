@@ -271,11 +271,15 @@ def test_network_disabled_rejects_extra_arg_override(monkeypatch, network_arg):
         _make_dummy_env(network=False, extra_args=network_arg)
 
 
-def test_explicit_workspace_mount_participates_in_reuse_fingerprint(monkeypatch):
+def test_explicit_workspace_mount_participates_in_reuse_fingerprint(
+    monkeypatch, tmp_path
+):
+    review_dir = tmp_path / "review"
+    review_dir.mkdir()
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     calls = _mock_subprocess_run(monkeypatch)
 
-    _make_dummy_env(volumes=["/host/review:/workspace:ro"])
+    _make_dummy_env(volumes=[f"{review_dir}:/workspace:ro"])
 
     run_args = next(c[0] for c in calls if c[0][1] == "run")
     workspace_label = next(
@@ -343,6 +347,114 @@ def test_read_only_workspace_content_participates_in_policy(monkeypatch, tmp_pat
     first_label = next(arg for arg in first_run if arg.startswith("hermes-policy="))
 
     candidate.write_text("second candidate", encoding="utf-8")
+    _make_dummy_env(**options)
+    second_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    second_label = next(arg for arg in second_run if arg.startswith("hermes-policy="))
+
+    assert first_label != second_label
+
+
+def test_read_only_workspace_executable_mode_participates_in_policy(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    candidate = project_dir / "candidate.sh"
+    candidate.write_text("#!/bin/sh\n", encoding="utf-8")
+    candidate.chmod(0o644)
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    options = {
+        "cwd": "/workspace",
+        "host_cwd": str(project_dir),
+        "auto_mount_cwd": True,
+        "cwd_mount_mode": "ro",
+    }
+
+    _make_dummy_env(**options)
+    first_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    first_label = next(arg for arg in first_run if arg.startswith("hermes-policy="))
+
+    candidate.chmod(0o755)
+    _make_dummy_env(**options)
+    second_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    second_label = next(arg for arg in second_run if arg.startswith("hermes-policy="))
+
+    assert first_label != second_label
+
+
+def test_read_only_workspace_digest_failure_is_fail_closed(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        docker_env,
+        "_readonly_tree_digest",
+        lambda _root: (_ for _ in ()).throw(OSError("unreadable")),
+    )
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="cannot authenticate read-only workspace"):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+        )
+
+
+def test_read_only_workspace_change_blocks_existing_container_execution(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    candidate = project_dir / "candidate.txt"
+    candidate.write_text("reviewed", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(project_dir),
+        auto_mount_cwd=True,
+        cwd_mount_mode="ro",
+    )
+
+    candidate.write_text("changed after mount", encoding="utf-8")
+    result = env.execute("true")
+
+    assert result["returncode"] == 126
+    assert "read-only workspace changed" in result["output"]
+
+
+def test_read_only_workspace_resolves_packed_git_head(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    git_dir = project_dir / ".git"
+    git_dir.mkdir()
+    (git_dir / "HEAD").write_text("ref: refs/heads/review\n", encoding="utf-8")
+    first_sha = "1" * 40
+    second_sha = "2" * 40
+    (git_dir / "packed-refs").write_text(
+        f"# pack-refs with: peeled fully-peeled sorted\n{first_sha} refs/heads/review\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    options = {
+        "cwd": "/workspace",
+        "host_cwd": str(project_dir),
+        "auto_mount_cwd": True,
+        "cwd_mount_mode": "ro",
+    }
+
+    _make_dummy_env(**options)
+    first_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    first_label = next(arg for arg in first_run if arg.startswith("hermes-policy="))
+
+    (git_dir / "packed-refs").write_text(
+        f"# pack-refs with: peeled fully-peeled sorted\n{second_sha} refs/heads/review\n",
+        encoding="utf-8",
+    )
     _make_dummy_env(**options)
     second_run = [call[0] for call in calls if call[0][1] == "run"][-1]
     second_label = next(arg for arg in second_run if arg.startswith("hermes-policy="))
