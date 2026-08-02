@@ -308,6 +308,28 @@ def test_config_yaml_disk_tmp_storage_reaches_docker_constructor(tmp_path, monke
     assert captured["tmp_storage"] == "disk"
 
 
+def test_mini_swe_docker_factory_uses_configured_tmp_storage(monkeypatch):
+    import mini_swe_runner
+
+    captured = {}
+
+    class FakeDockerEnvironment:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "tools.environments.docker.DockerEnvironment", FakeDockerEnvironment
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"terminal": {"docker_tmp_storage": "disk"}},
+    )
+
+    mini_swe_runner.create_environment(env_type="docker")
+
+    assert captured["tmp_storage"] == "disk"
+
+
 def test_terminal_env_config_parses_docker_cwd_mount_policy(monkeypatch):
     from tools import terminal_tool
 

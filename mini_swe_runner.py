@@ -140,6 +140,13 @@ def create_environment(
     
     elif env_type == "docker":
         from tools.environments.docker import DockerEnvironment
+        if "tmp_storage" not in kwargs:
+            from hermes_cli.config import load_config
+
+            terminal_config = load_config().get("terminal") or {}
+            kwargs["tmp_storage"] = terminal_config.get(
+                "docker_tmp_storage", "tmpfs"
+            )
         return DockerEnvironment(image=image, cwd=cwd, timeout=timeout, **kwargs)
     
     elif env_type == "modal":

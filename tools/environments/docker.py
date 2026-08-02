@@ -168,6 +168,25 @@ def _readonly_tree_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
+def _readonly_tree_metadata_digest(root: Path) -> str:
+    """Hash mutation-sensitive tree metadata without rereading file contents."""
+    digest = hashlib.sha256()
+    paths = [root] if root.is_file() else [root, *sorted(root.rglob("*"))]
+    for path in paths:
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        info = path.lstat()
+        digest.update(relative.encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+        digest.update(
+            f"{info.st_dev}:{info.st_ino}:{info.st_mode}:{info.st_size}:"
+            f"{info.st_mtime_ns}:{info.st_ctime_ns}".encode("ascii")
+        )
+        if path.is_symlink():
+            digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _packed_git_ref(git_dir: Path, ref_name: str) -> Optional[str]:
     """Resolve *ref_name* from packed-refs, ignoring comments/peeled lines."""
     packed_refs = git_dir / "packed-refs"
@@ -233,7 +252,9 @@ def _git_commit_identity(git_entry: Path) -> tuple[str, str]:
     raise ValueError(f"cannot resolve Git ref {ref_name} in {git_dir}")
 
 
-def _path_identity(path: str, *, content_digest: bool = False) -> dict[str, object]:
+def _path_identity(
+    path: str, *, content_digest: bool = False, metadata_digest: bool = False
+) -> dict[str, object]:
     """Return stable host-object evidence for an immutable bind source.
 
     The inode fields detect atomic directory/file replacement at an unchanged
@@ -247,7 +268,7 @@ def _path_identity(path: str, *, content_digest: bool = False) -> dict[str, obje
         resolved = candidate.resolve(strict=True)
         stat_result = resolved.stat()
     except OSError as exc:
-        if content_digest:
+        if content_digest or metadata_digest:
             raise ValueError(
                 f"cannot authenticate read-only workspace {path}: {exc}"
             ) from exc
@@ -266,6 +287,13 @@ def _path_identity(path: str, *, content_digest: bool = False) -> dict[str, obje
             raise ValueError(
                 f"cannot authenticate read-only workspace {resolved}: {exc}"
             ) from exc
+    if content_digest or metadata_digest:
+        try:
+            identity["tree_metadata_sha256"] = _readonly_tree_metadata_digest(resolved)
+        except OSError as exc:
+            raise ValueError(
+                f"cannot authenticate read-only workspace metadata {resolved}: {exc}"
+            ) from exc
     git_entry = resolved / ".git" if resolved.is_dir() else None
     if git_entry is not None and git_entry.exists():
         try:
@@ -281,8 +309,14 @@ def _path_identity(path: str, *, content_digest: bool = False) -> dict[str, obje
                 git_dir, common_dir = _git_metadata_dirs(git_entry)
                 identity["git_metadata_sha256"] = _readonly_tree_digest(git_dir)
                 identity["git_common_metadata_sha256"] = _readonly_tree_digest(common_dir)
+                identity["git_metadata_tree_sha256"] = _readonly_tree_metadata_digest(git_dir)
+                identity["git_common_metadata_tree_sha256"] = _readonly_tree_metadata_digest(common_dir)
+            elif metadata_digest and git_entry.is_file():
+                git_dir, common_dir = _git_metadata_dirs(git_entry)
+                identity["git_metadata_tree_sha256"] = _readonly_tree_metadata_digest(git_dir)
+                identity["git_common_metadata_tree_sha256"] = _readonly_tree_metadata_digest(common_dir)
         except (OSError, ValueError) as exc:
-            if content_digest:
+            if content_digest or metadata_digest:
                 raise ValueError(
                     f"cannot authenticate read-only workspace Git HEAD at "
                     f"{resolved}: {exc}"
@@ -319,6 +353,58 @@ def _volume_source_identities(
                     identity.pop(mutable_field, None)
             identities.append(identity)
     return identities
+
+
+def _extra_arg_file_identities(extra_args: list[str]) -> list[dict[str, object]]:
+    """Authenticate files whose contents affect immutable Docker creation state."""
+    identities: list[dict[str, object]] = []
+    for index, arg in enumerate(extra_args):
+        value = ""
+        if arg == "--env-file":
+            if index + 1 >= len(extra_args):
+                raise ValueError("docker_extra_args --env-file requires a path")
+            value = extra_args[index + 1]
+        elif arg.startswith("--env-file="):
+            value = arg.split("=", 1)[1]
+        if value:
+            identities.append(_path_identity(value, content_digest=True))
+    return identities
+
+
+def _resolve_image_identity(docker_exe: str, image: str) -> str:
+    """Resolve a mutable image reference to the daemon's immutable image ID."""
+    try:
+        result = subprocess.run(
+            [docker_exe, "image", "inspect", "--format", "{{.Id}}", image],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30, check=False, stdin=subprocess.DEVNULL,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise RuntimeError(f"cannot resolve Docker image identity for {image}: {exc}") from exc
+    identity = result.stdout.strip()
+    if result.returncode != 0:
+        try:
+            pull = subprocess.run(
+                [docker_exe, "pull", image],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=120, check=False, stdin=subprocess.DEVNULL,
+            )
+            if pull.returncode == 0:
+                result = subprocess.run(
+                    [docker_exe, "image", "inspect", "--format", "{{.Id}}", image],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=30, check=False, stdin=subprocess.DEVNULL,
+                )
+                identity = result.stdout.strip()
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise RuntimeError(
+                f"cannot pull or resolve Docker image identity for {image}: {exc}"
+            ) from exc
+    if result.returncode != 0 or not identity:
+        raise RuntimeError(
+            f"cannot resolve Docker image identity for {image}: {result.stderr.strip()}"
+        )
+    return identity
 
 
 def _get_active_profile_name() -> str:
@@ -1363,6 +1449,14 @@ class DockerEnvironment(BaseEnvironment):
                     )
                 volume_args.extend(["-v", vol])
                 if _volume_mounts_workspace(vol):
+                    mode = vol.rsplit(":", 1)[-1].split(",")
+                    source = vol.split(":", 1)[0]
+                    if "ro" in mode and not source.startswith("/"):
+                        raise ValueError(
+                            "docker_volumes read-only /workspace requires an authenticated host bind "
+                            "with an absolute POSIX source path; named and Windows-style "
+                            "volume sources cannot prove exact reviewer contents"
+                        )
                     workspace_explicitly_mounted = True
             else:
                 logger.warning(f"Docker volume '{vol}' missing colon, skipping")
@@ -1740,6 +1834,8 @@ class DockerEnvironment(BaseEnvironment):
         # Resolve the docker executable once so it works even when
         # /usr/local/bin is not in PATH (common on macOS gateway/service).
         self._docker_exe = find_docker() or "docker"
+        image_identity = _resolve_image_identity(self._docker_exe, image)
+        self._image_identity = image_identity
 
         # s6-overlay images (e.g. hermes-agent:latest) already use /init as PID 1
         # and exec /run/s6/basedir/bin/init during startup. For those images we
@@ -1836,6 +1932,7 @@ class DockerEnvironment(BaseEnvironment):
             volume_args,
             canonical_workspace=canonical_workspace_identity is not None,
         )
+        extra_file_identities = _extra_arg_file_identities(validated_extra)
         if canonical_workspace_identity is None:
             for identity in bind_source_identities:
                 if "content_sha256" in identity:
@@ -1845,12 +1942,14 @@ class DockerEnvironment(BaseEnvironment):
         policy_payload = {
             "version": 1,
             "image": image,
+            "image_identity": image_identity,
             "cwd": cwd,
             "image_uses_s6_init": image_uses_s6_init,
             "persistent_filesystem": self._persistent,
             "run_args": all_run_args,
             "bind_sources": bind_source_identities,
             "canonical_workspace": canonical_workspace_identity,
+            "extra_files": extra_file_identities,
         }
         policy_label = hashlib.sha256(
             json.dumps(
@@ -2122,6 +2221,19 @@ class DockerEnvironment(BaseEnvironment):
         original error).
         """
         old_id = (self._container_id or "")[:12]
+        try:
+            current_image_identity = _resolve_image_identity(
+                self._docker_exe, self._image
+            )
+        except RuntimeError as exc:
+            logger.error("Recovery cannot authenticate image identity: %s", exc)
+            return False
+        if current_image_identity != self._image_identity:
+            logger.error(
+                "Recovery rejected mutable image %s: identity changed from %s to %s",
+                self._image, self._image_identity, current_image_identity,
+            )
+            return False
         logger.warning(
             "Container %s appears to be gone — attempting recovery", old_id,
         )
@@ -2240,6 +2352,12 @@ class DockerEnvironment(BaseEnvironment):
         ):
             if self._recreate_container():
                 result = super().execute(command, cwd, **kwargs)
+        workspace_error = self._readonly_workspace_identity_violation()
+        if workspace_error:
+            return {
+                "output": f"{workspace_error}; changed during command execution",
+                "returncode": 126,
+            }
         return result
 
     def _readonly_workspace_identity_violation(self) -> Optional[str]:
@@ -2252,10 +2370,13 @@ class DockerEnvironment(BaseEnvironment):
         """
         for source, expected in self._readonly_workspace_sources:
             try:
-                current = _path_identity(source, content_digest=True)
+                # Creation performs the expensive byte-for-byte hash. Commands
+                # revalidate mutation-sensitive metadata before and after use,
+                # avoiding repeated reads of large Git packs/build artifacts.
+                current = _path_identity(source, metadata_digest=True)
             except (OSError, ValueError) as exc:
                 return f"cannot authenticate read-only workspace {source}: {exc}"
-            if current != expected:
+            if any(expected.get(key) != value for key, value in current.items()):
                 return (
                     "read-only workspace changed after container policy "
                     f"authentication: {source}"
@@ -2392,22 +2513,60 @@ class DockerEnvironment(BaseEnvironment):
             )
             return True
 
+    def _container_resolved_path(
+        self, container_id: str, container_path: str
+    ) -> Optional[str]:
+        """Resolve a protected path inside the running image, failing closed."""
+        try:
+            result = subprocess.run(
+                [
+                    self._docker_exe, "exec", container_id,
+                    "readlink", "-f", "--", container_path,
+                ],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=30, check=False, stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("Could not resolve %s in container: %s", container_path, exc)
+            return None
+        resolved = result.stdout.strip()
+        if result.returncode != 0 or not resolved.startswith("/"):
+            logger.warning(
+                "Could not resolve %s in container %s: %s",
+                container_path, container_id[:12], result.stderr.strip(),
+            )
+            return None
+        return posixpath.normpath(resolved)
+
     def _effective_policy_violation(self, container_id: str) -> Optional[str]:
         """Return a fail-closed effective-mount policy error, if any."""
         workspace_error = self._readonly_workspace_identity_violation()
         if workspace_error:
             return workspace_error
         if self._tmp_storage == "disk":
-            if self._container_has_mount_at_or_below(container_id, "/tmp"):
+            resolved_tmp = self._container_resolved_path(container_id, "/tmp")
+            if resolved_tmp is None or self._container_has_mount_at_or_below(
+                container_id, "/tmp"
+            ) or (
+                resolved_tmp != "/tmp"
+                and self._container_has_mount_at_or_below(container_id, resolved_tmp)
+            ):
                 return (
                     "docker_tmp_storage=disk requires /tmp on the container "
                     "writable layer, but the effective image/container declares "
                     "a mount at /tmp"
                 )
-        elif self._container_has_mount_at_or_below(
-            container_id, "/tmp", include_root=False
-        ):
-            return "effective container mounts bypass the hardened /tmp tmpfs"
+        else:
+            resolved_tmp = self._container_resolved_path(container_id, "/tmp")
+            if resolved_tmp is None or self._container_has_mount_at_or_below(
+                container_id, "/tmp", include_root=False
+            ) or (
+                resolved_tmp != "/tmp"
+                and self._container_has_mount_at_or_below(
+                    container_id, resolved_tmp, include_root=False
+                )
+            ):
+                return "effective container mounts bypass the hardened /tmp tmpfs"
         if self._workspace_requires_ro and self._container_has_mount_at_or_below(
             container_id,
             "/workspace",

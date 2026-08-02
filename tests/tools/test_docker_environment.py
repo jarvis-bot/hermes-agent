@@ -27,6 +27,11 @@ def _mock_subprocess_run(monkeypatch):
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
             if cmd[1] == "run":
                 return subprocess.CompletedProcess(cmd, 0, stdout="fake-container-id\n", stderr="")
+            if cmd[1] == "image" and cmd[2] == "inspect":
+                return subprocess.CompletedProcess(cmd, 0, stdout="sha256:test-image\n", stderr="")
+            if cmd[1] == "exec" and cmd[-3:-1] == ["-f", "--"]:
+                protected = cmd[-1].rsplit(" ", 1)[-1]
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{protected}\n", stderr="")
             if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, stdout="[]\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -132,6 +137,8 @@ def test_disk_tmp_storage_rejects_image_declared_tmp_volume(monkeypatch):
         calls.append(list(cmd))
         if cmd[1] == "version":
             return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+        if cmd[1] == "image":
+            return subprocess.CompletedProcess(cmd, 0, stdout="sha256:test-image\n", stderr="")
         if cmd[1] == "run":
             return subprocess.CompletedProcess(cmd, 0, stdout="disk-container\n", stderr="")
         if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
@@ -155,6 +162,34 @@ def test_default_tmp_storage_preserves_hardened_tmpfs(monkeypatch):
 
     run_args = next(c[0] for c in calls if c[0][1] == "run")
     assert "/tmp:rw,nosuid,size=512m" in run_args
+
+
+def test_disk_tmp_storage_rejects_image_volume_reached_through_tmp_symlink(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    docker_env._cgroup_limits_ok = True
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+        if cmd[1] == "image":
+            return subprocess.CompletedProcess(cmd, 0, stdout="sha256:symlink-image\n", stderr="")
+        if cmd[1] == "run":
+            return subprocess.CompletedProcess(cmd, 0, stdout="disk-container\n", stderr="")
+        if cmd[1] == "exec" and cmd[-3:-1] == ["-f", "--"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="/scratch\n", stderr="")
+        if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
+            mounts = '[{"Type":"volume","Destination":"/scratch","RW":true}]\n'
+            return subprocess.CompletedProcess(cmd, 0, stdout=mounts, stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    with pytest.raises(RuntimeError, match="container writable layer"):
+        _make_dummy_env(tmp_storage="disk", persist_across_processes=False)
+
+    assert ["/usr/bin/docker", "rm", "-f", "disk-container"] in calls
 
 
 def test_tmp_storage_participates_in_container_reuse_fingerprint(monkeypatch):
@@ -303,6 +338,52 @@ def test_managed_workspace_policy_participates_in_reuse_fingerprint(monkeypatch)
 
 
 @pytest.mark.parametrize(
+    "volume",
+    ["review-source:/workspace:ro", r"C:\review:/workspace:ro"],
+)
+def test_read_only_workspace_requires_authenticatable_bind_source(monkeypatch, volume):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="authenticated host bind"):
+        _make_dummy_env(volumes=[volume])
+
+
+def test_env_file_contents_participate_in_reuse_fingerprint(monkeypatch, tmp_path):
+    env_file = tmp_path / "container.env"
+    env_file.write_text("VALUE=first\n", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(extra_args=["--env-file", str(env_file)])
+    first_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    first_label = next(arg for arg in first_run if arg.startswith("hermes-policy="))
+
+    env_file.write_text("VALUE=second\n", encoding="utf-8")
+    _make_dummy_env(extra_args=["--env-file", str(env_file)])
+    second_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    second_label = next(arg for arg in second_run if arg.startswith("hermes-policy="))
+
+    assert first_label != second_label
+
+
+def test_mutable_image_identity_participates_in_reuse_fingerprint(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    identities = iter(["sha256:first", "sha256:second"])
+    monkeypatch.setattr(docker_env, "_resolve_image_identity", lambda *_: next(identities))
+
+    _make_dummy_env(image="reviewer:latest")
+    first_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    first_label = next(arg for arg in first_run if arg.startswith("hermes-policy="))
+    _make_dummy_env(image="reviewer:latest")
+    second_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    second_label = next(arg for arg in second_run if arg.startswith("hermes-policy="))
+
+    assert first_label != second_label
+
+
+@pytest.mark.parametrize(
     ("first", "second"),
     [
         ({"image": "python:3.11"}, {"image": "python:3.12"}),
@@ -424,6 +505,32 @@ def test_read_only_workspace_change_blocks_existing_container_execution(
 
     assert result["returncode"] == 126
     assert "read-only workspace changed" in result["output"]
+
+
+def test_mutated_read_only_workspace_rejects_command_result(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    candidate = project_dir / "candidate.txt"
+    candidate.write_text("reviewed", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(project_dir),
+        auto_mount_cwd=True,
+        cwd_mount_mode="ro",
+        persist_across_processes=False,
+    )
+
+    def _execute(*args, **kwargs):
+        candidate.write_text("changed during command", encoding="utf-8")
+        return {"output": "apparently successful", "returncode": 0}
+
+    monkeypatch.setattr(docker_env.BaseEnvironment, "execute", _execute)
+    result = env.execute("inspect candidate")
+
+    assert result["returncode"] == 126
+    assert "changed during command" in result["output"]
 
 
 def test_read_only_workspace_resolves_packed_git_head(monkeypatch, tmp_path):
@@ -1131,6 +1238,10 @@ def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
                 return subprocess.CompletedProcess(cmd, 0, stdout="reused-cid\n", stderr="")
             if sub == "run":
                 return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
+            if sub == "image" and cmd[2] == "inspect":
+                return subprocess.CompletedProcess(cmd, 0, stdout="sha256:test-image\n", stderr="")
+            if sub == "exec" and cmd[-3:-1] == ["-f", "--"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{cmd[-1]}\n", stderr="")
             if sub == "inspect" and "{{.HostConfig.NetworkMode}}" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, stdout="bridge\n", stderr="")
             if sub == "inspect" and "{{json .Mounts}}" in cmd:
@@ -1198,6 +1309,10 @@ def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             if sub == "run":
                 return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
+            if sub == "image" and cmd[2] == "inspect":
+                return subprocess.CompletedProcess(cmd, 0, stdout="sha256:test-image\n", stderr="")
+            if sub == "exec" and cmd[-3:-1] == ["-f", "--"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{cmd[-1]}\n", stderr="")
             if sub == "inspect" and "{{.HostConfig.NetworkMode}}" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, stdout="bridge\n", stderr="")
             if sub == "inspect" and "{{json .Mounts}}" in cmd:
@@ -1286,6 +1401,8 @@ def test_failed_docker_run_cleans_up_orphaned_container(monkeypatch):
             sub = cmd[1]
             if sub == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+            if sub == "image":
+                return subprocess.CompletedProcess(cmd, 0, stdout="sha256:test-image\n", stderr="")
             if sub == "ps":
                 # No reusable container -> fall through to a fresh `docker run`.
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -1324,6 +1441,8 @@ def test_docker_run_timeout_cleans_up_orphaned_container(monkeypatch):
             sub = cmd[1]
             if sub == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+            if sub == "image":
+                return subprocess.CompletedProcess(cmd, 0, stdout="sha256:test-image\n", stderr="")
             if sub == "ps":
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             if sub == "run":
@@ -1363,6 +1482,8 @@ def test_find_reusable_handles_empty_label_string(monkeypatch):
                     stdout="safe-cid\trunning\t\n",
                     stderr="",
                 )
+            if cmd[1] == "exec" and cmd[-3:-1] == ["-f", "--"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{cmd[-1]}\n", stderr="")
             if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, stdout="[]\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
@@ -1831,9 +1952,13 @@ def _mock_subprocess_run_with_entrypoint(monkeypatch, entrypoint_json):
             if cmd[1] == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
             if cmd[1] == "image" and len(cmd) >= 3 and cmd[2] == "inspect":
+                if "{{.Id}}" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="sha256:test-image\n", stderr="")
                 return subprocess.CompletedProcess(cmd, 0, stdout=entrypoint_json + "\n", stderr="")
             if cmd[1] == "run":
                 return subprocess.CompletedProcess(cmd, 0, stdout="fake-container-id\n", stderr="")
+            if cmd[1] == "exec" and cmd[-3:-1] == ["-f", "--"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{cmd[-1]}\n", stderr="")
             if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, stdout="[]\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
