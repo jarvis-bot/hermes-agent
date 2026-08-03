@@ -68,7 +68,7 @@ for name, requested in (
 ):
     kind = getattr(resource, name, None)
     if kind is None:
-        continue
+        raise RuntimeError(f"required reviewer resource limit is unavailable: {name}")
     _soft, hard = resource.getrlimit(kind)
     limit = requested if hard == resource.RLIM_INFINITY else min(requested, hard)
     resource.setrlimit(kind, (limit, limit))
@@ -135,15 +135,18 @@ def _open_nofollow_path(path: Path, flags: int) -> int:
     """Open every absolute path component through anchored no-follow dirfds."""
     if os.name != "posix":
         raise ValueError("reviewer path authentication requires POSIX dirfd support")
+    required = ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")
+    if any(not hasattr(os, name) for name in required):
+        raise ValueError("reviewer path authentication primitives are unavailable")
     absolute = Path(os.path.abspath(path))
     parts = absolute.parts[1:]
     if not parts:
         raise ValueError("reviewer file path is invalid")
     directory_flags = (
         os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | os.O_CLOEXEC
     )
     descriptor = os.open("/", directory_flags)
     try:
@@ -151,7 +154,7 @@ def _open_nofollow_path(path: Path, flags: int) -> int:
             child = os.open(part, directory_flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = child
-        final_flags = flags | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        final_flags = flags | os.O_NOFOLLOW | os.O_CLOEXEC
         result = os.open(parts[-1], final_flags, dir_fd=descriptor)
         os.close(descriptor)
         return result
@@ -1388,6 +1391,20 @@ def _verify_git_workspace_provenance_in_staging(
 
 
 
+def _best_effort_docker_cleanup(docker_exe: str, args: list[str]) -> None:
+    """Run bounded cleanup without masking the failure that required it."""
+    try:
+        subprocess.run(
+            [docker_exe, *args],
+            capture_output=True,
+            timeout=30,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("Reviewer Docker cleanup failed for %s: %s", args, exc)
+
+
 def _materialize_readonly_workspace(
     docker_exe: str,
     image: str,
@@ -1415,10 +1432,14 @@ def _materialize_readonly_workspace(
         else f"hermes-ro-{content[:24]}"
     )
     created_volume = False
-    inspect = subprocess.run(
-        [docker_exe, "volume", "inspect", volume],
-        capture_output=True, timeout=30, check=False, stdin=subprocess.DEVNULL,
-    )
+    try:
+        inspect = subprocess.run(
+            [docker_exe, "volume", "inspect", volume],
+            capture_output=True, timeout=30, check=False, stdin=subprocess.DEVNULL,
+        )
+    except BaseException:
+        archive.close()
+        raise
     if disposable or inspect.returncode != 0:
         try:
             subprocess.run(
@@ -1429,13 +1450,15 @@ def _materialize_readonly_workspace(
         except BaseException:
             # The daemon may have created the deterministically known volume
             # before the client timed out or lost its connection. Reviewer
-            # volumes are disposable, so always attempt removal by name.
-            if disposable:
-                subprocess.run(
-                    [docker_exe, "volume", "rm", "-f", volume], capture_output=True,
-                    timeout=30, check=False, stdin=subprocess.DEVNULL,
-                )
-            archive.close()
+            # volumes are disposable, so always attempt removal by name, and
+            # never let cleanup mask the original failure or skip archive close.
+            try:
+                if disposable:
+                    _best_effort_docker_cleanup(
+                        docker_exe, ["volume", "rm", "-f", volume]
+                    )
+            finally:
+                archive.close()
             raise
         script = r'''
 import hashlib, os, pathlib, shutil, stat, sys, tarfile
@@ -1476,23 +1499,23 @@ print(digest.hexdigest())
                 stdin=archive, capture_output=True, timeout=120, check=False,
             )
         except BaseException:
-            subprocess.run(
-                [docker_exe, "rm", "-f", "-v", populate_name], capture_output=True,
-                timeout=30, check=False, stdin=subprocess.DEVNULL,
+            _best_effort_docker_cleanup(
+                docker_exe, ["rm", "-f", "-v", populate_name]
             )
             if created_volume:
-                subprocess.run(
-                    [docker_exe, "volume", "rm", "-f", volume], capture_output=True,
-                    timeout=30, check=False, stdin=subprocess.DEVNULL,
+                _best_effort_docker_cleanup(
+                    docker_exe, ["volume", "rm", "-f", volume]
                 )
             raise
         finally:
             archive.close()
         output = populated.stdout.decode("utf-8", errors="replace").strip()
         if populated.returncode != 0 or output != content:
-            subprocess.run(
-                [docker_exe, "volume", "rm", "-f", volume],
-                capture_output=True, timeout=30, check=False,
+            _best_effort_docker_cleanup(
+                docker_exe, ["rm", "-f", "-v", populate_name]
+            )
+            _best_effort_docker_cleanup(
+                docker_exe, ["volume", "rm", "-f", volume]
             )
             detail = populated.stderr.decode("utf-8", errors="replace").strip()
             raise RuntimeError(
