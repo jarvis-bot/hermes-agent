@@ -26,6 +26,17 @@ mirrors the pattern used in tests/hermes_cli/test_config_drift.py.
 import ast
 import inspect
 
+import pytest
+
+from tools import terminal_tool
+
+
+def test_malformed_expected_workspace_sha_fails_closed(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "candidate-branch")
+
+    with pytest.raises(ValueError, match="40 lowercase hex"):
+        terminal_tool._expected_kanban_workspace_sha()
+
 
 def _extract_dict_values(source: str, dict_name: str) -> set[str]:
     """Return the set of *value* strings in `dict_name = { "k": "VALUE", ... }`.
@@ -306,6 +317,31 @@ def test_config_yaml_disk_tmp_storage_reaches_docker_constructor(tmp_path, monke
     )
 
     assert captured["tmp_storage"] == "disk"
+
+
+def test_assigned_workspace_sha_reaches_docker_constructor(monkeypatch):
+    from tools import terminal_tool
+
+    assigned_sha = "a" * 40
+    monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", assigned_sha)
+    captured = {}
+
+    class CapturingDockerEnvironment:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(terminal_tool, "_DockerEnvironment", CapturingDockerEnvironment)
+    monkeypatch.setattr(terminal_tool, "_maybe_reap_docker_orphans", lambda config: None)
+
+    terminal_tool._create_environment(
+        "docker",
+        "python:3.11",
+        "/workspace",
+        60,
+        container_config={},
+    )
+
+    assert captured["expected_git_sha"] == assigned_sha
 
 
 def test_mini_swe_docker_factory_uses_configured_tmp_storage(monkeypatch):

@@ -62,7 +62,7 @@ def _mock_subprocess_run(monkeypatch):
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
 
-    def _materialize(_docker, _image, _source, expected):
+    def _materialize(_docker, _image, _source, expected, _expected_git_sha=None):
         volume = f"hermes-ro-{str(expected['mounted_content_sha256'])[:24]}"
         snapshot_digests[volume] = str(expected["mounted_content_sha256"])
         return volume
@@ -94,6 +94,7 @@ def _make_dummy_env(**kwargs):
         run_as_host_user=kwargs.get("run_as_host_user", False),
         extra_args=kwargs.get("extra_args", []),
         tmp_storage=kwargs.get("tmp_storage", "tmpfs"),
+        expected_git_sha=kwargs.get("expected_git_sha"),
         persist_across_processes=kwargs.get("persist_across_processes", True),
     )
 
@@ -628,6 +629,132 @@ def test_git_workspace_provenance_requires_exact_clean_commit_tree(tmp_path):
     (project_dir / ".hidden").write_text("candidate bytes\n", encoding="utf-8")
     with pytest.raises(ValueError, match="untracked files"):
         docker_env._verify_git_workspace_provenance(project_dir)
+
+
+def test_git_workspace_provenance_rejects_candidate_replacement_refs(tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"],
+        cwd=project_dir,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    payload = project_dir / "payload.txt"
+    payload.write_text("assigned\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=project_dir, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    payload.write_text("candidate replacement\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "replacement"], cwd=project_dir, check=True)
+    replacement = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "checkout", "-q", assigned], cwd=project_dir, check=True)
+    subprocess.run(["git", "replace", assigned, replacement], cwd=project_dir, check=True)
+    subprocess.run(["git", "pack-refs", "--all", "--prune"], cwd=project_dir, check=True)
+    payload.write_text("assigned\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="replacement refs"):
+        docker_env._verify_git_workspace_provenance(project_dir, assigned)
+
+
+def test_git_workspace_provenance_does_not_trust_candidate_index_stat_cache(tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"],
+        cwd=project_dir, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    payload = project_dir / "payload.txt"
+    payload.write_text("SAFE-CONTENT\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=project_dir, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    original_stat = payload.stat()
+    subprocess.run(
+        ["git", "config", "core.trustctime", "false"], cwd=project_dir, check=True
+    )
+    subprocess.run(
+        ["git", "config", "core.checkStat", "minimal"], cwd=project_dir, check=True
+    )
+    payload.write_text("EVIL-CONTENT\n", encoding="utf-8")
+    os.utime(payload, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    with pytest.raises(ValueError, match="tracked files do not match HEAD"):
+        docker_env._verify_git_workspace_provenance(project_dir, assigned)
+
+
+@pytest.mark.parametrize("metadata", ["info/grafts", "shallow"])
+def test_git_workspace_provenance_rejects_candidate_history_metadata(
+    tmp_path, metadata
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"],
+        cwd=project_dir, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    (project_dir / "payload.txt").write_text("assigned\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=project_dir, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    metadata_path = project_dir / ".git" / metadata
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(f"{assigned}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="candidate-selected Git history metadata"):
+        docker_env._verify_git_workspace_provenance(project_dir, assigned)
+
+
+def test_git_workspace_provenance_requires_out_of_band_assigned_sha(tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"],
+        cwd=project_dir,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    (project_dir / "payload.txt").write_text("tree\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "other"], cwd=project_dir, check=True)
+
+    with pytest.raises(ValueError, match="assigned SHA"):
+        docker_env._verify_git_workspace_provenance(project_dir, "1" * 40)
+
+
+def test_assigned_sha_requires_git_metadata(tmp_path):
+    project_dir = tmp_path / "not-a-repository"
+    project_dir.mkdir()
+
+    with pytest.raises(ValueError, match="missing Git metadata"):
+        docker_env._verify_git_workspace_provenance(project_dir, "1" * 40)
 
 
 def test_read_only_workspace_is_materialized_away_from_mutable_host_bind(

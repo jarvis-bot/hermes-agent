@@ -542,9 +542,11 @@ def _extra_args_have_host_security_file(extra_args: list[str]) -> bool:
     return False
 
 
-def _readonly_workspace_archive(root: Path, expected_metadata: str) -> bytes:
+def _readonly_workspace_archive(
+    root: Path, expected_metadata: str, expected_git_sha: Optional[str] = None
+) -> bytes:
     """Create a stable regular/dir/symlink-only archive of an authenticated tree."""
-    _verify_git_workspace_provenance(root)
+    _verify_git_workspace_provenance(root, expected_git_sha)
     if _readonly_tree_metadata_digest(root) != expected_metadata:
         raise ValueError(f"read-only workspace changed before materialization: {root}")
     if not root.is_dir():
@@ -571,7 +573,9 @@ def _readonly_workspace_archive(root: Path, expected_metadata: str) -> bytes:
         return archive_file.read()
 
 
-def _verify_git_workspace_provenance(root: Path) -> None:
+def _verify_git_workspace_provenance(
+    root: Path, expected_git_sha: Optional[str] = None
+) -> None:
     """Require a Git workspace to be the complete clean tree of its real HEAD.
 
     Merely hashing candidate-supplied ``.git/HEAD`` text does not establish
@@ -582,10 +586,17 @@ def _verify_git_workspace_provenance(root: Path) -> None:
     are not authenticated by the parent commit.
     """
     git_entry = root / ".git"
-    if not git_entry.exists():
+    if not git_entry.exists() and not git_entry.is_symlink():
+        if expected_git_sha is not None:
+            raise ValueError("reviewer workspace is missing Git metadata for the assigned SHA")
         return
     _validate_local_git_metadata(git_entry)
     _head_text, commit = _git_commit_identity(git_entry)
+    if expected_git_sha is not None:
+        if not re.fullmatch(r"[0-9a-f]{40}", expected_git_sha):
+            raise ValueError("expected reviewer Git SHA must be 40 lowercase hex characters")
+        if commit != expected_git_sha:
+            raise ValueError("reviewer workspace HEAD does not match the assigned SHA")
     git_exe = shutil.which("git")
     if git_exe is None:
         raise ValueError("git is required to authenticate a Git reviewer workspace")
@@ -601,6 +612,7 @@ def _verify_git_workspace_provenance(root: Path) -> None:
         "LANG": "C",
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_NO_REPLACE_OBJECTS": "1",
     }
 
     def run(args: list[str]) -> subprocess.CompletedProcess[bytes]:
@@ -615,17 +627,84 @@ def _verify_git_workspace_provenance(root: Path) -> None:
     object_check = run(["cat-file", "-e", f"{commit}^{{commit}}"])
     if object_check.returncode != 0:
         raise ValueError("reviewer workspace HEAD commit object is missing or invalid")
-    tracked_check = run(["diff-index", "--quiet", "--no-ext-diff", commit, "--"])
-    if tracked_check.returncode != 0:
-        raise ValueError("reviewer workspace tracked files do not match HEAD")
-    untracked = run(["ls-files", "--others", "-z"])
-    if untracked.returncode != 0 or untracked.stdout:
-        raise ValueError("reviewer workspace contains untracked files")
     tree = run(["ls-tree", "-r", "-z", "--full-tree", commit])
     if tree.returncode != 0:
         raise ValueError("reviewer workspace commit tree cannot be authenticated")
-    if any(record.startswith(b"160000 ") for record in tree.stdout.split(b"\0") if record):
-        raise ValueError("reviewer workspace contains unauthenticated Git submodules")
+    expected_paths: set[str] = set()
+    for record in tree.stdout.split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, raw_path = record.partition(b"\t")
+        fields = metadata.split(b" ")
+        if not separator or len(fields) != 3:
+            raise ValueError("reviewer workspace commit tree is malformed")
+        mode, object_type, object_id = fields
+        if mode == b"160000" or object_type == b"commit":
+            raise ValueError("reviewer workspace contains unauthenticated Git submodules")
+        if object_type != b"blob" or mode not in {b"100644", b"100755", b"120000"}:
+            raise ValueError("reviewer workspace contains unsupported Git tree entries")
+        relative = raw_path.decode("utf-8", errors="surrogateescape")
+        if not relative or relative.startswith("/") or ".." in Path(relative).parts:
+            raise ValueError("reviewer workspace commit tree contains an unsafe path")
+        expected_paths.add(relative)
+        candidate = root / relative
+        try:
+            candidate_mode = candidate.lstat().st_mode
+        except OSError as exc:
+            raise ValueError("reviewer workspace tracked files do not match HEAD") from exc
+        blob = run(["cat-file", "blob", object_id.decode("ascii")])
+        if blob.returncode != 0:
+            raise ValueError("reviewer workspace commit blob cannot be authenticated")
+        if mode == b"120000":
+            if not stat.S_ISLNK(candidate_mode):
+                raise ValueError("reviewer workspace tracked files do not match HEAD")
+            actual = os.readlink(candidate).encode("utf-8", errors="surrogateescape")
+        else:
+            if not stat.S_ISREG(candidate_mode):
+                raise ValueError("reviewer workspace tracked files do not match HEAD")
+            try:
+                actual = candidate.read_bytes()
+            except OSError as exc:
+                raise ValueError("reviewer workspace tracked files do not match HEAD") from exc
+            executable = bool(candidate_mode & stat.S_IXUSR)
+            if executable != (mode == b"100755"):
+                raise ValueError("reviewer workspace tracked file modes do not match HEAD")
+        if actual != blob.stdout:
+            raise ValueError("reviewer workspace tracked files do not match HEAD")
+
+    # Do not consult the candidate-controlled index for untracked detection.
+    # Compare the filesystem leaves directly to the authenticated commit tree.
+    actual_paths: set[str] = set()
+    for top_level in root.iterdir():
+        if top_level.name == ".git":
+            continue
+        candidates = [top_level]
+        if top_level.is_dir() and not top_level.is_symlink():
+            candidates.extend(top_level.rglob("*"))
+        for candidate in candidates:
+            if not candidate.is_dir() or candidate.is_symlink():
+                actual_paths.add(candidate.relative_to(root).as_posix())
+    if actual_paths != expected_paths:
+        raise ValueError("reviewer workspace contains missing or untracked files")
+
+    # Replacement refs alter ordinary reviewer Git commands even though the
+    # authentication commands above disable them. Never preserve that
+    # candidate-selected interpretation in the copied reviewer workspace.
+    replace_refs = run(["for-each-ref", "--format=%(refname)", "refs/replace"])
+    if replace_refs.returncode != 0:
+        raise ValueError("reviewer workspace Git refs cannot be authenticated")
+    if replace_refs.stdout:
+        raise ValueError("reviewer workspace contains Git replacement refs")
+    for semantic_metadata in (
+        git_entry / "info" / "grafts",
+        git_entry / "shallow",
+        git_entry / "objects" / "info" / "alternates",
+        git_entry / "objects" / "info" / "http-alternates",
+    ):
+        if semantic_metadata.exists() or semantic_metadata.is_symlink():
+            raise ValueError(
+                "reviewer workspace contains candidate-selected Git history metadata"
+            )
 
 
 def _materialize_readonly_workspace(
@@ -633,12 +712,13 @@ def _materialize_readonly_workspace(
     image: str,
     source: str,
     expected: dict[str, object],
+    expected_git_sha: Optional[str] = None,
 ) -> str:
     """Materialize authenticated bytes in a daemon-owned, content-named volume."""
     content = str(expected["mounted_content_sha256"])
     volume = f"hermes-ro-{content[:24]}"
     archive = _readonly_workspace_archive(
-        Path(source), str(expected["tree_metadata_sha256"])
+        Path(source), str(expected["tree_metadata_sha256"]), expected_git_sha
     )
     inspect = subprocess.run(
         [docker_exe, "volume", "inspect", volume],
@@ -660,6 +740,8 @@ with tarfile.open(fileobj=sys.stdin.buffer, mode='r|*') as archive:
         if target.is_absolute() or '..' in target.parts or not (member.isfile() or member.isdir() or member.issym()):
             raise ValueError('unsafe workspace archive member')
         archive.extract(member, root, filter='data')
+        if member.isfile() or member.isdir():
+            os.chmod(root / member.name, member.mode & 0o777)
 digest = hashlib.sha256()
 for path in [root, *sorted(root.rglob('*'))]:
     relative = '.' if path == root else path.relative_to(root).as_posix()
@@ -1556,6 +1638,16 @@ def _volume_mounts_path(volume: str, container_path: str) -> bool:
     )
 
 
+def _volume_targets_exact_path(volume: str, container_path: str) -> bool:
+    """Recognize a Docker ``-v`` entry targeting exactly one container path."""
+    match = re.search(r":(/[^:]*)(?::[^:]*)?$", volume)
+    if not match:
+        return False
+    candidate = posixpath.normpath("/" + match.group(1).strip().lstrip("/"))
+    expected = posixpath.normpath("/" + container_path.strip().lstrip("/"))
+    return candidate == expected
+
+
 def _container_path_is_at_or_below(candidate: str, protected: str) -> bool:
     """Return whether a container path resolves to a protected path/subtree."""
     candidate = candidate.strip().replace('"', "").replace("'", "")
@@ -1714,6 +1806,7 @@ class DockerEnvironment(BaseEnvironment):
         extra_args: list = None,
         persist_across_processes: bool = True,
         tmp_storage: str = "tmpfs",
+        expected_git_sha: Optional[str] = None,
     ):
         if cwd == "~":
             cwd = "/root"
@@ -2285,18 +2378,27 @@ class DockerEnvironment(BaseEnvironment):
                         )
                     )
 
+        if expected_git_sha is not None and not self._readonly_workspace_sources:
+            raise ValueError(
+                "an assigned reviewer Git SHA requires an authenticated read-only workspace"
+            )
+
         # A read-only host bind is not immutable: a host checkout can change
         # between the pre-command digest and the command's read. Replace every
         # authenticated workspace bind with a daemon-owned content snapshot.
         for source, destination, expected in list(self._readonly_workspace_sources):
             snapshot_volume = _materialize_readonly_workspace(
-                self._docker_exe, image_identity, source, expected
+                self._docker_exe,
+                image_identity,
+                source,
+                expected,
+                expected_git_sha,
             )
             for index, arg in enumerate(volume_args[:-1]):
                 if arg != "-v":
                     continue
                 spec = volume_args[index + 1]
-                if _volume_mounts_path(spec, destination) and "ro" in spec.rsplit(
+                if _volume_targets_exact_path(spec, destination) and "ro" in spec.rsplit(
                     ":", 1
                 )[-1].split(","):
                     volume_args[index + 1] = f"{snapshot_volume}:{destination}:ro"
@@ -2725,9 +2827,17 @@ class DockerEnvironment(BaseEnvironment):
         OOM kill, daemon restart), detect the error and recreate the container
         transparently before retrying once.
         """
-        workspace_error = self._readonly_workspace_identity_violation()
-        if workspace_error:
-            return {"output": workspace_error, "returncode": 126}
+        # Mutable host binds require before/after checks. Materialized snapshots
+        # are authenticated once at creation/reuse and mounted from a daemon
+        # volume read-only, so hashing a large repository twice per command is
+        # unnecessary and makes every terminal/file operation O(tree size).
+        revalidate_each_command = any(
+            source for source, _destination, _expected in self._readonly_workspace_sources
+        )
+        if revalidate_each_command:
+            workspace_error = self._readonly_workspace_identity_violation()
+            if workspace_error:
+                return {"output": workspace_error, "returncode": 126}
         result = super().execute(command, cwd, **kwargs)
         if (
             result.get("returncode", 0) != 0
@@ -2736,12 +2846,13 @@ class DockerEnvironment(BaseEnvironment):
         ):
             if self._recreate_container():
                 result = super().execute(command, cwd, **kwargs)
-        workspace_error = self._readonly_workspace_identity_violation()
-        if workspace_error:
-            return {
-                "output": f"{workspace_error}; changed during command execution",
-                "returncode": 126,
-            }
+        if revalidate_each_command:
+            workspace_error = self._readonly_workspace_identity_violation()
+            if workspace_error:
+                return {
+                    "output": f"{workspace_error}; changed during command execution",
+                    "returncode": 126,
+                }
         return result
 
     def _readonly_workspace_identity_violation(self) -> Optional[str]:

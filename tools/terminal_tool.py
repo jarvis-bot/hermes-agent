@@ -1597,6 +1597,18 @@ def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:
     )
 
 
+def _expected_kanban_workspace_sha() -> Optional[str]:
+    """Return the assigned SHA, rejecting malformed provenance constraints."""
+    value = os.environ.get("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA")
+    if value is None:
+        return None
+    if not re.fullmatch(r"[0-9a-f]{40}", value):
+        raise ValueError(
+            "HERMES_KANBAN_EXPECTED_WORKSPACE_SHA must be 40 lowercase hex characters"
+        )
+    return value
+
+
 def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                         ssh_config: dict = None, container_config: dict = None,
                         local_config: dict = None,
@@ -1657,6 +1669,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             network=docker_network,
             extra_args=docker_extra_args,
             tmp_storage=cc.get("docker_tmp_storage", "tmpfs"),
+            expected_git_sha=_expected_kanban_workspace_sha(),
             persist_across_processes=cc.get("docker_persist_across_processes", True),
         )
     

@@ -68,6 +68,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
         "branch_name": t.branch_name,
+        "expected_workspace_sha": t.expected_workspace_sha,
         "project_id": t.project_id,
         "created_by": t.created_by,
         "created_at": t.created_at,
@@ -350,6 +351,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(default: scratch)")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
+    p_create.add_argument(
+        "--expected-workspace-sha",
+        default=None,
+        help="Expected 40-character lowercase Git commit for a dir workspace",
+    )
     p_create.add_argument("--project", default=None,
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
@@ -1536,6 +1542,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             workspace_kind=ws_kind,
             workspace_path=ws_path,
             branch_name=branch_name,
+            expected_workspace_sha=getattr(args, "expected_workspace_sha", None),
             project_id=getattr(args, "project", None),
             tenant=args.tenant,
             priority=args.priority,

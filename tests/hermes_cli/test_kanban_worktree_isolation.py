@@ -99,6 +99,39 @@ def test_decompose_worktree_children_get_own_workspace(kanban_home):
             assert row["workspace_path"] is None
 
 
+def test_decompose_inherits_sha_only_with_exact_dir_workspace(kanban_home):
+    assigned_sha = "a" * 40
+    with kb.connect() as conn:
+        root = kb.create_task(
+            conn,
+            title="review assigned tree",
+            triage=True,
+            workspace_kind="dir",
+            workspace_path="/runs/card/repo",
+            expected_workspace_sha=assigned_sha,
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=[
+                {"title": "same tree", "parents": []},
+                {
+                    "title": "different tree",
+                    "parents": [],
+                    "workspace_kind": "dir",
+                    "workspace_path": "/runs/other/repo",
+                },
+            ],
+            author="decomposer",
+        )
+        assert child_ids is not None
+        rows = [kb.get_task(conn, child_id) for child_id in child_ids]
+
+    assert rows[0].expected_workspace_sha == assigned_sha
+    assert rows[1].expected_workspace_sha is None
+
+
 
 
 def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):

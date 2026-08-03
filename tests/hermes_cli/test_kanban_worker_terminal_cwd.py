@@ -16,7 +16,7 @@ from __future__ import annotations
 import subprocess
 
 
-def _make_task(kb, *, assignee: str = "w"):
+def _make_task(kb, *, assignee: str = "w", expected_workspace_sha: str | None = None):
     return kb.Task(
         id="t_cwd",
         title="cwd pin",
@@ -33,11 +33,14 @@ def _make_task(kb, *, assignee: str = "w"):
         claim_lock="lock",
         claim_expires=None,
         tenant=None,
+        expected_workspace_sha=expected_workspace_sha,
         current_run_id=1,
     )
 
 
-def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
+def _capture_spawn_env(
+    kb, monkeypatch, workspace: str, *, expected_workspace_sha: str | None = None
+) -> dict:
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
 
     captured: dict = {}
@@ -52,7 +55,9 @@ def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    kb._default_spawn(_make_task(kb), workspace)
+    kb._default_spawn(
+        _make_task(kb, expected_workspace_sha=expected_workspace_sha), workspace
+    )
     return captured
 
 
@@ -75,5 +80,52 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     # The subprocess cwd and TERMINAL_CWD must agree — both anchor the workspace.
     assert captured["cwd"] == str(workspace)
     assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
+
+
+def test_expected_workspace_sha_is_pinned_in_worker_environment(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "w").mkdir(parents=True)
+    (root / "profiles" / "w" / "config.yaml").write_text(
+        "toolsets:\n  - kanban\n", encoding="utf-8"
+    )
+    root.joinpath("config.yaml").write_text(
+        "toolsets:\n  - kanban\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    assigned_sha = "a" * 40
+    captured = _capture_spawn_env(
+        kb,
+        monkeypatch,
+        str(workspace),
+        expected_workspace_sha=assigned_sha,
+    )
+
+    assert captured["env"]["HERMES_KANBAN_EXPECTED_WORKSPACE_SHA"] == assigned_sha
+
+
+def test_unpinned_worker_clears_inherited_expected_workspace_sha(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "w").mkdir(parents=True)
+    (root / "profiles" / "w" / "config.yaml").write_text(
+        "toolsets:\n  - kanban\n", encoding="utf-8"
+    )
+    root.joinpath("config.yaml").write_text(
+        "toolsets:\n  - kanban\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "b" * 40)
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+
+    assert "HERMES_KANBAN_EXPECTED_WORKSPACE_SHA" not in captured["env"]
 
 

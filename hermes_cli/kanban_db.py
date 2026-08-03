@@ -883,6 +883,7 @@ class Task:
     claim_expires: Optional[int]
     tenant: Optional[str]
     branch_name: Optional[str] = None
+    expected_workspace_sha: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
@@ -976,6 +977,11 @@ class Task:
             workspace_kind=row["workspace_kind"],
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
+            expected_workspace_sha=(
+                row["expected_workspace_sha"]
+                if "expected_workspace_sha" in keys
+                else None
+            ),
             project_id=row["project_id"] if "project_id" in keys else None,
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
@@ -1179,6 +1185,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
     workspace_path       TEXT,
     branch_name          TEXT,
+    expected_workspace_sha TEXT,
     -- Optional link to a first-class Project (hermes_cli/projects_db). When set,
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
@@ -2326,6 +2333,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "result", "result TEXT")
     if "branch_name" not in cols:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
+    if "expected_workspace_sha" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "expected_workspace_sha",
+            "expected_workspace_sha TEXT",
+        )
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
     if "idempotency_key" not in cols:
@@ -3161,6 +3175,7 @@ def create_task(
     workspace_kind: str = "scratch",
     workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None,
+    expected_workspace_sha: Optional[str] = None,
     tenant: Optional[str] = None,
     priority: int = 0,
     parents: Iterable[str] = (),
@@ -3233,6 +3248,14 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    if expected_workspace_sha is not None:
+        expected_workspace_sha = str(expected_workspace_sha).strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", expected_workspace_sha):
+            raise ValueError(
+                "expected_workspace_sha must be exactly 40 lowercase hex characters"
+            )
+        if workspace_kind != "dir":
+            raise ValueError("expected_workspace_sha is only valid for dir workspaces")
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -3464,11 +3487,12 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, expected_workspace_sha, project_id, tenant,
+                        idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3482,6 +3506,7 @@ def create_task(
                         workspace_kind,
                         workspace_path,
                         branch_name,
+                        expected_workspace_sha,
                         project_id,
                         tenant,
                         idempotency_key,
@@ -3512,6 +3537,7 @@ def create_task(
                         "workspace_kind": workspace_kind,
                         "workspace_path": workspace_path,
                         "branch_name": branch_name,
+                        "expected_workspace_sha": expected_workspace_sha,
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
@@ -6340,7 +6366,8 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "expected_workspace_sha "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -6355,6 +6382,7 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        root_expected_sha = root_row["expected_workspace_sha"]
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -6389,8 +6417,8 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, expected_workspace_sha, tenant, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -6398,6 +6426,12 @@ def decompose_triage_task(
                     assignee,
                     child_ws_kind,
                     child_ws_path,
+                    (
+                        root_expected_sha
+                        if child_ws_kind == root_ws_kind
+                        and child_ws_path == root_ws_path
+                        else None
+                    ),
                     tenant,
                     now,
                     (author or "decomposer"),
@@ -9212,6 +9246,9 @@ def _default_spawn(
         env["TERMINAL_CWD"] = workspace
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
+    env.pop("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", None)
+    if task.expected_workspace_sha:
+        env["HERMES_KANBAN_EXPECTED_WORKSPACE_SHA"] = task.expected_workspace_sha
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
