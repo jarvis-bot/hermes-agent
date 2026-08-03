@@ -27,7 +27,7 @@ def _mock_subprocess_run(monkeypatch):
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
             if cmd[1] == "run":
                 return subprocess.CompletedProcess(cmd, 0, stdout="fake-container-id\n", stderr="")
-            if cmd[1] == "exec" and len(cmd) >= 7 and cmd[4] == "-c":
+            if cmd[1] == "exec" and len(cmd) >= 10 and cmd[-3] == "-c":
                 run_cmd = next(
                     call[0]
                     for call in reversed(calls[:-1])
@@ -759,6 +759,68 @@ def test_read_only_workspace_git_symlink_is_rejected(monkeypatch, tmp_path):
             auto_mount_cwd=True,
             cwd_mount_mode="ro",
         )
+
+
+@pytest.mark.parametrize("metadata_path", ["HEAD", "packed-refs", "refs/heads/review"])
+def test_read_only_workspace_nested_git_symlink_is_rejected(
+    monkeypatch, tmp_path, metadata_path
+):
+    project_dir = tmp_path / "review-target"
+    git_dir = project_dir / ".git"
+    target = tmp_path / "candidate-selected-metadata"
+    target.write_text("1" * 40 + "\n", encoding="utf-8")
+    link = git_dir / metadata_path
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
+    if metadata_path != "HEAD":
+        (git_dir / "HEAD").write_text("ref: refs/heads/review\n", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="external Git metadata"):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+        )
+
+
+def test_read_only_workspace_git_commondir_is_rejected(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    git_dir = project_dir / ".git"
+    git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("1" * 40 + "\n", encoding="utf-8")
+    (git_dir / "commondir").write_text(str(tmp_path) + "\n", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="external Git metadata"):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+        )
+
+
+def test_container_workspace_digest_uses_isolated_python(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="a" * 64 + "\n", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+
+    assert docker_env._container_tree_digest("docker", "container", "/workspace") == (
+        "a" * 64
+    )
+    assert len(calls) == 1
+    assert calls[0][:9] == [
+        "docker", "exec", "-w", "/", "container", "python3", "-I", "-c", calls[0][8]
+    ]
+    assert calls[0][-1] == "/workspace"
 
 
 def test_read_only_workspace_submount_is_revalidated(monkeypatch, tmp_path):

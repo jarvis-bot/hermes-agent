@@ -247,8 +247,11 @@ print(digest.hexdigest())
             [
                 docker_exe,
                 "exec",
+                "-w",
+                "/",
                 container_id,
                 python_exe,
+                "-I",
                 "-c",
                 script,
                 container_path,
@@ -307,6 +310,24 @@ def _git_metadata_dirs(git_entry: Path) -> tuple[Path, Path]:
     return git_dir, common_dir
 
 
+def _validate_local_git_metadata(git_entry: Path) -> None:
+    """Reject Git metadata that can redirect authenticated host reads.
+
+    Candidate workspaces do not provide a trusted out-of-band metadata root.
+    Consequently linked worktrees, ``commondir``, and symlinks anywhere below
+    ``.git`` cannot be authenticated safely and are rejected fail closed.
+    """
+    if git_entry.is_symlink() or git_entry.is_file():
+        raise ValueError("external Git metadata is not allowed")
+    if not git_entry.is_dir():
+        return
+    if (git_entry / "commondir").exists() or (git_entry / "commondir").is_symlink():
+        raise ValueError("external Git metadata is not allowed")
+    for metadata_path in git_entry.rglob("*"):
+        if metadata_path.is_symlink():
+            raise ValueError("external Git metadata is not allowed")
+
+
 def _git_commit_identity(git_entry: Path) -> tuple[str, str]:
     """Return ``(HEAD text, commit)`` for normal and linked Git worktrees."""
     git_dir, common_dir = _git_metadata_dirs(git_entry)
@@ -362,20 +383,18 @@ def _path_identity(
         "ctime_ns": stat_result.st_ctime_ns,
     })
     git_entry = resolved / ".git" if resolved.is_dir() else None
-    if (
-        (content_digest or metadata_digest)
-        and git_entry is not None
-        and (git_entry.is_symlink() or git_entry.is_file())
-    ):
+    if (content_digest or metadata_digest) and git_entry is not None:
         # A read-only workspace is candidate-controlled input.  A .git file
         # (linked worktree) or symlink can redirect provenance reads and tree
         # hashing to arbitrary host paths outside that authenticated input.
         # The Docker policy API has no separately trusted Git-metadata root,
         # so fail closed rather than deriving one from candidate contents.
-        raise ValueError(
-            f"cannot authenticate read-only workspace {resolved}: "
-            "external Git metadata is not allowed"
-        )
+        try:
+            _validate_local_git_metadata(git_entry)
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                f"cannot authenticate read-only workspace {resolved}: {exc}"
+            ) from exc
     authenticated_metadata: Optional[str] = None
     if content_digest:
         try:
