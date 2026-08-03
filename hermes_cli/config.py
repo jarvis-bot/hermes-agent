@@ -4872,6 +4872,10 @@ def set_config_value(key: str, value: str, force: bool = False):
         raise ValueError(
             "terminal.docker_tmp_storage must be exactly 'tmpfs' or 'disk'"
         )
+    if key == "terminal.docker_cwd_mount_mode" and value not in {"ro", "rw"}:
+        raise ValueError(
+            "terminal.docker_cwd_mount_mode must be exactly 'ro' or 'rw'"
+        )
 
     # Unknown-key notice (#34067): the key is still written (arbitrary keys
     # are supported — top-level scalars are bridged into os.environ for

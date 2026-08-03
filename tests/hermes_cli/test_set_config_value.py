@@ -126,6 +126,28 @@ class TestConfigYamlRouting:
         assert config["terminal"]["docker_tmp_storage"] == value
         assert get_env_value("TERMINAL_DOCKER_TMP_STORAGE") == value
 
+    @pytest.mark.parametrize("value", ["RO", "rw ", "", "true", "write-mostly"])
+    def test_terminal_cwd_mount_mode_rejects_invalid_value_before_writing(
+        self, _isolated_hermes_home, value
+    ):
+        with pytest.raises(ValueError, match="exactly 'ro' or 'rw'"):
+            set_config_value("terminal.docker_cwd_mount_mode", value)
+
+        assert "docker_cwd_mount_mode" not in _read_config(_isolated_hermes_home)
+        assert "TERMINAL_DOCKER_CWD_MOUNT_MODE" not in _read_env(_isolated_hermes_home)
+
+    @pytest.mark.parametrize("value", ["ro", "rw"])
+    def test_terminal_cwd_mount_mode_accepts_exact_allowed_values(
+        self, _isolated_hermes_home, value
+    ):
+        import yaml
+
+        set_config_value("terminal.docker_cwd_mount_mode", value)
+
+        config = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert config["terminal"]["docker_cwd_mount_mode"] == value
+        assert get_env_value("TERMINAL_DOCKER_CWD_MOUNT_MODE") == value
+
     def test_terminal_docker_cwd_mount_flag_goes_to_config_and_env(self, _isolated_hermes_home):
         set_config_value("terminal.docker_mount_cwd_to_workspace", "true")
         config = _read_config(_isolated_hermes_home)
