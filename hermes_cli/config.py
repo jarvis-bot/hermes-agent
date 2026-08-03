@@ -1921,7 +1921,7 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             ))
 
         mount_mode = terminal.get("docker_cwd_mount_mode", "rw")
-        if mount_mode not in {"ro", "rw"}:
+        if not isinstance(mount_mode, str) or mount_mode not in {"ro", "rw"}:
             issues.append(ConfigIssue(
                 "error",
                 "terminal.docker_cwd_mount_mode must be 'ro' or 'rw'",

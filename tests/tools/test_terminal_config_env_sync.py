@@ -387,6 +387,7 @@ def test_mini_swe_docker_factory_uses_configured_tmp_storage(monkeypatch):
     import mini_swe_runner
 
     captured = {}
+    monkeypatch.delenv("TERMINAL_DOCKER_TMP_STORAGE", raising=False)
 
     class FakeDockerEnvironment:
         def __init__(self, **kwargs):

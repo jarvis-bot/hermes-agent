@@ -107,9 +107,10 @@ class TestDockerCwdMountPolicyValidation:
         })
         assert not any("docker_tmp_storage" in i.message for i in issues)
 
-    def test_rejects_invalid_mount_mode(self):
+    @pytest.mark.parametrize("value", ["write-mostly", [], {}, True, None])
+    def test_rejects_invalid_mount_mode(self, value):
         issues = validate_config_structure({
-            "terminal": {"docker_cwd_mount_mode": "write-mostly"},
+            "terminal": {"docker_cwd_mount_mode": value},
         })
         assert any(i.severity == "error" and "docker_cwd_mount_mode" in i.message for i in issues)
 
