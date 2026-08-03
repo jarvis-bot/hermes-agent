@@ -1391,6 +1391,14 @@ def _verify_git_workspace_provenance_in_staging(
 
 
 
+def _best_effort_close(handle: IO[bytes]) -> None:
+    """Close a reviewer staging stream without masking its primary failure."""
+    try:
+        handle.close()
+    except OSError as exc:
+        logger.warning("Reviewer staging stream cleanup failed: %s", exc)
+
+
 def _best_effort_docker_cleanup(docker_exe: str, args: list[str]) -> None:
     """Run bounded cleanup without masking the failure that required it."""
     try:
@@ -1438,7 +1446,7 @@ def _materialize_readonly_workspace(
             capture_output=True, timeout=30, check=False, stdin=subprocess.DEVNULL,
         )
     except BaseException:
-        archive.close()
+        _best_effort_close(archive)
         raise
     if disposable or inspect.returncode != 0:
         try:
@@ -1458,7 +1466,7 @@ def _materialize_readonly_workspace(
                         docker_exe, ["volume", "rm", "-f", volume]
                     )
             finally:
-                archive.close()
+                _best_effort_close(archive)
             raise
         script = r'''
 import hashlib, os, pathlib, shutil, stat, sys, tarfile
@@ -1508,7 +1516,7 @@ print(digest.hexdigest())
                 )
             raise
         finally:
-            archive.close()
+            _best_effort_close(archive)
         output = populated.stdout.decode("utf-8", errors="replace").strip()
         if populated.returncode != 0 or output != content:
             _best_effort_docker_cleanup(
@@ -1522,7 +1530,7 @@ print(digest.hexdigest())
                 f"materialized read-only workspace failed authentication: {detail}"
             )
     else:
-        archive.close()
+        _best_effort_close(archive)
     verifier_name = f"{volume}-verify"
     try:
         verifier = subprocess.run(
@@ -1539,24 +1547,22 @@ print(digest.hexdigest())
                     "materialized read-only workspace failed digest authentication"
                 )
         finally:
-            subprocess.run(
-                [docker_exe, "rm", "-f", "-v", verifier_name], capture_output=True,
-                timeout=30, check=False, stdin=subprocess.DEVNULL,
+            _best_effort_docker_cleanup(
+                docker_exe, ["rm", "-f", "-v", verifier_name]
             )
         expected["mounted_content_sha256"] = content
         return volume
     except BaseException:
         # A daemon can create the verifier even when the client times out before
         # returning its ID. The deterministic name lets cleanup detach it before
-        # reclaiming the disposable volume.
-        subprocess.run(
-            [docker_exe, "rm", "-f", "-v", verifier_name], capture_output=True,
-            timeout=30, check=False, stdin=subprocess.DEVNULL,
+        # reclaiming the disposable volume. Cleanup failures never mask the
+        # primary verifier error or skip the volume-removal attempt.
+        _best_effort_docker_cleanup(
+            docker_exe, ["rm", "-f", "-v", verifier_name]
         )
         if created_volume:
-            subprocess.run(
-                [docker_exe, "volume", "rm", "-f", volume], capture_output=True,
-                timeout=30, check=False, stdin=subprocess.DEVNULL,
+            _best_effort_docker_cleanup(
+                docker_exe, ["volume", "rm", "-f", volume]
             )
         raise
 
