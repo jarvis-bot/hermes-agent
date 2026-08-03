@@ -884,17 +884,27 @@ def _materialize_readonly_workspace(
     source: str,
     expected: dict[str, object],
     expected_git_sha: Optional[str] = None,
+    *,
+    disposable: bool = False,
 ) -> str:
-    """Materialize authenticated bytes in a daemon-owned, content-named volume."""
+    """Materialize authenticated bytes in a daemon-owned volume.
+
+    Assigned-reviewer snapshots are uniquely named and explicitly reclaimed,
+    so concurrent reviewers never populate the same mutable volume.
+    """
     archive, content = _readonly_workspace_archive(
         Path(source), str(expected["tree_metadata_sha256"]), expected_git_sha
     )
-    volume = f"hermes-ro-{content[:24]}"
+    volume = (
+        f"hermes-ro-{content[:16]}-{uuid.uuid4().hex[:8]}"
+        if disposable
+        else f"hermes-ro-{content[:24]}"
+    )
     inspect = subprocess.run(
         [docker_exe, "volume", "inspect", volume],
         capture_output=True, timeout=30, check=False, stdin=subprocess.DEVNULL,
     )
-    if inspect.returncode != 0:
+    if disposable or inspect.returncode != 0:
         subprocess.run(
             [docker_exe, "volume", "create", "--label", "hermes-agent=1", volume],
             capture_output=True, timeout=30, check=True, stdin=subprocess.DEVNULL,
@@ -957,7 +967,7 @@ print(digest.hexdigest())
             )
     finally:
         subprocess.run(
-            [docker_exe, "rm", "-f", verifier_id], capture_output=True,
+            [docker_exe, "rm", "-f", "-v", verifier_id], capture_output=True,
             timeout=30, check=False, stdin=subprocess.DEVNULL,
         )
     return volume
@@ -1637,9 +1647,10 @@ def _cgroup_limits_available(image: str) -> bool:
 
     try:
         result = subprocess.run(
-            [docker_exe, "run", "--rm",
+            [docker_exe, "run", "--rm", "--network=none", "--cap-drop", "ALL",
+             "--security-opt", "no-new-privileges", "--entrypoint", "sleep",
              "--cpus", "0.5", "--memory", "64m", "--pids-limit", "32",
-             image, "sleep", "0"],
+             image, "0"],
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
             timeout=60,
@@ -2021,6 +2032,7 @@ class DockerEnvironment(BaseEnvironment):
         self._readonly_workspace_sources: list[
             tuple[str, str, dict[str, object]]
         ] = []
+        self._snapshot_volumes: list[str] = []
         logger.info(f"DockerEnvironment volumes: {volumes}")
         # Ensure volumes is a list (config.yaml could be malformed)
         if volumes is not None and not isinstance(volumes, list):
@@ -2589,7 +2601,10 @@ class DockerEnvironment(BaseEnvironment):
                 source,
                 expected,
                 expected_git_sha,
+                disposable=reviewer_mode,
             )
+            if reviewer_mode:
+                self._snapshot_volumes.append(snapshot_volume)
             for index, arg in enumerate(volume_args[:-1]):
                 if arg != "-v":
                     continue
@@ -3259,11 +3274,48 @@ class DockerEnvironment(BaseEnvironment):
             return None
         return posixpath.normpath(resolved)
 
+    def _unexpected_reviewer_writable_mount(self, container_id: str) -> Optional[str]:
+        """Return a writable mount outside the fixed disposable scratch roots."""
+        allowed = {"/tmp", "/var/tmp", "/run", "/home", "/root"}
+        try:
+            result = subprocess.run(
+                [self._docker_exe, "inspect", "--format", "{{json .Mounts}}", container_id],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=30, check=True, stdin=subprocess.DEVNULL,
+            )
+            mounts = json.loads(result.stdout)
+            if not isinstance(mounts, list):
+                return "unknown"
+            for mount in mounts:
+                if not isinstance(mount, dict) or mount.get("RW") is False:
+                    continue
+                destination = mount.get("Destination")
+                if not isinstance(destination, str):
+                    return "unknown"
+                canonical = posixpath.normpath("/" + destination.lstrip("/"))
+                if canonical not in allowed:
+                    return canonical
+            return None
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+            json.JSONDecodeError,
+        ):
+            return "unknown"
+
     def _effective_policy_violation(self, container_id: str) -> Optional[str]:
         """Return a fail-closed effective-mount policy error, if any."""
         workspace_error = self._readonly_workspace_identity_violation()
         if workspace_error:
             return workspace_error
+        if self._reviewer_mode:
+            unexpected_mount = self._unexpected_reviewer_writable_mount(container_id)
+            if unexpected_mount is not None:
+                return (
+                    "assigned reviewer container has unexpected writable mount: "
+                    f"{unexpected_mount}"
+                )
         if self._tmp_storage == "disk":
             resolved_tmp = self._container_resolved_path(container_id, "/tmp")
             if resolved_tmp is None or self._container_has_mount_at_or_below(
@@ -3306,7 +3358,7 @@ class DockerEnvironment(BaseEnvironment):
         """Best-effort bounded cleanup that never masks a policy failure."""
         try:
             result = subprocess.run(
-                [self._docker_exe, "rm", "-f", container_id],
+                [self._docker_exe, "rm", "-f", "-v", container_id],
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
                 timeout=30,
@@ -3324,7 +3376,22 @@ class DockerEnvironment(BaseEnvironment):
                 container_id[:12], result.stderr.strip(),
             )
             return False
+        self._remove_snapshot_volumes()
         return True
+
+    def _remove_snapshot_volumes(self) -> None:
+        """Best-effort removal of uniquely owned reviewer snapshot volumes."""
+        volumes = list(getattr(self, "_snapshot_volumes", []))
+        self._snapshot_volumes = []
+        for volume in volumes:
+            try:
+                subprocess.run(
+                    [self._docker_exe, "volume", "rm", "-f", volume],
+                    capture_output=True, timeout=30, check=False,
+                    stdin=subprocess.DEVNULL,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                logger.warning("docker volume rm -f %s failed: %s", volume, exc)
 
     def _find_reusable_container(
         self,
@@ -3504,6 +3571,8 @@ class DockerEnvironment(BaseEnvironment):
         # the worker thread can outlive ``self``.
         docker_exe = self._docker_exe
         log_id = container_id[:12]
+        snapshot_volumes = list(getattr(self, "_snapshot_volumes", []))
+        self._snapshot_volumes = []
 
         def _do_cleanup() -> None:
             if should_stop:
@@ -3518,12 +3587,21 @@ class DockerEnvironment(BaseEnvironment):
             if should_remove:
                 try:
                     subprocess.run(
-                        [docker_exe, "rm", "-f", container_id],
+                        [docker_exe, "rm", "-f", "-v", container_id],
                         capture_output=True, timeout=30,
                         stdin=subprocess.DEVNULL,
                     )
                 except (subprocess.TimeoutExpired, OSError) as e:
                     logger.warning("docker rm -f %s failed: %s", log_id, e)
+                for volume in snapshot_volumes:
+                    try:
+                        subprocess.run(
+                            [docker_exe, "volume", "rm", "-f", volume],
+                            capture_output=True, timeout=30, check=False,
+                            stdin=subprocess.DEVNULL,
+                        )
+                    except (subprocess.TimeoutExpired, OSError) as e:
+                        logger.warning("docker volume rm -f %s failed: %s", volume, e)
 
         # Daemon thread: doesn't block interpreter exit (atexit returns
         # promptly), but unlike the old ``Popen(... &)`` shell trick the

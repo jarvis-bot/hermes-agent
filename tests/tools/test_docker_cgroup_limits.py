@@ -44,6 +44,10 @@ def test_probe_returns_true_when_container_starts(monkeypatch):
     assert "--memory" in captured["cmd"]
     assert "--pids-limit" in captured["cmd"]
     assert "hermes-agent:latest" in captured["cmd"]
+    assert "--network=none" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("--entrypoint") + 1] == "sleep"
+    assert "--cap-drop" in captured["cmd"]
+    assert "no-new-privileges" in captured["cmd"]
 
 
 def test_probe_result_is_cached(monkeypatch):

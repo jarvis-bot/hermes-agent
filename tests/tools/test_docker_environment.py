@@ -63,7 +63,9 @@ def _mock_subprocess_run(monkeypatch):
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
 
-    def _materialize(_docker, _image, _source, expected, _expected_git_sha=None):
+    def _materialize(
+        _docker, _image, _source, expected, _expected_git_sha=None, *, disposable=False
+    ):
         volume = f"hermes-ro-{str(expected['mounted_content_sha256'])[:24]}"
         snapshot_digests[volume] = str(expected["mounted_content_sha256"])
         return volume
@@ -184,7 +186,7 @@ def test_disk_tmp_storage_rejects_image_declared_tmp_volume(monkeypatch):
     with pytest.raises(RuntimeError, match="container writable layer"):
         _make_dummy_env(tmp_storage="disk", persist_across_processes=False)
 
-    assert ["/usr/bin/docker", "rm", "-f", "disk-container"] in calls
+    assert ["/usr/bin/docker", "rm", "-f", "-v", "disk-container"] in calls
 
 
 def test_disk_tmp_storage_rejects_ancestor_root_mount(monkeypatch):
@@ -212,7 +214,7 @@ def test_disk_tmp_storage_rejects_ancestor_root_mount(monkeypatch):
     with pytest.raises(RuntimeError, match="container writable layer"):
         _make_dummy_env(tmp_storage="disk", persist_across_processes=False)
 
-    assert ["/usr/bin/docker", "rm", "-f", "disk-container"] in calls
+    assert ["/usr/bin/docker", "rm", "-f", "-v", "disk-container"] in calls
 
 
 def test_default_tmp_storage_preserves_hardened_tmpfs(monkeypatch):
@@ -250,7 +252,7 @@ def test_disk_tmp_storage_rejects_image_volume_reached_through_tmp_symlink(monke
     with pytest.raises(RuntimeError, match="container writable layer"):
         _make_dummy_env(tmp_storage="disk", persist_across_processes=False)
 
-    assert ["/usr/bin/docker", "rm", "-f", "disk-container"] in calls
+    assert ["/usr/bin/docker", "rm", "-f", "-v", "disk-container"] in calls
 
 
 def test_disk_tmp_storage_rejects_tmp_symlink_below_ancestor_mount(monkeypatch):
@@ -278,7 +280,7 @@ def test_disk_tmp_storage_rejects_tmp_symlink_below_ancestor_mount(monkeypatch):
     with pytest.raises(RuntimeError, match="container writable layer"):
         _make_dummy_env(tmp_storage="disk", persist_across_processes=False)
 
-    assert ["/usr/bin/docker", "rm", "-f", "disk-container"] in calls
+    assert ["/usr/bin/docker", "rm", "-f", "-v", "disk-container"] in calls
 
 
 def test_tmp_storage_participates_in_container_reuse_fingerprint(monkeypatch):
@@ -995,6 +997,66 @@ def test_assigned_reviewer_workspace_omits_automatic_host_data(monkeypatch, tmp_
     assert "credential-from-host" not in repr(calls)
 
 
+def test_assigned_reviewer_rejects_unexpected_image_writable_volume(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    (project_dir / "candidate.txt").write_text("reviewed", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    original_run = docker_env.subprocess.run
+
+    def _run(cmd, **kwargs):
+        if isinstance(cmd, list) and cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
+            return subprocess.CompletedProcess(
+                cmd, 0,
+                stdout='[{"Destination":"/scratch","RW":true,"Type":"volume"}]\n',
+                stderr="",
+            )
+        return original_run(cmd, **kwargs)
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    with pytest.raises(RuntimeError, match="unexpected writable mount.*scratch"):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+            network=False,
+            expected_git_sha="1" * 40,
+        )
+
+    rejected_rm = [
+        call[0] for call in calls
+        if isinstance(call[0], list) and call[0][1:3] == ["rm", "-f"]
+    ]
+    assert rejected_rm and all("-v" in cmd for cmd in rejected_rm)
+
+
+def test_reviewer_cleanup_removes_snapshot_volume(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    import threading
+    monkeypatch.setattr(threading, "Thread", _FakeThread)
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    env._container_id = "review-container"
+    env._persist_across_processes = False
+    env._persistent = False
+    env._reviewer_mode = True
+    env._docker_exe = "/usr/bin/docker"
+    env._workspace_dir = None
+    env._home_dir = None
+    env._snapshot_volumes = ["hermes-ro-review-snapshot"]
+
+    env.cleanup()
+
+    commands = [call[0] for call in calls if isinstance(call[0], list)]
+    assert ["/usr/bin/docker", "rm", "-f", "-v", "review-container"] in commands
+    assert [
+        "/usr/bin/docker", "volume", "rm", "-f", "hermes-ro-review-snapshot"
+    ] in commands
+
+
 def test_read_only_workspace_is_materialized_away_from_mutable_host_bind(
     monkeypatch, tmp_path
 ):
@@ -1105,7 +1167,7 @@ def test_mounted_workspace_content_must_match_authenticated_source(
             persist_across_processes=False,
         )
 
-    assert ["/usr/bin/docker", "rm", "-f", "fake-container-id"] in [
+    assert ["/usr/bin/docker", "rm", "-f", "-v", "fake-container-id"] in [
         call[0] for call in calls
     ]
 
