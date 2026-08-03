@@ -66,6 +66,27 @@ def test_exact_sha_reviewer_cannot_show_another_task(monkeypatch):
     assert result["error"].startswith("exact-SHA reviewers may inspect only")
 
 
+def test_exact_sha_reviewer_show_returns_only_own_task(monkeypatch, worker_env):
+    monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "a" * 40)
+
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_show({}))
+    assert set(result) == {"task"}
+    assert result["task"]["id"] == worker_env
+
+
+def test_exact_sha_reviewer_cannot_switch_board(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_review")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "assigned-board")
+    monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "a" * 40)
+
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_show({"board": "other-board"}))
+    assert result["error"].startswith("exact-SHA reviewers may inspect only")
+
+
 # ---------------------------------------------------------------------------
 # Handler happy paths
 # ---------------------------------------------------------------------------

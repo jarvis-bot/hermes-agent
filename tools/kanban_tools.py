@@ -420,8 +420,13 @@ def _handle_show(args: dict, **kw) -> str:
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
     own_task = os.environ.get("HERMES_KANBAN_TASK")
-    if _is_exact_sha_reviewer_worker() and tid != own_task:
-        return tool_error("exact-SHA reviewers may inspect only their assigned task")
+    exact_sha_reviewer = _is_exact_sha_reviewer_worker()
+    if exact_sha_reviewer:
+        if tid != own_task:
+            return tool_error("exact-SHA reviewers may inspect only their assigned task")
+        assigned_board = os.environ.get("HERMES_KANBAN_BOARD")
+        if args.get("board") and args["board"] != assigned_board:
+            return tool_error("exact-SHA reviewers may inspect only their assigned board")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -459,6 +464,12 @@ def _handle_show(args: dict, **kw) -> str:
                     "metadata": r.metadata,
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
+
+            if exact_sha_reviewer:
+                # The task body is the reviewer's trusted work order. Do not
+                # include graph/context helpers: build_worker_context surfaces
+                # recent runs from other tasks assigned to the same profile.
+                return json.dumps({"task": _task_dict(task)})
 
             return json.dumps({
                 "task": _task_dict(task),
