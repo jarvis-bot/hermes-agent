@@ -981,6 +981,19 @@ def _make_create_ns(**overrides):
     return ns
 
 
+def test_cmd_create_reports_invalid_expected_workspace_sha(monkeypatch, capsys):
+    from hermes_cli import kanban as kb_cli
+
+    args = _make_create_ns(
+        workspace="dir:/tmp/reviewer",
+        expected_workspace_sha="not-a-sha",
+    )
+    monkeypatch.setattr(kb_cli.kb, "connect_closing", lambda: pytest.fail("DB must not open"))
+
+    assert kb_cli._cmd_create(args) == 2
+    assert "expected-workspace-sha" in capsys.readouterr().err
+
+
 def test_cli_daemon_help_marks_deprecated():
     """The argparse help string on `daemon` mentions deprecation so users
     scanning `--help` see the migration before running the stub."""

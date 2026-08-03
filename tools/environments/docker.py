@@ -1993,6 +1993,8 @@ class DockerEnvironment(BaseEnvironment):
     ):
         if cwd == "~":
             cwd = "/root"
+        if not isinstance(tmp_storage, str) or tmp_storage not in {"tmpfs", "disk"}:
+            raise ValueError("docker_tmp_storage must be exactly 'tmpfs' or 'disk'")
         reviewer_mode = expected_git_sha is not None
         requested_cwd = cwd
         effective_cwd = "/tmp/review" if reviewer_mode else cwd
@@ -2543,11 +2545,10 @@ class DockerEnvironment(BaseEnvironment):
                 "docker_extra_args host bind sources are unsupported because raw "
                 "mounts cannot participate in policy authentication; use docker_volumes"
             )
-        if _extra_args_override_network(validated_extra):
+        if not network and _extra_args_override_network(validated_extra):
             raise ValueError(
-                "docker_extra_args cannot select a network mode; in particular it "
-                "cannot override terminal.docker_network=false. use "
-                "terminal.docker_network for reusable-container isolation"
+                "docker_extra_args cannot select a network mode when "
+                "terminal.docker_network=false"
             )
         reserved_label_collisions = _extra_args_reserved_label_collisions(validated_extra)
         if reserved_label_collisions:
@@ -2830,6 +2831,7 @@ class DockerEnvironment(BaseEnvironment):
                     capture_output=True, timeout=10,
                     stdin=subprocess.DEVNULL,
                 )
+                self._remove_snapshot_volumes()
                 raise
             self._container_id = result.stdout.strip()
             logger.info(f"Started container {container_name} ({self._container_id[:12]})")

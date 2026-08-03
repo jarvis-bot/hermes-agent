@@ -1078,6 +1078,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
                 "container_persistent": config.get("container_persistent", True),
                 "modal_mode": config.get("modal_mode", "auto"),
                 "docker_tmp_storage": config.get("docker_tmp_storage", "tmpfs"),
+                "docker_network": config.get("docker_network", True),
                 "docker_volumes": config.get("docker_volumes", []),
                 "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
                 "docker_cwd_mount_mode": config.get("docker_cwd_mount_mode", "rw"),

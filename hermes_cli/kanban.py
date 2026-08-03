@@ -1519,6 +1519,22 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if branch_name and ws_kind != "worktree":
         print("kanban: --branch is only valid with --workspace worktree", file=sys.stderr)
         return 2
+    expected_workspace_sha = getattr(args, "expected_workspace_sha", None)
+    if expected_workspace_sha is not None and (
+        len(expected_workspace_sha) != 40
+        or any(char not in "0123456789abcdef" for char in expected_workspace_sha)
+    ):
+        print(
+            "kanban: --expected-workspace-sha must be exactly 40 lowercase hexadecimal characters",
+            file=sys.stderr,
+        )
+        return 2
+    if expected_workspace_sha is not None and ws_kind != "dir":
+        print(
+            "kanban: --expected-workspace-sha is only valid with --workspace dir:PATH",
+            file=sys.stderr,
+        )
+        return 2
     try:
         max_runtime = _parse_duration(getattr(args, "max_runtime", None))
     except ValueError as exc:
@@ -1542,7 +1558,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             workspace_kind=ws_kind,
             workspace_path=ws_path,
             branch_name=branch_name,
-            expected_workspace_sha=getattr(args, "expected_workspace_sha", None),
+            expected_workspace_sha=expected_workspace_sha,
             project_id=getattr(args, "project", None),
             tenant=args.tenant,
             priority=args.priority,

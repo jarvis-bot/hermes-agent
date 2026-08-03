@@ -435,6 +435,16 @@ def test_network_disabled_rejects_extra_arg_override(monkeypatch, network_arg):
         _make_dummy_env(network=False, extra_args=network_arg)
 
 
+def test_network_enabled_preserves_explicit_network_mode(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(network=True, extra_args=["--network=host"])
+
+    run_cmd = next(cmd for cmd, _ in calls if isinstance(cmd, list) and cmd[1] == "run")
+    assert "--network=host" in run_cmd
+
+
 def test_explicit_workspace_mount_participates_in_reuse_fingerprint(
     monkeypatch, tmp_path
 ):
@@ -2247,6 +2257,49 @@ def test_failed_docker_run_cleans_up_orphaned_container(monkeypatch):
     rm_cmd = cleanup_calls[0]
     assert rm_cmd[1] == "rm" and rm_cmd[2] == "-f"
     assert rm_cmd[3].startswith("hermes-"), "should remove the container by its generated name"
+
+
+def test_failed_reviewer_docker_run_removes_snapshot_volume(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    (project_dir / "candidate.txt").write_text("reviewed", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "reviewer")
+    monkeypatch.setattr(
+        docker_env,
+        "_materialize_readonly_workspace",
+        lambda *args, **kwargs: "hermes-ro-failed-review",
+    )
+    removed_volumes = []
+
+    def _run(cmd, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 2:
+            sub = cmd[1]
+            if sub == "version":
+                return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+            if sub == "image":
+                return subprocess.CompletedProcess(cmd, 0, stdout="sha256:test-image\n", stderr="")
+            if sub == "run":
+                raise subprocess.CalledProcessError(125, cmd, stderr="start failed")
+            if sub == "volume" and cmd[2:4] == ["rm", "-f"]:
+                removed_volumes.append(cmd[4])
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+    docker_env._cgroup_limits_ok = True
+
+    with pytest.raises(subprocess.CalledProcessError):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+            network=False,
+            expected_git_sha="1" * 40,
+        )
+
+    assert removed_volumes == ["hermes-ro-failed-review"]
 
 
 def test_docker_run_timeout_cleans_up_orphaned_container(monkeypatch):
