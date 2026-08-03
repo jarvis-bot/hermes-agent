@@ -1075,6 +1075,24 @@ def test_host_git_authentication_uses_resource_limited_exec_wrapper():
     ]
 
 
+def test_host_git_authentication_bounds_parent_output():
+    with pytest.raises(ValueError, match="output exceeds"):
+        docker_env._run_resource_limited_git(
+            docker_env.sys.executable,
+            ["-c", "print('x' * 4096)"],
+            timeout=5,
+            env={"PATH": "/usr/bin:/bin"},
+            capture=True,
+            maximum_output=128,
+        )
+
+
+def test_host_git_authentication_fails_closed_without_posix_limits(monkeypatch):
+    monkeypatch.setattr(docker_env.os, "name", "nt")
+    with pytest.raises(ValueError, match="requires POSIX resource limits"):
+        docker_env._resource_limited_git_command("git", ["status"])
+
+
 def test_trusted_git_objects_exclude_candidate_semantic_caches(tmp_path):
     repository = tmp_path / "repository"
     destination = tmp_path / "destination"

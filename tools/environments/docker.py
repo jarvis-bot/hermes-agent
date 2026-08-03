@@ -53,6 +53,7 @@ _MAX_REVIEW_WORKSPACE_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_REVIEW_GIT_OBJECT_BYTES = 512 * 1024 * 1024
 _MAX_REVIEW_LOOSE_OBJECT_COMPRESSED_BYTES = 128 * 1024 * 1024
 _MAX_REVIEW_PACKED_REFS_BYTES = 16 * 1024 * 1024
+_MAX_REVIEW_GIT_OUTPUT_BYTES = 64 * 1024 * 1024
 _REVIEW_PROVENANCE_DEADLINE_SECONDS = 180.0
 
 _RESOURCE_LIMITED_GIT_EXEC = r'''
@@ -75,7 +76,52 @@ os.execve(sys.argv[1], sys.argv[1:], os.environ)
 
 def _resource_limited_git_command(git_exe: str, args: list[str]) -> list[str]:
     """Run candidate-object Git work behind hard host resource ceilings."""
+    if os.name != "posix":
+        raise ValueError(
+            "exact-SHA reviewer Git authentication requires POSIX resource limits"
+        )
     return [sys.executable, "-I", "-c", _RESOURCE_LIMITED_GIT_EXEC, git_exe, *args]
+
+
+def _run_resource_limited_git(
+    git_exe: str,
+    args: list[str],
+    *,
+    timeout: float,
+    env: dict[str, str],
+    capture: bool = False,
+    maximum_output: int = _MAX_REVIEW_GIT_OUTPUT_BYTES,
+) -> subprocess.CompletedProcess[bytes]:
+    """Execute Git with child resource limits and bounded parent-side output."""
+    command = _resource_limited_git_command(git_exe, args)
+    if not capture:
+        return subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env=env,
+        )
+    with tempfile.TemporaryFile() as output:
+        result = subprocess.run(
+            command,
+            stdout=output,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env=env,
+        )
+        size = output.tell()
+        if size > maximum_output:
+            raise ValueError("Git reviewer authentication output exceeds its size limit")
+        output.seek(0)
+        data = output.read(maximum_output + 1)
+    if len(data) > maximum_output:
+        raise ValueError("Git reviewer authentication output exceeds its size limit")
+    return subprocess.CompletedProcess(result.args, result.returncode, data, b"")
 
 
 def _check_review_deadline(deadline: Optional[float]) -> None:
@@ -770,7 +816,11 @@ def _readonly_workspace_archive(
         _copy_trusted_git_objects(
             source_git / "objects", trusted_git / "objects", deadline=provenance_deadline
         )
-        _head_text, commit = _git_commit_identity(source_git)
+        _head_text, commit = _git_commit_identity(
+            source_git, deadline=provenance_deadline
+        )
+        if commit != expected_git_sha:
+            raise ValueError("reviewer workspace HEAD changed during materialization")
         # Branch/ref identity is candidate-controlled and can make ordinary
         # reviewer comparisons misleading. Trust only the out-of-band commit.
         trusted_ref = trusted_git / "refs" / "heads" / "hermes-assigned-review"
@@ -787,16 +837,23 @@ def _readonly_workspace_archive(
         git_exe = shutil.which("git")
         if git_exe is None:
             raise ValueError("git is required to build trusted reviewer metadata")
-        index = subprocess.run(
+        index_env = {
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            "LANG": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_NO_LAZY_FETCH": "1",
+        }
+        index = _run_resource_limited_git(
+            git_exe,
             [
-                git_exe,
                 "-c", "core.fsmonitor=false",
                 "-c", "core.hooksPath=/dev/null",
                 f"--git-dir={trusted_git}",
                 f"--work-tree={archive_root}",
                 "read-tree", commit,
             ],
-            capture_output=True,
             timeout=max(
                 0.1,
                 min(
@@ -806,20 +863,10 @@ def _readonly_workspace_archive(
                     else 30.0,
                 ),
             ),
-            check=False,
-            stdin=subprocess.DEVNULL,
-            env={
-                "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-                "LANG": "C",
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_CONFIG_GLOBAL": os.devnull,
-                "GIT_NO_REPLACE_OBJECTS": "1",
-                "GIT_NO_LAZY_FETCH": "1",
-            },
+            env=index_env,
         )
         if index.returncode != 0:
-            detail = index.stderr.decode("utf-8", errors="replace").strip()
-            raise ValueError(f"trusted reviewer Git index could not be materialized: {detail}")
+            raise ValueError("trusted reviewer Git index could not be materialized")
         (trusted_git / "HEAD").write_text(f"{commit}\n", encoding="ascii")
         trusted_ref.unlink()
         # Authenticate the actual staged bytes against the assigned commit too.
@@ -1162,12 +1209,12 @@ def _verify_git_workspace_provenance_in_staging(
     ) -> subprocess.CompletedProcess[bytes]:
         check_deadline()
         try:
-            return subprocess.run(
-                _resource_limited_git_command(git_exe, [*base, *args]),
-                stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
-                stderr=subprocess.PIPE if capture else subprocess.DEVNULL,
-                timeout=max(0.1, min(30.0, deadline - time.monotonic())), check=False,
-                stdin=subprocess.DEVNULL, env=safe_env,
+            return _run_resource_limited_git(
+                git_exe,
+                [*base, *args],
+                capture=capture,
+                timeout=max(0.1, min(30.0, deadline - time.monotonic())),
+                env=safe_env,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise ValueError("Git reviewer workspace authentication failed") from exc
