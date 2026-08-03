@@ -1,5 +1,6 @@
 import logging
 from io import StringIO
+import os
 import subprocess
 
 import pytest
@@ -19,6 +20,7 @@ def _mock_subprocess_run(monkeypatch):
     """
     docker_env._cgroup_limits_ok = True
     calls = []
+    snapshot_digests = {}
 
     def _run(cmd, **kwargs):
         calls.append((list(cmd) if isinstance(cmd, list) else cmd, kwargs))
@@ -41,9 +43,11 @@ def _mock_subprocess_run(monkeypatch):
                     and run_cmd[index + 1].split(":", 2)[1] == container_path
                 )
                 source = workspace_spec.split(":", 1)[0]
-                digest = docker_env._readonly_tree_digest(
-                    docker_env.Path(source), include_root_mode=False
-                )
+                digest = snapshot_digests.get(source)
+                if digest is None:
+                    digest = docker_env._readonly_tree_digest(
+                        docker_env.Path(source), include_root_mode=False
+                    )
                 return subprocess.CompletedProcess(
                     cmd, 0, stdout=f"{digest}\n", stderr=""
                 )
@@ -57,6 +61,13 @@ def _mock_subprocess_run(monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    def _materialize(_docker, _image, _source, expected):
+        volume = f"hermes-ro-{str(expected['mounted_content_sha256'])[:24]}"
+        snapshot_digests[volume] = str(expected["mounted_content_sha256"])
+        return volume
+
+    monkeypatch.setattr(docker_env, "_materialize_readonly_workspace", _materialize)
     return calls
 
 
@@ -548,6 +559,136 @@ def test_read_only_workspace_digest_failure_is_fail_closed(monkeypatch, tmp_path
         )
 
 
+@pytest.mark.parametrize("node_kind", ["fifo", "socket"])
+def test_read_only_workspace_rejects_unsupported_nodes(tmp_path, node_kind):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    node = project_dir / node_kind
+    if node_kind == "fifo":
+        os.mkfifo(node)
+    else:
+        import socket
+
+        sock = socket.socket(socket.AF_UNIX)
+        sock.bind(str(node))
+        sock.close()
+
+    with pytest.raises(ValueError, match="unsupported filesystem node"):
+        docker_env._readonly_tree_digest(project_dir)
+
+
+def test_container_workspace_digest_rejects_unsupported_nodes(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        assert "unsupported filesystem node" in cmd[-2]
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="unsupported filesystem node: /workspace/fifo"
+        )
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="unsupported filesystem node"):
+        docker_env._container_tree_digest("docker", "container", "/workspace")
+
+
+def test_git_workspace_provenance_rejects_fabricated_head(tmp_path):
+    project_dir = tmp_path / "review-target"
+    git_dir = project_dir / ".git"
+    git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("1" * 40 + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="commit object is missing or invalid"):
+        docker_env._verify_git_workspace_provenance(project_dir)
+
+
+def test_git_workspace_provenance_requires_exact_clean_commit_tree(tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"],
+        cwd=project_dir,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    tracked = project_dir / "tracked.txt"
+    tracked.write_text("assigned bytes\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=project_dir, check=True)
+
+    docker_env._verify_git_workspace_provenance(project_dir)
+
+    tracked.write_text("candidate replacement\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="tracked files do not match HEAD"):
+        docker_env._verify_git_workspace_provenance(project_dir)
+
+    subprocess.run(["git", "checkout", "--", "tracked.txt"], cwd=project_dir, check=True)
+    (project_dir / ".gitignore").write_text(".hidden\n", encoding="utf-8")
+    (project_dir / ".hidden").write_text("candidate bytes\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="untracked files"):
+        docker_env._verify_git_workspace_provenance(project_dir)
+
+
+def test_read_only_workspace_is_materialized_away_from_mutable_host_bind(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    (project_dir / "candidate.txt").write_text("authenticated", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(project_dir),
+        auto_mount_cwd=True,
+        cwd_mount_mode="ro",
+    )
+
+    run_args = [call[0] for call in calls if call[0][1] == "run"][-1]
+    workspace_spec = next(
+        run_args[index + 1]
+        for index, arg in enumerate(run_args[:-1])
+        if arg == "-v" and run_args[index + 1].endswith(":/workspace:ro")
+    )
+    assert not workspace_spec.startswith(f"{project_dir}:")
+    assert workspace_spec.startswith("hermes-ro-")
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["-v", "/host/source:/data:ro"],
+        ["--volume=/host/source:/data"],
+        ["--mount", "type=bind,source=/host/source,target=/data"],
+        ["--mount=type=bind,src=/host/source,dst=/data"],
+        ["--mount=source=/host/source,target=/data,type=bind"],
+    ],
+)
+def test_extra_args_reject_untracked_host_bind_sources(monkeypatch, extra_args):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="host bind sources"):
+        _make_dummy_env(extra_args=extra_args)
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--security-opt", "seccomp=/host/profile.json"],
+        ["--security-opt=seccomp=relative-profile.json"],
+    ],
+)
+def test_extra_args_reject_host_backed_security_opt_files(monkeypatch, extra_args):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="host-backed security-opt"):
+        _make_dummy_env(extra_args=extra_args)
+
+
 def test_read_only_workspace_mutation_during_authentication_is_fail_closed(
     monkeypatch, tmp_path
 ):
@@ -604,7 +745,7 @@ def test_mounted_workspace_content_must_match_authenticated_source(
     ]
 
 
-def test_read_only_workspace_change_blocks_existing_container_execution(
+def test_read_only_workspace_snapshot_ignores_later_host_change(
     monkeypatch, tmp_path
 ):
     project_dir = tmp_path / "review-target"
@@ -621,13 +762,17 @@ def test_read_only_workspace_change_blocks_existing_container_execution(
     )
 
     candidate.write_text("changed after mount", encoding="utf-8")
+    monkeypatch.setattr(
+        docker_env.BaseEnvironment,
+        "execute",
+        lambda *args, **kwargs: {"output": "", "returncode": 0},
+    )
     result = env.execute("true")
 
-    assert result["returncode"] == 126
-    assert "read-only workspace changed" in result["output"]
+    assert result["returncode"] == 0
 
 
-def test_mutated_read_only_workspace_rejects_command_result(monkeypatch, tmp_path):
+def test_host_mutation_during_command_cannot_change_snapshot(monkeypatch, tmp_path):
     project_dir = tmp_path / "review-target"
     project_dir.mkdir()
     candidate = project_dir / "candidate.txt"
@@ -649,8 +794,7 @@ def test_mutated_read_only_workspace_rejects_command_result(monkeypatch, tmp_pat
     monkeypatch.setattr(docker_env.BaseEnvironment, "execute", _execute)
     result = env.execute("inspect candidate")
 
-    assert result["returncode"] == 126
-    assert "changed during command" in result["output"]
+    assert result == {"output": "apparently successful", "returncode": 0}
 
 
 def test_read_only_workspace_resolves_packed_git_head(monkeypatch, tmp_path):
@@ -823,7 +967,7 @@ def test_container_workspace_digest_uses_isolated_python(monkeypatch):
     assert calls[0][-1] == "/workspace"
 
 
-def test_read_only_workspace_submount_is_revalidated(monkeypatch, tmp_path):
+def test_read_only_workspace_submount_is_snapshotted(monkeypatch, tmp_path):
     component_dir = tmp_path / "component"
     component_dir.mkdir()
     candidate = component_dir / "candidate.txt"
@@ -833,10 +977,14 @@ def test_read_only_workspace_submount_is_revalidated(monkeypatch, tmp_path):
     env = _make_dummy_env(volumes=[f"{component_dir}:/workspace/component:ro"])
 
     candidate.write_text("changed after mount", encoding="utf-8")
+    monkeypatch.setattr(
+        docker_env.BaseEnvironment,
+        "execute",
+        lambda *args, **kwargs: {"output": "", "returncode": 0},
+    )
     result = env.execute("true")
 
-    assert result["returncode"] == 126
-    assert "read-only workspace changed" in result["output"]
+    assert result["returncode"] == 0
 
 
 def test_mapped_read_only_workspace_uses_canonical_source_identity(monkeypatch, tmp_path):
@@ -888,7 +1036,11 @@ def test_auto_mount_host_cwd_read_only_adds_ro_volume(monkeypatch, tmp_path):
     )
 
     run_args = next(c[0] for c in calls if c[0][1] == "run")
-    assert f"{project_dir}:/workspace:ro" in run_args
+    assert any(
+        arg.startswith("hermes-ro-") and arg.endswith(":/workspace:ro")
+        for arg in run_args
+    )
+    assert f"{project_dir}:/workspace:ro" not in run_args
     reuse_probe = next(c[0] for c in calls if c[0][1:3] == ["ps", "-a"])
     assert any(arg.startswith("label=hermes-workspace=") for arg in reuse_probe)
 

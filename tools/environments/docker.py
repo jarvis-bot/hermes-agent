@@ -14,6 +14,8 @@ import re
 import shutil
 import stat
 import subprocess
+import tarfile
+import tempfile
 
 import sys
 import uuid
@@ -156,16 +158,19 @@ def _readonly_tree_digest(root: Path, *, include_root_mode: bool = True) -> str:
         if include_root_mode or path != root:
             digest.update(f"{stat.S_IMODE(path.lstat().st_mode):04o}".encode("ascii"))
         digest.update(b"\0")
-        if path.is_symlink():
+        mode = path.lstat().st_mode
+        if stat.S_ISLNK(mode):
             digest.update(b"L")
             digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
-        elif path.is_file():
+        elif stat.S_ISREG(mode):
             digest.update(b"F")
             with path.open("rb") as handle:
                 for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                     digest.update(chunk)
-        elif path.is_dir():
+        elif stat.S_ISDIR(mode):
             digest.update(b"D")
+        else:
+            raise ValueError(f"unsupported filesystem node in read-only workspace: {path}")
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -228,16 +233,19 @@ for path in paths:
     if path != root:
         digest.update(f"{stat.S_IMODE(path.lstat().st_mode):04o}".encode("ascii"))
     digest.update(b"\0")
-    if path.is_symlink():
+    mode = path.lstat().st_mode
+    if stat.S_ISLNK(mode):
         digest.update(b"L")
         digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
-    elif path.is_file():
+    elif stat.S_ISREG(mode):
         digest.update(b"F")
         with path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
-    elif path.is_dir():
+    elif stat.S_ISDIR(mode):
         digest.update(b"D")
+    else:
+        raise ValueError(f"unsupported filesystem node in read-only workspace: {path}")
     digest.update(b"\0")
 print(digest.hexdigest())
 '''
@@ -496,6 +504,211 @@ def _extra_arg_file_identities(extra_args: list[str]) -> list[dict[str, object]]
         if value:
             identities.append(_path_identity(value, content_digest=True))
     return identities
+
+
+def _extra_args_have_host_bind(extra_args: list[str]) -> bool:
+    """Return whether opaque raw args contain a host-backed bind mount."""
+    mount_flags = {"-v", "--volume", "--mount"}
+    for index, arg in enumerate(extra_args):
+        if arg in mount_flags:
+            value = extra_args[index + 1] if index + 1 < len(extra_args) else ""
+        elif any(arg.startswith(f"{flag}=") for flag in mount_flags):
+            value = arg.split("=", 1)[1]
+        else:
+            value = ""
+        for candidate in [value, *_attached_short_option_values(arg, "v")]:
+            candidate = candidate.lstrip("=").replace('"', "").replace("'", "")
+            mount_fields = {
+                field.strip().lower() for field in candidate.split(",")
+            }
+            if "type=bind" in mount_fields:
+                return True
+            if candidate.startswith("/") and ":/" in candidate:
+                return True
+    return False
+
+
+def _extra_args_have_host_security_file(extra_args: list[str]) -> bool:
+    """Return whether a security-opt asks Docker to read a host profile file."""
+    for index, arg in enumerate(extra_args):
+        if arg == "--security-opt":
+            value = extra_args[index + 1] if index + 1 < len(extra_args) else ""
+        elif arg.startswith("--security-opt="):
+            value = arg.split("=", 1)[1]
+        else:
+            continue
+        if value.lower().startswith("seccomp=") and value.split("=", 1)[1] != "unconfined":
+            return True
+    return False
+
+
+def _readonly_workspace_archive(root: Path, expected_metadata: str) -> bytes:
+    """Create a stable regular/dir/symlink-only archive of an authenticated tree."""
+    _verify_git_workspace_provenance(root)
+    if _readonly_tree_metadata_digest(root) != expected_metadata:
+        raise ValueError(f"read-only workspace changed before materialization: {root}")
+    if not root.is_dir():
+        raise ValueError("authenticated read-only workspace root must be a directory")
+    with tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as archive_file:
+        with tarfile.open(fileobj=archive_file, mode="w") as archive:
+            for path in sorted(root.rglob("*")):
+                mode = path.lstat().st_mode
+                if not any(check(mode) for check in (stat.S_ISREG, stat.S_ISDIR, stat.S_ISLNK)):
+                    raise ValueError(
+                        f"unsupported filesystem node in read-only workspace: {path}"
+                    )
+                info = archive.gettarinfo(
+                    str(path), arcname=path.relative_to(root).as_posix()
+                )
+                if stat.S_ISREG(mode):
+                    with path.open("rb") as handle:
+                        archive.addfile(info, handle)
+                else:
+                    archive.addfile(info)
+        if _readonly_tree_metadata_digest(root) != expected_metadata:
+            raise ValueError(f"read-only workspace changed during materialization: {root}")
+        archive_file.seek(0)
+        return archive_file.read()
+
+
+def _verify_git_workspace_provenance(root: Path) -> None:
+    """Require a Git workspace to be the complete clean tree of its real HEAD.
+
+    Merely hashing candidate-supplied ``.git/HEAD`` text does not establish
+    provenance: a fabricated ref can claim an assigned SHA without supplying
+    the corresponding object.  Resolve the commit through Git's object store,
+    require the tracked worktree to match it, reject every untracked path
+    (including ignored paths), and reject unexpanded gitlinks whose contents
+    are not authenticated by the parent commit.
+    """
+    git_entry = root / ".git"
+    if not git_entry.exists():
+        return
+    _validate_local_git_metadata(git_entry)
+    _head_text, commit = _git_commit_identity(git_entry)
+    git_exe = shutil.which("git")
+    if git_exe is None:
+        raise ValueError("git is required to authenticate a Git reviewer workspace")
+    base = [
+        git_exe,
+        "-c", "core.fsmonitor=false",
+        "-c", "core.hooksPath=/dev/null",
+        f"--git-dir={git_entry}",
+        f"--work-tree={root}",
+    ]
+    safe_env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "LANG": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    }
+
+    def run(args: list[str]) -> subprocess.CompletedProcess[bytes]:
+        try:
+            return subprocess.run(
+                [*base, *args], capture_output=True, timeout=30, check=False,
+                stdin=subprocess.DEVNULL, env=safe_env,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValueError("Git reviewer workspace authentication failed") from exc
+
+    object_check = run(["cat-file", "-e", f"{commit}^{{commit}}"])
+    if object_check.returncode != 0:
+        raise ValueError("reviewer workspace HEAD commit object is missing or invalid")
+    tracked_check = run(["diff-index", "--quiet", "--no-ext-diff", commit, "--"])
+    if tracked_check.returncode != 0:
+        raise ValueError("reviewer workspace tracked files do not match HEAD")
+    untracked = run(["ls-files", "--others", "-z"])
+    if untracked.returncode != 0 or untracked.stdout:
+        raise ValueError("reviewer workspace contains untracked files")
+    tree = run(["ls-tree", "-r", "-z", "--full-tree", commit])
+    if tree.returncode != 0:
+        raise ValueError("reviewer workspace commit tree cannot be authenticated")
+    if any(record.startswith(b"160000 ") for record in tree.stdout.split(b"\0") if record):
+        raise ValueError("reviewer workspace contains unauthenticated Git submodules")
+
+
+def _materialize_readonly_workspace(
+    docker_exe: str,
+    image: str,
+    source: str,
+    expected: dict[str, object],
+) -> str:
+    """Materialize authenticated bytes in a daemon-owned, content-named volume."""
+    content = str(expected["mounted_content_sha256"])
+    volume = f"hermes-ro-{content[:24]}"
+    archive = _readonly_workspace_archive(
+        Path(source), str(expected["tree_metadata_sha256"])
+    )
+    inspect = subprocess.run(
+        [docker_exe, "volume", "inspect", volume],
+        capture_output=True, timeout=30, check=False, stdin=subprocess.DEVNULL,
+    )
+    if inspect.returncode != 0:
+        subprocess.run(
+            [docker_exe, "volume", "create", "--label", "hermes-agent=1", volume],
+            capture_output=True, timeout=30, check=True, stdin=subprocess.DEVNULL,
+        )
+        script = r'''
+import hashlib, os, pathlib, shutil, stat, sys, tarfile
+root = pathlib.Path('/workspace')
+for child in root.iterdir():
+    shutil.rmtree(child) if child.is_dir() and not child.is_symlink() else child.unlink()
+with tarfile.open(fileobj=sys.stdin.buffer, mode='r|*') as archive:
+    for member in archive:
+        target = pathlib.PurePosixPath(member.name)
+        if target.is_absolute() or '..' in target.parts or not (member.isfile() or member.isdir() or member.issym()):
+            raise ValueError('unsafe workspace archive member')
+        archive.extract(member, root, filter='data')
+digest = hashlib.sha256()
+for path in [root, *sorted(root.rglob('*'))]:
+    relative = '.' if path == root else path.relative_to(root).as_posix()
+    digest.update(relative.encode('utf-8', errors='surrogateescape')); digest.update(b'\0')
+    if path != root: digest.update(f'{stat.S_IMODE(path.lstat().st_mode):04o}'.encode('ascii'))
+    digest.update(b'\0'); mode = path.lstat().st_mode
+    if stat.S_ISLNK(mode): digest.update(b'L'); digest.update(os.readlink(path).encode('utf-8', errors='surrogateescape'))
+    elif stat.S_ISREG(mode):
+        digest.update(b'F')
+        with path.open('rb') as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b''): digest.update(chunk)
+    elif stat.S_ISDIR(mode): digest.update(b'D')
+    else: raise ValueError(f'unsupported filesystem node: {path}')
+    digest.update(b'\0')
+print(digest.hexdigest())
+'''
+        populated = subprocess.run(
+            [docker_exe, "run", "--rm", "-i", "--network=none", "--cap-drop",
+             "ALL", "-v", f"{volume}:/workspace", image, "python3", "-I", "-c", script],
+            input=archive, capture_output=True, timeout=120, check=False,
+        )
+        output = populated.stdout.decode("utf-8", errors="replace").strip()
+        if populated.returncode != 0 or output != content:
+            subprocess.run(
+                [docker_exe, "volume", "rm", "-f", volume],
+                capture_output=True, timeout=30, check=False,
+            )
+            detail = populated.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"materialized read-only workspace failed authentication: {detail}"
+            )
+    verifier = subprocess.run(
+        [docker_exe, "run", "-d", "--network=none", "--cap-drop", "ALL", "-v",
+         f"{volume}:/workspace:ro", image, "sleep", "120"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=120, check=True, stdin=subprocess.DEVNULL,
+    )
+    verifier_id = verifier.stdout.strip()
+    try:
+        if _container_tree_digest(docker_exe, verifier_id, "/workspace") != content:
+            raise RuntimeError(
+                "materialized read-only workspace failed digest authentication"
+            )
+    finally:
+        subprocess.run(
+            [docker_exe, "rm", "-f", verifier_id], capture_output=True,
+            timeout=30, check=False, stdin=subprocess.DEVNULL,
+        )
+    return volume
 
 
 def _resolve_image_identity(docker_exe: str, image: str) -> str:
@@ -1994,6 +2207,11 @@ class DockerEnvironment(BaseEnvironment):
                 logger.warning("Ignoring non-string docker_extra_args entry: %r", arg)
                 continue
             validated_extra.append(arg)
+        if _extra_args_have_host_security_file(validated_extra):
+            raise ValueError(
+                "docker_extra_args host-backed security-opt files are unsupported "
+                "because their contents cannot be authenticated"
+            )
         if any(
             arg == "--volumes-from" or arg.startswith("--volumes-from=")
             for arg in validated_extra
@@ -2015,6 +2233,11 @@ class DockerEnvironment(BaseEnvironment):
             raise ValueError(
                 "docker_extra_args cannot mount /tmp or its subdirectories; "
                 "use docker_tmp_storage to select the /tmp policy"
+            )
+        if _extra_args_have_host_bind(validated_extra):
+            raise ValueError(
+                "docker_extra_args host bind sources are unsupported because raw "
+                "mounts cannot participate in policy authentication; use docker_volumes"
             )
         if _extra_args_override_network(validated_extra):
             raise ValueError(
@@ -2047,21 +2270,10 @@ class DockerEnvironment(BaseEnvironment):
                     "%s  Extra Docker args may bypass egress isolation.", _msg,
                 )
 
-        all_run_args = (
-            security_args
-            + user_args
-            + writable_args
-            + resource_args
-            + egress_host_args
-            + volume_args
-            + env_args
-            + validated_extra
-        )
         bind_source_identities = _volume_source_identities(
             volume_args,
             canonical_workspace=canonical_workspace_identity is not None,
         )
-        extra_file_identities = _extra_arg_file_identities(validated_extra)
         if canonical_workspace_identity is None:
             for identity in bind_source_identities:
                 if "content_sha256" in identity:
@@ -2072,6 +2284,43 @@ class DockerEnvironment(BaseEnvironment):
                             identity,
                         )
                     )
+
+        # A read-only host bind is not immutable: a host checkout can change
+        # between the pre-command digest and the command's read. Replace every
+        # authenticated workspace bind with a daemon-owned content snapshot.
+        for source, destination, expected in list(self._readonly_workspace_sources):
+            snapshot_volume = _materialize_readonly_workspace(
+                self._docker_exe, image_identity, source, expected
+            )
+            for index, arg in enumerate(volume_args[:-1]):
+                if arg != "-v":
+                    continue
+                spec = volume_args[index + 1]
+                if _volume_mounts_path(spec, destination) and "ro" in spec.rsplit(
+                    ":", 1
+                )[-1].split(","):
+                    volume_args[index + 1] = f"{snapshot_volume}:{destination}:ro"
+                    break
+            else:
+                raise RuntimeError(
+                    f"cannot locate authenticated read-only workspace mount: {destination}"
+                )
+        self._readonly_workspace_sources = [
+            ("", destination, expected)
+            for _, destination, expected in self._readonly_workspace_sources
+        ]
+
+        all_run_args = (
+            security_args
+            + user_args
+            + writable_args
+            + resource_args
+            + egress_host_args
+            + volume_args
+            + env_args
+            + validated_extra
+        )
+        extra_file_identities = _extra_arg_file_identities(validated_extra)
         policy_payload = {
             "version": 1,
             "image": image,
@@ -2504,18 +2753,16 @@ class DockerEnvironment(BaseEnvironment):
         under the same creation-policy label.
         """
         for source, destination, expected in self._readonly_workspace_sources:
-            try:
-                # Creation performs the expensive byte-for-byte hash. Commands
-                # revalidate mutation-sensitive metadata before and after use,
-                # avoiding repeated reads of large Git packs/build artifacts.
-                current = _path_identity(source, metadata_digest=True)
-            except (OSError, ValueError) as exc:
-                return f"cannot authenticate read-only workspace {source}: {exc}"
-            if any(expected.get(key) != value for key, value in current.items()):
-                return (
-                    "read-only workspace changed after container policy "
-                    f"authentication: {source}"
-                )
+            if source:
+                try:
+                    current = _path_identity(source, metadata_digest=True)
+                except (OSError, ValueError) as exc:
+                    return f"cannot authenticate read-only workspace {source}: {exc}"
+                if any(expected.get(key) != value for key, value in current.items()):
+                    return (
+                        "read-only workspace changed after container policy "
+                        f"authentication: {source}"
+                    )
             if self._container_id and "content_sha256" in expected:
                 try:
                     mounted_digest = _container_tree_digest(
