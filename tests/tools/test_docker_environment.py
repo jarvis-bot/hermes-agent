@@ -1263,6 +1263,7 @@ def test_assigned_reviewer_workspace_omits_automatic_host_data(monkeypatch, tmp_
     assert "--network=none" in run_args
     assert run_args[run_args.index("-w") + 1] == "/tmp"
     assert any(arg.endswith(":/workspace:ro") for arg in run_args)
+    assert not any(arg.startswith("/tmp:") for arg in run_args)
     assert "/root:rw,exec,size=1g" in run_args
     assert not any(
         run_args[index] == "-v" and run_args[index + 1].endswith(":/root")

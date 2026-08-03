@@ -2185,6 +2185,12 @@ class DockerEnvironment(BaseEnvironment):
         if not isinstance(tmp_storage, str) or tmp_storage not in {"tmpfs", "disk"}:
             raise ValueError("docker_tmp_storage must be exactly 'tmpfs' or 'disk'")
         reviewer_mode = expected_git_sha is not None
+        if reviewer_mode:
+            # Exact-SHA reviews need disposable scratch larger than the hardened
+            # 512 MiB default. Make this a runtime invariant, not a model-reported
+            # or profile-configuration-only property: Docker's effective-mount
+            # verification below then proves /tmp is on the writable layer.
+            tmp_storage = "disk"
         requested_cwd = cwd
         effective_cwd = "/tmp/review" if reviewer_mode else cwd
         startup_cwd = "/tmp" if reviewer_mode else cwd

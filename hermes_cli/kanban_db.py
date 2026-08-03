@@ -9326,6 +9326,11 @@ def _default_spawn(
         # profile-local worker sessions still register configured hooks.
         "--accept-hooks",
     ]
+    if task.expected_workspace_sha:
+        # Exact-SHA tasks review untrusted candidate content. Candidate-owned
+        # AGENTS.md / CLAUDE.md files must remain data, never system-level
+        # instructions that can forge isolation canaries or review findings.
+        cmd.append("--ignore-rules")
     # Per-task force-loaded skills. Each name goes in its own
     # `--skills X` pair rather than a single comma-joined arg: the CLI
     # accepts both forms (action='append' + comma-split), but
