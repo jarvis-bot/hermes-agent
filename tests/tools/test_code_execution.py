@@ -47,6 +47,38 @@ from tools.code_execution_tool import (
     _TOOL_DOC_LINES,
     _execute_remote,
 )
+import tools.code_execution_tool as code_execution_tool
+
+
+def test_execute_code_preserves_raw_workspace_override(tmp_path):
+    """Execute-code-first creation must use the raw task workspace and host mount."""
+    ticket_cwd = tmp_path / "ticket"
+    ticket_cwd.mkdir()
+    task_id = "execute-review"
+    captured = {}
+    config = {
+        "env_type": "docker", "docker_image": "image", "cwd": "/configured",
+        "host_cwd": str(tmp_path), "timeout": 30,
+        "docker_mount_cwd_to_workspace": True,
+    }
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    with patch("tools.terminal_tool._get_env_config", return_value=config), \
+         patch("tools.terminal_tool._task_env_overrides", {task_id: {"cwd": str(ticket_cwd)}}), \
+         patch("tools.terminal_tool._active_environments", {}), \
+         patch("tools.terminal_tool._creation_locks", {}), \
+         patch("tools.terminal_tool._creation_locks_lock", threading.Lock()), \
+         patch("tools.terminal_tool._create_environment", side_effect=create), \
+         patch("tools.terminal_tool._start_cleanup_thread"), \
+         patch("tools.terminal_tool.get_session_cwd", return_value=None):
+        code_execution_tool._get_or_create_env(task_id)
+
+    assert captured["task_id"] == "default"
+    assert captured["cwd"] == "/workspace"
+    assert captured["host_cwd"] == str(ticket_cwd)
 
 
 def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None):

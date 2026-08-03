@@ -9,6 +9,44 @@ import pytest
 from tools.environments import docker as docker_env
 
 
+def test_reviewer_rejects_scratch_mount_resolving_into_workspace(monkeypatch):
+    """An image symlink must not turn an allowlisted mount into a workspace write."""
+    env = object.__new__(docker_env.DockerEnvironment)
+    env._docker_exe = "/usr/bin/docker"
+    mounts = '[{"Destination":"/root","RW":true}]\n'
+    monkeypatch.setattr(
+        docker_env.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, mounts, ""),
+    )
+    monkeypatch.setattr(
+        env,
+        "_container_resolved_path",
+        lambda _container_id, path: "/workspace/root" if path == "/root" else path,
+    )
+
+    assert env._unexpected_reviewer_writable_mount("container") == "/root"
+
+
+def test_reviewer_rejects_workspace_path_resolving_elsewhere(monkeypatch):
+    env = object.__new__(docker_env.DockerEnvironment)
+    env._reviewer_mode = True
+    env._workspace_requires_ro = True
+    env._tmp_storage = "tmpfs"
+    monkeypatch.setattr(env, "_readonly_workspace_identity_violation", lambda: None)
+    monkeypatch.setattr(env, "_unexpected_reviewer_writable_mount", lambda _id: None)
+    monkeypatch.setattr(env, "_container_has_mount_at_or_below", lambda *a, **kw: False)
+    monkeypatch.setattr(
+        env,
+        "_container_resolved_path",
+        lambda _id, path: "/tmp/redirect" if path == "/workspace" else path,
+    )
+
+    violation = env._effective_policy_violation("container")
+    assert violation is not None
+    assert "read-only /workspace" in violation
+
+
 def _mock_subprocess_run(monkeypatch):
     """Mock subprocess.run to intercept docker run -d and docker version calls.
 

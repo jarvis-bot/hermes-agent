@@ -3363,6 +3363,14 @@ if result.returncode != 0 or result.stdout.strip() != sys.argv[1]:
                 canonical = posixpath.normpath("/" + destination.lstrip("/"))
                 if canonical not in allowed:
                     return canonical
+                # Image-provided symlinks must not turn an allowlisted scratch
+                # mount (for example /root) into a writable mount inside the
+                # authoritative /workspace tree.  Require every allowlisted
+                # destination to resolve to itself, just as /tmp is checked
+                # below for the general storage policy.
+                resolved = self._container_resolved_path(container_id, canonical)
+                if resolved != canonical:
+                    return canonical
             return None
         except (
             subprocess.CalledProcessError,
@@ -3420,6 +3428,10 @@ if result.returncode != 0 or result.stdout.strip() != sys.argv[1]:
             writable_only=True,
         ):
             return "effective container mounts bypass the read-only /workspace"
+        if self._workspace_requires_ro:
+            resolved_workspace = self._container_resolved_path(container_id, "/workspace")
+            if resolved_workspace != "/workspace":
+                return "effective container path bypasses the read-only /workspace"
         return None
 
     def _remove_rejected_container(self, container_id: str) -> bool:

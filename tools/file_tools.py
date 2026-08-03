@@ -1039,8 +1039,13 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "docker_cwd_path_mappings": config.get("docker_cwd_path_mappings", {}),
                     "docker_cwd_allowed_roots": config.get("docker_cwd_allowed_roots", []),
                     "docker_forward_env": config.get("docker_forward_env", []),
+                    "docker_env": config.get("docker_env", {}),
+                    "docker_extra_args": config.get("docker_extra_args", []),
                     "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                     "docker_network": config.get("docker_network", True),
+                    "docker_persist_across_processes": config.get(
+                        "docker_persist_across_processes", True
+                    ),
                 }
 
             ssh_config = None

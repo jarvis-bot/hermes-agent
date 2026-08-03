@@ -725,8 +725,8 @@ def _get_or_create_env(task_id: str):
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
-        _creation_locks, _creation_locks_lock, _task_env_overrides,
-        _resolve_container_task_id,
+        _creation_locks, _creation_locks_lock, _resolve_container_task_id,
+        get_session_cwd, resolve_container_cwd_mount, resolve_task_overrides,
     )
 
     effective_task_id = _resolve_container_task_id(task_id)
@@ -751,7 +751,7 @@ def _get_or_create_env(task_id: str):
 
         config = _get_env_config()
         env_type = config["env_type"]
-        overrides = _task_env_overrides.get(effective_task_id, {})
+        overrides = resolve_task_overrides(task_id)
 
         if env_type == "docker":
             image = overrides.get("docker_image") or config["docker_image"]
@@ -764,7 +764,9 @@ def _get_or_create_env(task_id: str):
         else:
             image = ""
 
-        cwd = overrides.get("cwd") or config["cwd"]
+        recorded_cwd = get_session_cwd(task_id)
+        cwd = overrides.get("cwd") or recorded_cwd or config["cwd"]
+        cwd, host_cwd = resolve_container_cwd_mount(env_type, cwd, config)
 
         container_config = None
         if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
@@ -819,7 +821,7 @@ def _get_or_create_env(task_id: str):
             container_config=container_config,
             local_config=local_config,
             task_id=effective_task_id,
-            host_cwd=config.get("host_cwd"),
+            host_cwd=host_cwd,
         )
 
         with _env_lock:

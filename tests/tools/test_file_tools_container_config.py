@@ -54,6 +54,20 @@ class TestFileToolsContainerConfig:
         cc = self._run(_make_env_config(docker_mount_cwd_to_workspace=True), "t1").get("container_config", {})
         assert cc.get("docker_mount_cwd_to_workspace") is True
 
+    def test_complete_docker_policy_passed_to_file_environment(self):
+        """File-first creation must preserve policy and reviewer rejections."""
+        config = _make_env_config(
+            docker_env={"UNSAFE": "value"},
+            docker_extra_args=["--privileged"],
+            docker_persist_across_processes=False,
+            docker_tmp_storage="disk",
+        )
+        cc = self._run(config, "file-policy")["container_config"]
+        assert cc["docker_env"] == {"UNSAFE": "value"}
+        assert cc["docker_extra_args"] == ["--privileged"]
+        assert cc["docker_persist_across_processes"] is False
+        assert cc["docker_tmp_storage"] == "disk"
+
 
     def test_cwd_only_raw_task_override_reaches_file_environment(self):
         """CWD-only task overrides collapse to default but must keep their cwd."""
