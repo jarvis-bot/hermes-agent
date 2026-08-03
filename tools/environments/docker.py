@@ -361,6 +361,21 @@ def _path_identity(
         "inode": stat_result.st_ino,
         "ctime_ns": stat_result.st_ctime_ns,
     })
+    git_entry = resolved / ".git" if resolved.is_dir() else None
+    if (
+        (content_digest or metadata_digest)
+        and git_entry is not None
+        and (git_entry.is_symlink() or git_entry.is_file())
+    ):
+        # A read-only workspace is candidate-controlled input.  A .git file
+        # (linked worktree) or symlink can redirect provenance reads and tree
+        # hashing to arbitrary host paths outside that authenticated input.
+        # The Docker policy API has no separately trusted Git-metadata root,
+        # so fail closed rather than deriving one from candidate contents.
+        raise ValueError(
+            f"cannot authenticate read-only workspace {resolved}: "
+            "external Git metadata is not allowed"
+        )
     authenticated_metadata: Optional[str] = None
     if content_digest:
         try:
