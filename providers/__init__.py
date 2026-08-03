@@ -165,12 +165,19 @@ def _discover_providers() -> None:
     #    in register_provider()).
     from utils import env_var_enabled
 
-    user_dir = None if env_var_enabled("HERMES_SAFE_MODE") else _user_plugins_dir()
+    safe_mode = env_var_enabled("HERMES_SAFE_MODE")
+    user_dir = None if safe_mode else _user_plugins_dir()
     if user_dir is not None:
         for child in sorted(user_dir.iterdir()):
             if not child.is_dir() or child.name.startswith(("_", ".")):
                 continue
             _import_plugin_dir(child, "user")
+
+    # Legacy provider modules are explicitly an editable-install extension
+    # surface. They are no more trusted than profile-local provider plugins and
+    # must not execute in exact-SHA/safe-mode workers.
+    if safe_mode:
+        return
 
     # 3. Legacy single-file profiles at providers/<name>.py. Kept for
     #    back-compat — if someone drops a ``providers/foo.py`` into an

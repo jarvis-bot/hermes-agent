@@ -71,6 +71,7 @@ def test_plugin_discovery_skipped(monkeypatch):
 
 
 def test_safe_mode_skips_user_model_provider_plugins(monkeypatch, tmp_path):
+    import pkgutil
     import providers
 
     bundled = tmp_path / "bundled"
@@ -78,6 +79,7 @@ def test_safe_mode_skips_user_model_provider_plugins(monkeypatch, tmp_path):
     bundled.joinpath("trusted").mkdir(parents=True)
     user.joinpath("host-extension").mkdir(parents=True)
     loaded = []
+    legacy_imports = []
     monkeypatch.setenv("HERMES_SAFE_MODE", "1")
     monkeypatch.setattr(providers, "_discovered", False)
     monkeypatch.setattr(providers, "_BUNDLED_PLUGINS_DIR", bundled)
@@ -87,11 +89,22 @@ def test_safe_mode_skips_user_model_provider_plugins(monkeypatch, tmp_path):
         "_import_plugin_dir",
         lambda path, source: loaded.append((path.name, source)),
     )
+    monkeypatch.setattr(
+        pkgutil,
+        "iter_modules",
+        lambda *_args, **_kwargs: [(None, "host_legacy_extension", False)],
+    )
+    monkeypatch.setattr(
+        providers.importlib,
+        "import_module",
+        lambda name: legacy_imports.append(name),
+    )
 
     providers._discover_providers()
 
     assert ("trusted", "bundled") in loaded
     assert ("host-extension", "user") not in loaded
+    assert legacy_imports == []
 
 
 
