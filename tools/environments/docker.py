@@ -49,7 +49,7 @@ _WORKSPACE_LABEL_KEY = "hermes-workspace"
 _TMP_STORAGE_LABEL_KEY = "hermes-tmp-storage"
 _POLICY_LABEL_KEY = "hermes-policy"
 _MAX_REVIEW_WORKSPACE_NODES = 100_000
-_MAX_REVIEW_WORKSPACE_BYTES = 1024 * 1024 * 1024
+_MAX_REVIEW_WORKSPACE_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_REVIEW_GIT_OBJECT_BYTES = 512 * 1024 * 1024
 _REVIEW_PROVENANCE_DEADLINE_SECONDS = 180.0
 
@@ -556,9 +556,13 @@ def _readonly_workspace_archive(
     # worktrees.  Their exact bytes are authenticated below.  The stronger Git
     # provenance contract is required only for reviewer workspaces carrying an
     # out-of-band assigned SHA.
+    provenance_deadline: Optional[float] = None
     if expected_git_sha is not None:
+        provenance_deadline = time.monotonic() + _REVIEW_PROVENANCE_DEADLINE_SECONDS
         _enforce_reviewer_workspace_bounds(root)
-        _verify_git_workspace_provenance(root, expected_git_sha)
+        _verify_git_workspace_provenance(
+            root, expected_git_sha, deadline=provenance_deadline
+        )
     if _readonly_tree_metadata_digest(root) != expected_metadata:
         raise ValueError(f"read-only workspace changed before materialization: {root}")
     if not root.is_dir():
@@ -574,6 +578,8 @@ def _readonly_workspace_archive(
         staging = tempfile.TemporaryDirectory(prefix="hermes-review-workspace-")
         archive_root = Path(staging.name)
         for child in root.iterdir():
+            if provenance_deadline is not None and time.monotonic() >= provenance_deadline:
+                raise ValueError("Git reviewer workspace authentication exceeded its deadline")
             if child.name == ".git":
                 continue
             destination = archive_root / child.name
@@ -586,7 +592,9 @@ def _readonly_workspace_archive(
         source_git = root / ".git"
         trusted_git = archive_root / ".git"
         trusted_git.mkdir(mode=0o755)
-        _copy_trusted_git_objects(source_git / "objects", trusted_git / "objects")
+        _copy_trusted_git_objects(
+            source_git / "objects", trusted_git / "objects", deadline=provenance_deadline
+        )
         _head_text, commit = _git_commit_identity(source_git)
         # Branch/ref identity is candidate-controlled and can make ordinary
         # reviewer comparisons misleading. Trust only the out-of-band commit.
@@ -726,7 +734,9 @@ def _validate_loose_git_objects(source: Path) -> None:
             _validated_loose_git_object_bytes(obj, child.name + obj.name)
 
 
-def _copy_trusted_git_objects(source: Path, destination: Path) -> None:
+def _copy_trusted_git_objects(
+    source: Path, destination: Path, *, deadline: Optional[float] = None
+) -> None:
     """Copy only content-addressed Git object files, excluding semantic caches.
 
     Commit graphs, multi-pack indexes, bitmaps and other auxiliary files are
@@ -742,6 +752,8 @@ def _copy_trusted_git_objects(source: Path, destination: Path) -> None:
     pack_file = re.compile(r"pack-([0-9a-f]{40})\.pack")
     copied_packs: list[tuple[Path, str]] = []
     for child in source.iterdir():
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ValueError("Git reviewer workspace authentication exceeded its deadline")
         if loose_directory.fullmatch(child.name):
             if child.is_symlink() or not child.is_dir():
                 raise ValueError("reviewer workspace loose Git objects are unsafe")
@@ -785,6 +797,8 @@ def _copy_trusted_git_objects(source: Path, destination: Path) -> None:
         "GIT_NO_LAZY_FETCH": "1",
     }
     for copied_pack, expected_checksum in copied_packs:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ValueError("Git reviewer workspace authentication exceeded its deadline")
         # A pack index selects which object and offset Git associates with an
         # object ID. Rebuild it from authenticated pack bytes rather than
         # preserving the candidate-selected index.
@@ -794,7 +808,11 @@ def _copy_trusted_git_objects(source: Path, destination: Path) -> None:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=120,
+            timeout=(
+                120
+                if deadline is None
+                else max(0.1, min(120.0, deadline - time.monotonic()))
+            ),
             check=False,
             stdin=subprocess.DEVNULL,
             env=safe_env,
@@ -810,7 +828,10 @@ def _copy_trusted_git_objects(source: Path, destination: Path) -> None:
 
 
 def _verify_git_workspace_provenance(
-    root: Path, expected_git_sha: Optional[str] = None
+    root: Path,
+    expected_git_sha: Optional[str] = None,
+    *,
+    deadline: Optional[float] = None,
 ) -> None:
     """Require a Git workspace to be the complete clean tree of its real HEAD.
 
@@ -853,7 +874,8 @@ def _verify_git_workspace_provenance(
         "GIT_NO_LAZY_FETCH": "1",
     }
 
-    deadline = time.monotonic() + _REVIEW_PROVENANCE_DEADLINE_SECONDS
+    if deadline is None:
+        deadline = time.monotonic() + _REVIEW_PROVENANCE_DEADLINE_SECONDS
 
     def check_deadline() -> None:
         if time.monotonic() >= deadline:
@@ -1069,6 +1091,7 @@ print(digest.hexdigest())
                 [docker_exe, "rm", "-f", "-v", verifier_id], capture_output=True,
                 timeout=30, check=False, stdin=subprocess.DEVNULL,
             )
+        expected["mounted_content_sha256"] = content
         return volume
     except BaseException:
         if created_volume:
@@ -2230,6 +2253,8 @@ class DockerEnvironment(BaseEnvironment):
                 path_mappings=cwd_path_mappings,
             )
             if cwd_mount_mode == "ro":
+                if reviewer_mode:
+                    _enforce_reviewer_workspace_bounds(Path(canonical_host_cwd))
                 canonical_workspace_identity = _path_identity(
                     canonical_host_cwd, content_digest=True
                 )
@@ -3440,13 +3465,13 @@ if result.returncode != 0 or result.stdout.strip() != sys.argv[1]:
                 timeout=120, check=False, stdin=subprocess.DEVNULL,
             )
         except (subprocess.TimeoutExpired, OSError) as exc:
-            self._remove_rejected_container(container_id)
-            self._container_id = None
+            if self._remove_rejected_container(container_id):
+                self._container_id = None
             raise RuntimeError("failed to create writable reviewer copy") from exc
         if result.returncode != 0:
             detail = result.stderr.strip()
-            self._remove_rejected_container(container_id)
-            self._container_id = None
+            if self._remove_rejected_container(container_id):
+                self._container_id = None
             raise RuntimeError(
                 f"failed to create writable reviewer copy at assigned SHA: {detail}"
             )
