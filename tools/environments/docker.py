@@ -14,6 +14,7 @@ import re
 import shutil
 import stat
 import subprocess
+
 import sys
 import uuid
 from pathlib import Path
@@ -133,7 +134,7 @@ def _sanitize_label_value(value: str) -> str:
     return f"{prefix}-{digest}"
 
 
-def _readonly_tree_digest(root: Path) -> str:
+def _readonly_tree_digest(root: Path, *, include_root_mode: bool = True) -> str:
     """Hash a complete read-only source tree without following symlinks.
 
     Permission bits are part of the identity because Git tracks the executable
@@ -152,7 +153,8 @@ def _readonly_tree_digest(root: Path) -> str:
         relative = "." if path == root else path.relative_to(root).as_posix()
         digest.update(relative.encode("utf-8", errors="surrogateescape"))
         digest.update(b"\0")
-        digest.update(f"{stat.S_IMODE(path.lstat().st_mode):04o}".encode("ascii"))
+        if include_root_mode or path != root:
+            digest.update(f"{stat.S_IMODE(path.lstat().st_mode):04o}".encode("ascii"))
         digest.update(b"\0")
         if path.is_symlink():
             digest.update(b"L")
@@ -187,7 +189,7 @@ def _readonly_tree_metadata_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _authenticated_tree_digests(root: Path) -> tuple[str, str]:
+def _authenticated_tree_digests(root: Path) -> tuple[str, str, str]:
     """Return content and metadata digests from one stable authentication window.
 
     The metadata passes bracket the content read so a source that changes while
@@ -196,10 +198,74 @@ def _authenticated_tree_digests(root: Path) -> tuple[str, str]:
     """
     metadata_before = _readonly_tree_metadata_digest(root)
     content = _readonly_tree_digest(root)
+    mounted_content = _readonly_tree_digest(root, include_root_mode=False)
     metadata_after = _readonly_tree_metadata_digest(root)
     if metadata_before != metadata_after:
         raise ValueError(f"read-only workspace changed during authentication: {root}")
-    return content, metadata_after
+    return content, mounted_content, metadata_after
+
+
+def _container_tree_digest(
+    docker_exe: str, container_id: str, container_path: str
+) -> str:
+    """Hash the exact tree held by a container bind mount.
+
+    The digest runs inside the container, so it reads through the exact mount
+    reference rather than resolving the original host pathname again.  This
+    closes the rename-swap window between host authentication and daemon
+    bind-mount creation.
+    """
+    script = r'''
+import hashlib, os, stat, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+digest = hashlib.sha256()
+paths = [root] if not root.is_dir() else [root, *sorted(root.rglob("*"))]
+for path in paths:
+    relative = "." if path == root else path.relative_to(root).as_posix()
+    digest.update(relative.encode("utf-8", errors="surrogateescape"))
+    digest.update(b"\0")
+    if path != root:
+        digest.update(f"{stat.S_IMODE(path.lstat().st_mode):04o}".encode("ascii"))
+    digest.update(b"\0")
+    if path.is_symlink():
+        digest.update(b"L")
+        digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+    elif path.is_file():
+        digest.update(b"F")
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    elif path.is_dir():
+        digest.update(b"D")
+    digest.update(b"\0")
+print(digest.hexdigest())
+'''
+    failures: list[str] = []
+    for python_exe in ("python3", "python"):
+        result = subprocess.run(
+            [
+                docker_exe,
+                "exec",
+                container_id,
+                python_exe,
+                "-c",
+                script,
+                container_path,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        output = result.stdout.strip()
+        if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{64}", output):
+            return output
+        failures.append((result.stderr or result.stdout or "digest failed").strip())
+    raise RuntimeError("; ".join(filter(None, failures)) or "container digest failed")
 
 
 def _packed_git_ref(git_dir: Path, ref_name: str) -> Optional[str]:
@@ -298,8 +364,11 @@ def _path_identity(
     authenticated_metadata: Optional[str] = None
     if content_digest:
         try:
-            content, authenticated_metadata = _authenticated_tree_digests(resolved)
+            content, mounted_content, authenticated_metadata = (
+                _authenticated_tree_digests(resolved)
+            )
             identity["content_sha256"] = content
+            identity["mounted_content_sha256"] = mounted_content
         except (OSError, ValueError) as exc:
             raise ValueError(
                 f"cannot authenticate read-only workspace {resolved}: {exc}"
@@ -328,8 +397,8 @@ def _path_identity(
             # while HEAD itself remains unchanged.
             if content_digest and git_entry.is_file():
                 git_dir, common_dir = _git_metadata_dirs(git_entry)
-                git_content, git_metadata = _authenticated_tree_digests(git_dir)
-                common_content, common_metadata = _authenticated_tree_digests(common_dir)
+                git_content, _, git_metadata = _authenticated_tree_digests(git_dir)
+                common_content, _, common_metadata = _authenticated_tree_digests(common_dir)
                 identity["git_metadata_sha256"] = git_content
                 identity["git_common_metadata_sha256"] = common_content
                 identity["git_metadata_tree_sha256"] = git_metadata
@@ -371,6 +440,7 @@ def _volume_source_identities(
                     and not (canonical_workspace and destination == "/workspace")
                 ),
             )
+            identity["destination"] = destination
             if "ro" not in mode:
                 for mutable_field in ("ctime_ns", "git_head", "git_ref"):
                     identity.pop(mutable_field, None)
@@ -1416,7 +1486,7 @@ class DockerEnvironment(BaseEnvironment):
         self._tmp_storage = tmp_storage
         self._workspace_requires_ro = False
         self._readonly_workspace_sources: list[
-            tuple[str, dict[str, object]]
+            tuple[str, str, dict[str, object]]
         ] = []
         logger.info(f"DockerEnvironment volumes: {volumes}")
         # Ensure volumes is a list (config.yaml could be malformed)
@@ -1508,7 +1578,7 @@ class DockerEnvironment(BaseEnvironment):
                     canonical_host_cwd, content_digest=True
                 )
                 self._readonly_workspace_sources.append(
-                    (canonical_host_cwd, canonical_workspace_identity)
+                    (canonical_host_cwd, "/workspace", canonical_workspace_identity)
                 )
 
         self._workspace_dir: Optional[str] = None
@@ -1962,7 +2032,11 @@ class DockerEnvironment(BaseEnvironment):
             for identity in bind_source_identities:
                 if "content_sha256" in identity:
                     self._readonly_workspace_sources.append(
-                        (str(identity["path"]), identity)
+                        (
+                            str(identity["path"]),
+                            str(identity["destination"]),
+                            identity,
+                        )
                     )
         policy_payload = {
             "version": 1,
@@ -2395,7 +2469,7 @@ class DockerEnvironment(BaseEnvironment):
         long-lived reviewer container cannot silently observe a different tree
         under the same creation-policy label.
         """
-        for source, expected in self._readonly_workspace_sources:
+        for source, destination, expected in self._readonly_workspace_sources:
             try:
                 # Creation performs the expensive byte-for-byte hash. Commands
                 # revalidate mutation-sensitive metadata before and after use,
@@ -2408,6 +2482,23 @@ class DockerEnvironment(BaseEnvironment):
                     "read-only workspace changed after container policy "
                     f"authentication: {source}"
                 )
+            if self._container_id and "content_sha256" in expected:
+                try:
+                    mounted_digest = _container_tree_digest(
+                        self._docker_exe,
+                        self._container_id,
+                        destination,
+                    )
+                except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                    return (
+                        "cannot authenticate mounted read-only workspace "
+                        f"{destination}: {exc}"
+                    )
+                if mounted_digest != expected["mounted_content_sha256"]:
+                    return (
+                        "mounted read-only workspace differs from authenticated "
+                        f"source: {destination}"
+                    )
         return None
 
     @staticmethod

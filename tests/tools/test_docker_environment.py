@@ -27,6 +27,26 @@ def _mock_subprocess_run(monkeypatch):
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
             if cmd[1] == "run":
                 return subprocess.CompletedProcess(cmd, 0, stdout="fake-container-id\n", stderr="")
+            if cmd[1] == "exec" and len(cmd) >= 7 and cmd[4] == "-c":
+                run_cmd = next(
+                    call[0]
+                    for call in reversed(calls[:-1])
+                    if isinstance(call[0], list) and call[0][1] == "run"
+                )
+                container_path = cmd[-1]
+                workspace_spec = next(
+                    run_cmd[index + 1]
+                    for index, arg in enumerate(run_cmd[:-1])
+                    if arg == "-v"
+                    and run_cmd[index + 1].split(":", 2)[1] == container_path
+                )
+                source = workspace_spec.split(":", 1)[0]
+                digest = docker_env._readonly_tree_digest(
+                    docker_env.Path(source), include_root_mode=False
+                )
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{digest}\n", stderr=""
+                )
             if cmd[1] == "image" and cmd[2] == "inspect":
                 return subprocess.CompletedProcess(cmd, 0, stdout="sha256:test-image\n", stderr="")
             if cmd[1] == "exec" and cmd[-3:-1] == ["-f", "--"]:
@@ -538,8 +558,8 @@ def test_read_only_workspace_mutation_during_authentication_is_fail_closed(
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     original_digest = docker_env._readonly_tree_digest
 
-    def _mutating_digest(root):
-        result = original_digest(root)
+    def _mutating_digest(root, **kwargs):
+        result = original_digest(root, **kwargs)
         candidate.write_text("changed during authentication", encoding="utf-8")
         return result
 
@@ -553,6 +573,35 @@ def test_read_only_workspace_mutation_during_authentication_is_fail_closed(
             auto_mount_cwd=True,
             cwd_mount_mode="ro",
         )
+
+
+def test_mounted_workspace_content_must_match_authenticated_source(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    (project_dir / "candidate.txt").write_text("reviewed", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        docker_env,
+        "_container_tree_digest",
+        lambda *_, **__: "digest-from-swapped-mounted-tree",
+        raising=False,
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="mounted read-only workspace differs"):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+            persist_across_processes=False,
+        )
+
+    assert ["/usr/bin/docker", "rm", "-f", "fake-container-id"] in [
+        call[0] for call in calls
+    ]
 
 
 def test_read_only_workspace_change_blocks_existing_container_execution(
@@ -728,6 +777,13 @@ def test_mapped_read_only_workspace_uses_canonical_source_identity(monkeypatch, 
     candidate.write_text("first candidate", encoding="utf-8")
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     calls = _mock_subprocess_run(monkeypatch)
+    monkeypatch.setattr(
+        docker_env,
+        "_container_tree_digest",
+        lambda *_, **__: docker_env._readonly_tree_digest(
+            project_dir, include_root_mode=False
+        ),
+    )
 
     options = {
         "cwd": "/workspace",
