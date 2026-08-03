@@ -710,6 +710,42 @@ def test_git_workspace_provenance_requires_exact_clean_commit_tree(tmp_path):
         docker_env._verify_git_workspace_provenance(project_dir)
 
 
+def test_git_workspace_provenance_rejects_forged_loose_object(tmp_path):
+    import zlib
+
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"],
+        cwd=project_dir,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    payload = project_dir / "payload.txt"
+    payload.write_bytes(b"assigned bytes\n")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=project_dir, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    blob_id = subprocess.run(
+        ["git", "rev-parse", "HEAD:payload.txt"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    forged = b"candidate-controlled bytes\n"
+    loose_object = project_dir / ".git" / "objects" / blob_id[:2] / blob_id[2:]
+    loose_object.chmod(0o644)
+    loose_object.write_bytes(zlib.compress(b"blob " + str(len(forged)).encode() + b"\0" + forged))
+    payload.write_bytes(forged)
+
+    with pytest.raises(ValueError, match="loose Git object failed independent validation"):
+        docker_env._verify_git_workspace_provenance(project_dir, assigned)
+
+
 def test_git_workspace_provenance_rejects_candidate_replacement_refs(tmp_path):
     project_dir = tmp_path / "review-target"
     project_dir.mkdir()

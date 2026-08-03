@@ -16,6 +16,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import zlib
 
 import sys
 import uuid
@@ -652,6 +653,55 @@ def _readonly_workspace_archive(
             staging.cleanup()
 
 
+def _validated_loose_git_object_bytes(path: Path, expected_id: str) -> bytes:
+    """Read a loose SHA-1 Git object and authenticate its content address."""
+    try:
+        compressed = path.read_bytes()
+        inflater = zlib.decompressobj()
+        canonical = inflater.decompress(compressed) + inflater.flush()
+    except (OSError, zlib.error) as exc:
+        raise ValueError(
+            "reviewer workspace loose Git object failed independent validation"
+        ) from exc
+    if not inflater.eof or inflater.unused_data or inflater.unconsumed_tail:
+        raise ValueError("reviewer workspace loose Git object failed independent validation")
+    header, separator, payload = canonical.partition(b"\0")
+    object_type, size_separator, raw_size = header.partition(b" ")
+    if (
+        not separator
+        or not size_separator
+        or object_type not in {b"blob", b"tree", b"commit", b"tag"}
+        or not raw_size.isdigit()
+        or int(raw_size) != len(payload)
+        or hashlib.sha1(canonical).hexdigest() != expected_id
+    ):
+        raise ValueError("reviewer workspace loose Git object failed independent validation")
+    return compressed
+
+
+def _validate_loose_git_objects(source: Path) -> None:
+    """Reject loose objects whose candidate-selected path does not match its bytes."""
+    if not source.exists() and not source.is_symlink():
+        return
+    if source.is_symlink() or not source.is_dir():
+        raise ValueError("reviewer workspace Git object database is unsafe")
+    loose_directory = re.compile(r"[0-9a-f]{2}")
+    loose_object = re.compile(r"[0-9a-f]{38}")
+    for child in source.iterdir():
+        if not loose_directory.fullmatch(child.name):
+            continue
+        if child.is_symlink() or not child.is_dir():
+            raise ValueError("reviewer workspace loose Git objects are unsafe")
+        for obj in child.iterdir():
+            if (
+                not loose_object.fullmatch(obj.name)
+                or obj.is_symlink()
+                or not obj.is_file()
+            ):
+                raise ValueError("reviewer workspace loose Git objects are unsafe")
+            _validated_loose_git_object_bytes(obj, child.name + obj.name)
+
+
 def _copy_trusted_git_objects(source: Path, destination: Path) -> None:
     """Copy only content-addressed Git object files, excluding semantic caches.
 
@@ -680,7 +730,10 @@ def _copy_trusted_git_objects(source: Path, destination: Path) -> None:
                     or not obj.is_file()
                 ):
                     raise ValueError("reviewer workspace loose Git objects are unsafe")
-                shutil.copy2(obj, target_dir / obj.name, follow_symlinks=False)
+                authenticated = _validated_loose_git_object_bytes(
+                    obj, child.name + obj.name
+                )
+                (target_dir / obj.name).write_bytes(authenticated)
         elif child.name == "pack":
             if child.is_symlink() or not child.is_dir():
                 raise ValueError("reviewer workspace packed Git objects are unsafe")
@@ -750,6 +803,7 @@ def _verify_git_workspace_provenance(
             raise ValueError("reviewer workspace is missing Git metadata for the assigned SHA")
         return
     _validate_local_git_metadata(git_entry)
+    _validate_loose_git_objects(git_entry / "objects")
     _head_text, commit = _git_commit_identity(git_entry)
     if expected_git_sha is not None:
         if not re.fullmatch(r"[0-9a-f]{40}", expected_git_sha):
