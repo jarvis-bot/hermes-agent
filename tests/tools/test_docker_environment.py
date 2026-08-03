@@ -411,6 +411,22 @@ def test_mutable_image_identity_participates_in_reuse_fingerprint(monkeypatch):
     assert first_label != second_label
 
 
+def test_container_starts_from_authenticated_immutable_image(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        docker_env,
+        "_resolve_image_identity",
+        lambda *_: "sha256:authenticated-image",
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(image="reviewer:latest", persist_across_processes=False)
+
+    run_args = next(call[0] for call in calls if call[0][1] == "run")
+    assert "sha256:authenticated-image" in run_args
+    assert "reviewer:latest" not in run_args
+
+
 @pytest.mark.parametrize(
     ("first", "second"),
     [
@@ -504,6 +520,33 @@ def test_read_only_workspace_digest_failure_is_fail_closed(monkeypatch, tmp_path
     _mock_subprocess_run(monkeypatch)
 
     with pytest.raises(ValueError, match="cannot authenticate read-only workspace"):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+        )
+
+
+def test_read_only_workspace_mutation_during_authentication_is_fail_closed(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    candidate = project_dir / "candidate.txt"
+    candidate.write_text("reviewed", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    original_digest = docker_env._readonly_tree_digest
+
+    def _mutating_digest(root):
+        result = original_digest(root)
+        candidate.write_text("changed during authentication", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(docker_env, "_readonly_tree_digest", _mutating_digest)
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="changed during authentication"):
         _make_dummy_env(
             cwd="/workspace",
             host_cwd=str(project_dir),

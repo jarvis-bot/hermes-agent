@@ -187,6 +187,21 @@ def _readonly_tree_metadata_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
+def _authenticated_tree_digests(root: Path) -> tuple[str, str]:
+    """Return content and metadata digests from one stable authentication window.
+
+    The metadata passes bracket the content read so a source that changes while
+    it is being authenticated is rejected rather than producing an identity
+    assembled from two different tree states.
+    """
+    metadata_before = _readonly_tree_metadata_digest(root)
+    content = _readonly_tree_digest(root)
+    metadata_after = _readonly_tree_metadata_digest(root)
+    if metadata_before != metadata_after:
+        raise ValueError(f"read-only workspace changed during authentication: {root}")
+    return content, metadata_after
+
+
 def _packed_git_ref(git_dir: Path, ref_name: str) -> Optional[str]:
     """Resolve *ref_name* from packed-refs, ignoring comments/peeled lines."""
     packed_refs = git_dir / "packed-refs"
@@ -280,16 +295,22 @@ def _path_identity(
         "inode": stat_result.st_ino,
         "ctime_ns": stat_result.st_ctime_ns,
     })
+    authenticated_metadata: Optional[str] = None
     if content_digest:
         try:
-            identity["content_sha256"] = _readonly_tree_digest(resolved)
-        except OSError as exc:
+            content, authenticated_metadata = _authenticated_tree_digests(resolved)
+            identity["content_sha256"] = content
+        except (OSError, ValueError) as exc:
             raise ValueError(
                 f"cannot authenticate read-only workspace {resolved}: {exc}"
             ) from exc
     if content_digest or metadata_digest:
         try:
-            identity["tree_metadata_sha256"] = _readonly_tree_metadata_digest(resolved)
+            identity["tree_metadata_sha256"] = (
+                authenticated_metadata
+                if authenticated_metadata is not None
+                else _readonly_tree_metadata_digest(resolved)
+            )
         except OSError as exc:
             raise ValueError(
                 f"cannot authenticate read-only workspace metadata {resolved}: {exc}"
@@ -307,10 +328,12 @@ def _path_identity(
             # while HEAD itself remains unchanged.
             if content_digest and git_entry.is_file():
                 git_dir, common_dir = _git_metadata_dirs(git_entry)
-                identity["git_metadata_sha256"] = _readonly_tree_digest(git_dir)
-                identity["git_common_metadata_sha256"] = _readonly_tree_digest(common_dir)
-                identity["git_metadata_tree_sha256"] = _readonly_tree_metadata_digest(git_dir)
-                identity["git_common_metadata_tree_sha256"] = _readonly_tree_metadata_digest(common_dir)
+                git_content, git_metadata = _authenticated_tree_digests(git_dir)
+                common_content, common_metadata = _authenticated_tree_digests(common_dir)
+                identity["git_metadata_sha256"] = git_content
+                identity["git_common_metadata_sha256"] = common_content
+                identity["git_metadata_tree_sha256"] = git_metadata
+                identity["git_common_metadata_tree_sha256"] = common_metadata
             elif metadata_digest and git_entry.is_file():
                 git_dir, common_dir = _git_metadata_dirs(git_entry)
                 identity["git_metadata_tree_sha256"] = _readonly_tree_metadata_digest(git_dir)
@@ -1843,7 +1866,9 @@ class DockerEnvironment(BaseEnvironment):
         # /run with exec instead of noexec, or s6 stage0 dies with exit 126
         # "Permission denied". Detected once here; defaults are kept on any
         # inspection failure. See issue #34628.
-        image_uses_s6_init = _image_uses_init_entrypoint(self._docker_exe, image)
+        image_uses_s6_init = _image_uses_init_entrypoint(
+            self._docker_exe, image_identity
+        )
         if image_uses_s6_init:
             logger.info(
                 "Docker: image %s uses /init (s6-overlay) as entrypoint — "
@@ -1979,7 +2004,9 @@ class DockerEnvironment(BaseEnvironment):
             "--label", f"{_POLICY_LABEL_KEY}={policy_label}",
         ]
         # Save args for container recreation on "No such container" recovery.
-        self._image = image
+        # Recovery and initial creation both use the authenticated immutable ID;
+        # the human-readable reference remains only in the policy payload/logs.
+        self._image = image_identity
         self._container_name = container_name
         self._image_uses_s6_init = image_uses_s6_init
         self._all_run_args = all_run_args
@@ -2089,7 +2116,7 @@ class DockerEnvironment(BaseEnvironment):
                 *label_args,
                 "-w", cwd,
                 *all_run_args,
-                image,
+                image_identity,
                 "sleep", "infinity",  # no fixed lifetime — idle reaper handles cleanup
             ]
             logger.debug(f"Starting container: {' '.join(run_cmd)}")
