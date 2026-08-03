@@ -165,6 +165,8 @@ def test_exact_sha_reviewer_spawn_ignores_candidate_project_rules(monkeypatch, t
     kb._default_spawn(task, str(workspace))
 
     assert "--ignore-rules" in captured["cmd"]
+    pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
+    assert pinned == ["terminal", "kanban"]
 
 
 def test_ordinary_worker_spawn_keeps_project_rules_enabled(monkeypatch, tmp_path):

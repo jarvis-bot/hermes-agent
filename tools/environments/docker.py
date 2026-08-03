@@ -22,7 +22,7 @@ import zlib
 import sys
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import IO, Optional
 
 from tools.environments.base import BaseEnvironment, _popen_bash
 from tools.environments.local import (
@@ -51,6 +51,7 @@ _POLICY_LABEL_KEY = "hermes-policy"
 _MAX_REVIEW_WORKSPACE_NODES = 100_000
 _MAX_REVIEW_WORKSPACE_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_REVIEW_GIT_OBJECT_BYTES = 512 * 1024 * 1024
+_MAX_REVIEW_PACKED_REFS_BYTES = 16 * 1024 * 1024
 _REVIEW_PROVENANCE_DEADLINE_SECONDS = 180.0
 
 
@@ -550,7 +551,7 @@ def _extra_args_have_host_security_file(extra_args: list[str]) -> bool:
 
 def _readonly_workspace_archive(
     root: Path, expected_metadata: str, expected_git_sha: Optional[str] = None
-) -> tuple[bytes, str]:
+) -> tuple[IO[bytes], str]:
     """Create a stable regular/dir/symlink-only archive of an authenticated tree."""
     # General-purpose read-only mounts may legitimately contain dirty Git
     # worktrees.  Their exact bytes are authenticated below.  The stronger Git
@@ -642,7 +643,8 @@ def _readonly_workspace_archive(
 
     try:
         mounted_digest = _authenticated_tree_digests(archive_root)[1]
-        with tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as archive_file:
+        archive_file = tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024)
+        try:
             with tarfile.open(fileobj=archive_file, mode="w") as archive:
                 for path in sorted(archive_root.rglob("*")):
                     mode = path.lstat().st_mode
@@ -661,7 +663,10 @@ def _readonly_workspace_archive(
             if _readonly_tree_metadata_digest(root) != expected_metadata:
                 raise ValueError(f"read-only workspace changed during materialization: {root}")
             archive_file.seek(0)
-            return archive_file.read(), mounted_digest
+            return archive_file, mounted_digest
+        except BaseException:
+            archive_file.close()
+            raise
     finally:
         if staging is not None:
             staging.cleanup()
@@ -900,13 +905,6 @@ def _verify_git_workspace_provenance_in_staging(
         f"--git-dir={trusted_git}",
         f"--work-tree={root}",
     ]
-    candidate_base = [
-        git_exe,
-        "-c", "core.fsmonitor=false",
-        "-c", "core.hooksPath=/dev/null",
-        f"--git-dir={git_entry}",
-        f"--work-tree={root}",
-    ]
     safe_env = {
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
         "LANG": "C",
@@ -920,13 +918,11 @@ def _verify_git_workspace_provenance_in_staging(
         if time.monotonic() >= deadline:
             raise ValueError("Git reviewer workspace authentication exceeded its deadline")
 
-    def run(
-        args: list[str], *, candidate_metadata: bool = False
-    ) -> subprocess.CompletedProcess[bytes]:
+    def run(args: list[str]) -> subprocess.CompletedProcess[bytes]:
         check_deadline()
         try:
             return subprocess.run(
-                [*(candidate_base if candidate_metadata else base), *args], capture_output=True,
+                [*base, *args], capture_output=True,
                 timeout=max(0.1, min(30.0, deadline - time.monotonic())), check=False,
                 stdin=subprocess.DEVNULL, env=safe_env,
             )
@@ -1015,14 +1011,27 @@ def _verify_git_workspace_provenance_in_staging(
     # Replacement refs alter ordinary reviewer Git commands even though the
     # authentication commands above disable them. Never preserve that
     # candidate-selected interpretation in the copied reviewer workspace.
-    replace_refs = run(
-        ["for-each-ref", "--format=%(refname)", "refs/replace"],
-        candidate_metadata=True,
-    )
-    if replace_refs.returncode != 0:
-        raise ValueError("reviewer workspace Git refs cannot be authenticated")
-    if replace_refs.stdout:
+    replace_ref_root = git_entry / "refs" / "replace"
+    if replace_ref_root.exists() or replace_ref_root.is_symlink():
         raise ValueError("reviewer workspace contains Git replacement refs")
+    packed_refs = git_entry / "packed-refs"
+    if packed_refs.exists() or packed_refs.is_symlink():
+        try:
+            if (
+                not packed_refs.is_file()
+                or packed_refs.stat().st_size > _MAX_REVIEW_PACKED_REFS_BYTES
+            ):
+                raise ValueError("reviewer workspace Git refs cannot be authenticated")
+            packed_ref_bytes = packed_refs.read_bytes()
+        except OSError as exc:
+            raise ValueError("reviewer workspace Git refs cannot be authenticated") from exc
+        if any(
+            line
+            and not line.startswith((b"#", b"^"))
+            and line.partition(b" ")[2].startswith(b"refs/replace/")
+            for line in packed_ref_bytes.splitlines()
+        ):
+            raise ValueError("reviewer workspace contains Git replacement refs")
     for semantic_metadata in (
         git_entry / "info" / "grafts",
         git_entry / "shallow",
@@ -1079,6 +1088,7 @@ def _materialize_readonly_workspace(
                     [docker_exe, "volume", "rm", "-f", volume], capture_output=True,
                     timeout=30, check=False, stdin=subprocess.DEVNULL,
                 )
+            archive.close()
             raise
         script = r'''
 import hashlib, os, pathlib, shutil, stat, sys, tarfile
@@ -1114,7 +1124,7 @@ print(digest.hexdigest())
                 [docker_exe, "run", "--rm", "-i", "--network=none", "--cap-drop",
                  "ALL", "-v", f"{volume}:/workspace", "--entrypoint", "python3",
                  image, "-I", "-c", script],
-                input=archive, capture_output=True, timeout=120, check=False,
+                stdin=archive, capture_output=True, timeout=120, check=False,
             )
         except BaseException:
             if created_volume:
@@ -1123,6 +1133,8 @@ print(digest.hexdigest())
                     timeout=30, check=False, stdin=subprocess.DEVNULL,
                 )
             raise
+        finally:
+            archive.close()
         output = populated.stdout.decode("utf-8", errors="replace").strip()
         if populated.returncode != 0 or output != content:
             subprocess.run(
@@ -1133,10 +1145,14 @@ print(digest.hexdigest())
             raise RuntimeError(
                 f"materialized read-only workspace failed authentication: {detail}"
             )
+    else:
+        archive.close()
+    verifier_name = f"{volume}-verify"
     try:
         verifier = subprocess.run(
-            [docker_exe, "run", "-d", "--network=none", "--cap-drop", "ALL", "-v",
-             f"{volume}:/workspace:ro", "--entrypoint", "sleep", image, "120"],
+            [docker_exe, "run", "--name", verifier_name, "-d", "--network=none",
+             "--cap-drop", "ALL", "-v", f"{volume}:/workspace:ro", "--entrypoint",
+             "sleep", image, "120"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=120, check=True, stdin=subprocess.DEVNULL,
         )
@@ -1148,12 +1164,19 @@ print(digest.hexdigest())
                 )
         finally:
             subprocess.run(
-                [docker_exe, "rm", "-f", "-v", verifier_id], capture_output=True,
+                [docker_exe, "rm", "-f", "-v", verifier_name], capture_output=True,
                 timeout=30, check=False, stdin=subprocess.DEVNULL,
             )
         expected["mounted_content_sha256"] = content
         return volume
     except BaseException:
+        # A daemon can create the verifier even when the client times out before
+        # returning its ID. The deterministic name lets cleanup detach it before
+        # reclaiming the disposable volume.
+        subprocess.run(
+            [docker_exe, "rm", "-f", "-v", verifier_name], capture_output=True,
+            timeout=30, check=False, stdin=subprocess.DEVNULL,
+        )
         if created_volume:
             subprocess.run(
                 [docker_exe, "volume", "rm", "-f", volume], capture_output=True,
@@ -2742,10 +2765,10 @@ class DockerEnvironment(BaseEnvironment):
                 "docker_extra_args host bind sources are unsupported because raw "
                 "mounts cannot participate in policy authentication; use docker_volumes"
             )
-        if not network and _extra_args_override_network(validated_extra):
+        if _extra_args_override_network(validated_extra):
             raise ValueError(
-                "docker_extra_args cannot select a network mode when "
-                "terminal.docker_network=false"
+                "docker_extra_args cannot select a network mode; use "
+                "terminal.docker_network so network policy participates in reuse isolation"
             )
         reserved_label_collisions = _extra_args_reserved_label_collisions(validated_extra)
         if reserved_label_collisions:

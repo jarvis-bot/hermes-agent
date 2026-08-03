@@ -9348,7 +9348,11 @@ def _default_spawn(
         # the classic mis-set that stalls a board).
         if task.provider_override:
             cmd.extend(["--provider", task.provider_override])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    worker_toolsets = (
+        ["terminal", "kanban"]
+        if task.expected_workspace_sha
+        else _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    )
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([

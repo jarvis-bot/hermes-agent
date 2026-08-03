@@ -431,18 +431,16 @@ def test_network_disabled_rejects_extra_arg_override(monkeypatch, network_arg):
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     _mock_subprocess_run(monkeypatch)
 
-    with pytest.raises(ValueError, match="docker_network=false"):
+    with pytest.raises(ValueError, match="network mode"):
         _make_dummy_env(network=False, extra_args=network_arg)
 
 
-def test_network_enabled_preserves_explicit_network_mode(monkeypatch):
+def test_network_enabled_rejects_explicit_network_mode(monkeypatch):
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
-    calls = _mock_subprocess_run(monkeypatch)
+    _mock_subprocess_run(monkeypatch)
 
-    _make_dummy_env(network=True, extra_args=["--network=host"])
-
-    run_cmd = next(cmd for cmd, _ in calls if isinstance(cmd, list) and cmd[1] == "run")
-    assert "--network=host" in run_cmd
+    with pytest.raises(ValueError, match="network mode"):
+        _make_dummy_env(network=True, extra_args=["--network=host"])
 
 
 def test_explicit_workspace_mount_participates_in_reuse_fingerprint(
@@ -929,8 +927,11 @@ def test_pinned_workspace_archive_rebuilds_trusted_git_metadata(tmp_path):
     )
     extracted = tmp_path / "extracted"
     extracted.mkdir()
-    with tarfile.open(fileobj=BytesIO(archive), mode="r:") as handle:
-        handle.extractall(extracted, filter="data")
+    try:
+        with tarfile.open(fileobj=archive, mode="r:") as handle:
+            handle.extractall(extracted, filter="data")
+    finally:
+        archive.close()
 
     config = (extracted / ".git" / "config").read_text(encoding="utf-8")
     assert "hostile" not in config
@@ -1071,7 +1072,7 @@ def test_materialize_reviewer_updates_expected_mounted_digest(monkeypatch, tmp_p
     monkeypatch.setattr(
         docker_env,
         "_readonly_workspace_archive",
-        lambda *_args, **_kwargs: (b"archive", content),
+        lambda *_args, **_kwargs: (BytesIO(b"archive"), content),
     )
     monkeypatch.setattr(docker_env, "_container_tree_digest", lambda *_args: content)
 
@@ -1081,7 +1082,7 @@ def test_materialize_reviewer_updates_expected_mounted_digest(monkeypatch, tmp_p
             return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
         if command[1:3] == ["run", "--rm"]:
             return subprocess.CompletedProcess(command, 0, stdout=(content + "\n").encode(), stderr=b"")
-        if command[1:3] == ["run", "-d"]:
+        if command[1] == "run" and "--name" in command and "-d" in command:
             return subprocess.CompletedProcess(command, 0, stdout="verifier\n", stderr="")
         return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
 
@@ -1105,7 +1106,7 @@ def test_materialize_reviewer_overrides_image_entrypoint(monkeypatch, tmp_path):
     monkeypatch.setattr(
         docker_env,
         "_readonly_workspace_archive",
-        lambda *_args, **_kwargs: (b"archive", content),
+        lambda *_args, **_kwargs: (BytesIO(b"archive"), content),
     )
     monkeypatch.setattr(docker_env, "_container_tree_digest", lambda *_args: content)
 
@@ -1117,7 +1118,7 @@ def test_materialize_reviewer_overrides_image_entrypoint(monkeypatch, tmp_path):
             return subprocess.CompletedProcess(
                 command, 0, stdout=(content + "\n").encode(), stderr=b""
             )
-        if command[1:3] == ["run", "-d"]:
+        if command[1] == "run" and "--name" in command and "-d" in command:
             return subprocess.CompletedProcess(command, 0, stdout="verifier\n", stderr="")
         return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
 
@@ -1128,7 +1129,11 @@ def test_materialize_reviewer_overrides_image_entrypoint(monkeypatch, tmp_path):
     )
 
     populate = next(command for command in calls if command[1:3] == ["run", "--rm"])
-    verifier = next(command for command in calls if command[1:3] == ["run", "-d"])
+    verifier = next(
+        command
+        for command in calls
+        if command[1] == "run" and "--name" in command and "-d" in command
+    )
     assert populate[populate.index("--entrypoint") + 1] == "python3"
     assert populate[populate.index("entrypoint-image") + 1 :][:2] == ["-I", "-c"]
     assert verifier[verifier.index("--entrypoint") + 1] == "sleep"
@@ -1143,7 +1148,7 @@ def test_materialize_reviewer_volume_is_removed_when_verifier_start_fails(
     monkeypatch.setattr(
         docker_env,
         "_readonly_workspace_archive",
-        lambda *_args, **_kwargs: (b"archive", "f" * 64),
+        lambda *_args, **_kwargs: (BytesIO(b"archive"), "f" * 64),
     )
 
     def fake_run(command, **kwargs):
@@ -1154,8 +1159,10 @@ def test_materialize_reviewer_volume_is_removed_when_verifier_start_fails(
             return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
         if command[1:3] == ["run", "--rm"]:
             return subprocess.CompletedProcess(command, 0, stdout=("f" * 64 + "\n").encode(), stderr=b"")
-        if command[1:3] == ["run", "-d"]:
+        if command[1] == "run" and "--name" in command and "-d" in command:
             raise subprocess.TimeoutExpired(command, 120)
+        if command[1:4] == ["rm", "-f", "-v"]:
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
         if command[1:4] == ["volume", "rm", "-f"]:
             return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
         raise AssertionError(command)

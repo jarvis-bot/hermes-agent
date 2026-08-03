@@ -1110,7 +1110,13 @@ def _probe_remote_backend(env_type: str) -> str | None:
             "\"$(uname -r 2>/dev/null || echo unknown)\" "
             "\"$HOME\" \"$(pwd)\" \"$(whoami 2>/dev/null || id -un 2>/dev/null || echo unknown)\""
         )
-        result = env.execute(probe_cmd, timeout=4)
+        try:
+            result = env.execute(probe_cmd, timeout=4)
+        finally:
+            # Prompt probes are one-shot. Exact-SHA reviewer probes create
+            # disposable authenticated Docker snapshots which must not survive
+            # after this function drops the environment.
+            env.cleanup()
         if result.get("returncode") != 0:
             logger.debug("Backend probe returned non-zero: %r", result)
             _BACKEND_PROBE_CACHE[cache_key] = ""
