@@ -151,6 +151,7 @@ def test_exact_sha_reviewer_spawn_ignores_candidate_project_rules(monkeypatch, t
 
     def fake_popen(cmd, *args, **kwargs):
         captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs.get("env") or {})
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
@@ -165,6 +166,8 @@ def test_exact_sha_reviewer_spawn_ignores_candidate_project_rules(monkeypatch, t
     kb._default_spawn(task, str(workspace))
 
     assert "--ignore-rules" in captured["cmd"]
+    assert "--accept-hooks" not in captured["cmd"]
+    assert captured["env"]["HERMES_SAFE_MODE"] == "1"
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
     assert pinned == ["terminal", "kanban"]
 

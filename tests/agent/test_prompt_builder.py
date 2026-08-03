@@ -752,6 +752,10 @@ class TestEnvironmentHints:
             def cleanup(self):
                 created["cleaned"] = True
 
+            def wait_for_cleanup(self, timeout):
+                created["cleanup_timeout"] = timeout
+                return True
+
         created = {}
 
         def _fake_create_environment(*, env_type, **kwargs):
@@ -766,6 +770,7 @@ class TestEnvironmentHints:
         line = _pb._probe_remote_backend("docker")
         assert created.get("env_type") == "docker"
         assert created.get("cleaned") is True
+        assert created.get("cleanup_timeout") == 120.0
         assert line is not None
         assert "Linux 6.8.0" in line
         assert "root" in line
@@ -786,6 +791,10 @@ class TestEnvironmentHints:
             def cleanup(self):
                 created["cleaned"] = True
 
+            def wait_for_cleanup(self, timeout):
+                created["cleanup_timeout"] = timeout
+                return True
+
         created = {}
 
         def _fake_create_environment(**kwargs):
@@ -796,6 +805,7 @@ class TestEnvironmentHints:
 
         assert _pb._probe_remote_backend("docker") is not None
         assert created.get("cleaned") is True
+        assert created.get("cleanup_timeout") == 120.0
         assert created["container_config"]["docker_network"] is False
 
 

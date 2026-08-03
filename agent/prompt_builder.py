@@ -1117,6 +1117,9 @@ def _probe_remote_backend(env_type: str) -> str | None:
             # disposable authenticated Docker snapshots which must not survive
             # after this function drops the environment.
             env.cleanup()
+            wait_for_cleanup = getattr(env, "wait_for_cleanup", None)
+            if callable(wait_for_cleanup) and not wait_for_cleanup(timeout=120.0):
+                raise RuntimeError("backend probe environment cleanup timed out")
         if result.get("returncode") != 0:
             logger.debug("Backend probe returned non-zero: %r", result)
             _BACKEND_PROBE_CACHE[cache_key] = ""

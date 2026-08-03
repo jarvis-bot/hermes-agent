@@ -9266,6 +9266,10 @@ def _default_spawn(
     env.pop("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", None)
     if task.expected_workspace_sha:
         env["HERMES_KANBAN_EXPECTED_WORKSPACE_SHA"] = task.expected_workspace_sha
+        # Exact-SHA reviewers consume candidate-controlled repository content.
+        # Disable host-executed plugins, MCP startup, and shell hooks without
+        # ignoring the trusted reviewer profile's Docker/provider config.
+        env["HERMES_SAFE_MODE"] = "1"
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
@@ -9320,12 +9324,11 @@ def _default_spawn(
         *_resolve_hermes_argv(),
         "-p", profile_arg,
         "--cli",
-        # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
-        # so they see that profile's shell-hook allowlist instead of the
-        # dispatcher's root allowlist. Pass --accept-hooks explicitly so
-        # profile-local worker sessions still register configured hooks.
-        "--accept-hooks",
     ]
+    if not task.expected_workspace_sha:
+        # Ordinary profile-local workers retain configured shell hooks. Exact-SHA
+        # reviewers run with HERMES_SAFE_MODE and must execute no host extensions.
+        cmd.append("--accept-hooks")
     if task.expected_workspace_sha:
         # Exact-SHA tasks review untrusted candidate content. Candidate-owned
         # AGENTS.md / CLAUDE.md files must remain data, never system-level
