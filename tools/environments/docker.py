@@ -55,6 +55,11 @@ _MAX_REVIEW_PACKED_REFS_BYTES = 16 * 1024 * 1024
 _REVIEW_PROVENANCE_DEADLINE_SECONDS = 180.0
 
 
+def _check_review_deadline(deadline: Optional[float]) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise ValueError("Git reviewer workspace authentication exceeded its deadline")
+
+
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
     """Return a deduplicated list of valid environment variable names."""
     normalized: list[str] = []
@@ -143,7 +148,9 @@ def _sanitize_label_value(value: str) -> str:
     return f"{prefix}-{digest}"
 
 
-def _readonly_tree_digest(root: Path, *, include_root_mode: bool = True) -> str:
+def _readonly_tree_digest(
+    root: Path, *, include_root_mode: bool = True, deadline: Optional[float] = None
+) -> str:
     """Hash a complete read-only source tree without following symlinks.
 
     Permission bits are part of the identity because Git tracks the executable
@@ -159,6 +166,7 @@ def _readonly_tree_digest(root: Path, *, include_root_mode: bool = True) -> str:
     # Include the source object itself as well as its descendants.  ``lstat``
     # deliberately authenticates symlinks rather than their targets.
     for path in [root, *paths] if paths != [root] else paths:
+        _check_review_deadline(deadline)
         relative = "." if path == root else path.relative_to(root).as_posix()
         digest.update(relative.encode("utf-8", errors="surrogateescape"))
         digest.update(b"\0")
@@ -173,6 +181,7 @@ def _readonly_tree_digest(root: Path, *, include_root_mode: bool = True) -> str:
             digest.update(b"F")
             with path.open("rb") as handle:
                 for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    _check_review_deadline(deadline)
                     digest.update(chunk)
         elif stat.S_ISDIR(mode):
             digest.update(b"D")
@@ -182,11 +191,14 @@ def _readonly_tree_digest(root: Path, *, include_root_mode: bool = True) -> str:
     return digest.hexdigest()
 
 
-def _readonly_tree_metadata_digest(root: Path) -> str:
+def _readonly_tree_metadata_digest(
+    root: Path, *, deadline: Optional[float] = None
+) -> str:
     """Hash mutation-sensitive tree metadata without rereading file contents."""
     digest = hashlib.sha256()
     paths = [root] if root.is_file() else [root, *sorted(root.rglob("*"))]
     for path in paths:
+        _check_review_deadline(deadline)
         relative = "." if path == root else path.relative_to(root).as_posix()
         info = path.lstat()
         digest.update(relative.encode("utf-8", errors="surrogateescape"))
@@ -201,17 +213,21 @@ def _readonly_tree_metadata_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _authenticated_tree_digests(root: Path) -> tuple[str, str, str]:
+def _authenticated_tree_digests(
+    root: Path, *, deadline: Optional[float] = None
+) -> tuple[str, str, str]:
     """Return content and metadata digests from one stable authentication window.
 
     The metadata passes bracket the content read so a source that changes while
     it is being authenticated is rejected rather than producing an identity
     assembled from two different tree states.
     """
-    metadata_before = _readonly_tree_metadata_digest(root)
-    content = _readonly_tree_digest(root)
-    mounted_content = _readonly_tree_digest(root, include_root_mode=False)
-    metadata_after = _readonly_tree_metadata_digest(root)
+    metadata_before = _readonly_tree_metadata_digest(root, deadline=deadline)
+    content = _readonly_tree_digest(root, deadline=deadline)
+    mounted_content = _readonly_tree_digest(
+        root, include_root_mode=False, deadline=deadline
+    )
+    metadata_after = _readonly_tree_metadata_digest(root, deadline=deadline)
     if metadata_before != metadata_after:
         raise ValueError(f"read-only workspace changed during authentication: {root}")
     return content, mounted_content, metadata_after
@@ -370,7 +386,11 @@ def _git_commit_identity(git_entry: Path) -> tuple[str, str]:
 
 
 def _path_identity(
-    path: str, *, content_digest: bool = False, metadata_digest: bool = False
+    path: str,
+    *,
+    content_digest: bool = False,
+    metadata_digest: bool = False,
+    deadline: Optional[float] = None,
 ) -> dict[str, object]:
     """Return stable host-object evidence for an immutable bind source.
 
@@ -414,7 +434,7 @@ def _path_identity(
     if content_digest:
         try:
             content, mounted_content, authenticated_metadata = (
-                _authenticated_tree_digests(resolved)
+                _authenticated_tree_digests(resolved, deadline=deadline)
             )
             identity["content_sha256"] = content
             identity["mounted_content_sha256"] = mounted_content
@@ -427,7 +447,7 @@ def _path_identity(
             identity["tree_metadata_sha256"] = (
                 authenticated_metadata
                 if authenticated_metadata is not None
-                else _readonly_tree_metadata_digest(resolved)
+                else _readonly_tree_metadata_digest(resolved, deadline=deadline)
             )
         except OSError as exc:
             raise ValueError(
@@ -549,22 +569,50 @@ def _extra_args_have_host_security_file(extra_args: list[str]) -> bool:
     return False
 
 
+def _copy_review_node(source: Path, destination: Path, deadline: float) -> None:
+    """Copy one authenticated review node while enforcing the shared deadline."""
+    _check_review_deadline(deadline)
+    mode = source.lstat().st_mode
+    if stat.S_ISLNK(mode):
+        destination.symlink_to(os.readlink(source))
+        return
+    if stat.S_ISDIR(mode):
+        destination.mkdir(mode=stat.S_IMODE(mode))
+        for child in source.iterdir():
+            _copy_review_node(child, destination / child.name, deadline)
+        return
+    if not stat.S_ISREG(mode):
+        raise ValueError(f"unsupported filesystem node in read-only workspace: {source}")
+    with source.open("rb") as reader, destination.open("xb") as writer:
+        while chunk := reader.read(1024 * 1024):
+            _check_review_deadline(deadline)
+            writer.write(chunk)
+    shutil.copystat(source, destination, follow_symlinks=False)
+
+
 def _readonly_workspace_archive(
-    root: Path, expected_metadata: str, expected_git_sha: Optional[str] = None
+    root: Path,
+    expected_metadata: str,
+    expected_git_sha: Optional[str] = None,
+    *,
+    provenance_deadline: Optional[float] = None,
 ) -> tuple[IO[bytes], str]:
     """Create a stable regular/dir/symlink-only archive of an authenticated tree."""
     # General-purpose read-only mounts may legitimately contain dirty Git
     # worktrees.  Their exact bytes are authenticated below.  The stronger Git
     # provenance contract is required only for reviewer workspaces carrying an
     # out-of-band assigned SHA.
-    provenance_deadline: Optional[float] = None
     if expected_git_sha is not None:
-        provenance_deadline = time.monotonic() + _REVIEW_PROVENANCE_DEADLINE_SECONDS
-        _enforce_reviewer_workspace_bounds(root)
+        if provenance_deadline is None:
+            provenance_deadline = time.monotonic() + _REVIEW_PROVENANCE_DEADLINE_SECONDS
+        _enforce_reviewer_workspace_bounds(root, deadline=provenance_deadline)
         _verify_git_workspace_provenance(
             root, expected_git_sha, deadline=provenance_deadline
         )
-    if _readonly_tree_metadata_digest(root) != expected_metadata:
+    if (
+        _readonly_tree_metadata_digest(root, deadline=provenance_deadline)
+        != expected_metadata
+    ):
         raise ValueError(f"read-only workspace changed before materialization: {root}")
     if not root.is_dir():
         raise ValueError("authenticated read-only workspace root must be a directory")
@@ -584,12 +632,8 @@ def _readonly_workspace_archive(
             if child.name == ".git":
                 continue
             destination = archive_root / child.name
-            if child.is_dir() and not child.is_symlink():
-                shutil.copytree(child, destination, symlinks=True)
-            elif child.is_symlink():
-                destination.symlink_to(os.readlink(child))
-            else:
-                shutil.copy2(child, destination, follow_symlinks=False)
+            assert provenance_deadline is not None
+            _copy_review_node(child, destination, provenance_deadline)
         source_git = root / ".git"
         trusted_git = archive_root / ".git"
         trusted_git.mkdir(mode=0o755)
@@ -623,7 +667,15 @@ def _readonly_workspace_archive(
                 "read-tree", commit,
             ],
             capture_output=True,
-            timeout=30,
+            timeout=max(
+                0.1,
+                min(
+                    30.0,
+                    (provenance_deadline - time.monotonic())
+                    if provenance_deadline is not None
+                    else 30.0,
+                ),
+            ),
             check=False,
             stdin=subprocess.DEVNULL,
             env={
@@ -649,11 +701,14 @@ def _readonly_workspace_archive(
         )
 
     try:
-        mounted_digest = _authenticated_tree_digests(archive_root)[1]
+        mounted_digest = _authenticated_tree_digests(
+            archive_root, deadline=provenance_deadline
+        )[1]
         archive_file = tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024)
         try:
             with tarfile.open(fileobj=archive_file, mode="w") as archive:
                 for path in sorted(archive_root.rglob("*")):
+                    _check_review_deadline(provenance_deadline)
                     mode = path.lstat().st_mode
                     if not any(check(mode) for check in (stat.S_ISREG, stat.S_ISDIR, stat.S_ISLNK)):
                         raise ValueError(
@@ -667,7 +722,10 @@ def _readonly_workspace_archive(
                             archive.addfile(info, handle)
                     else:
                         archive.addfile(info)
-            if _readonly_tree_metadata_digest(root) != expected_metadata:
+            if (
+                _readonly_tree_metadata_digest(root, deadline=provenance_deadline)
+                != expected_metadata
+            ):
                 raise ValueError(f"read-only workspace changed during materialization: {root}")
             archive_file.seek(0)
             return archive_file, mounted_digest
@@ -679,11 +737,14 @@ def _readonly_workspace_archive(
             staging.cleanup()
 
 
-def _enforce_reviewer_workspace_bounds(root: Path) -> None:
+def _enforce_reviewer_workspace_bounds(
+    root: Path, *, deadline: Optional[float] = None
+) -> None:
     """Bound candidate-controlled host work before reviewer isolation exists."""
     nodes = 0
     total_bytes = 0
     for path in root.rglob("*"):
+        _check_review_deadline(deadline)
         nodes += 1
         if nodes > _MAX_REVIEW_WORKSPACE_NODES:
             raise ValueError("reviewer workspace exceeds reviewer node limit")
@@ -694,9 +755,12 @@ def _enforce_reviewer_workspace_bounds(root: Path) -> None:
                 raise ValueError("reviewer workspace exceeds reviewer byte limit")
 
 
-def _validated_loose_git_object_bytes(path: Path, expected_id: str) -> bytes:
+def _validated_loose_git_object_bytes(
+    path: Path, expected_id: str, *, deadline: Optional[float] = None
+) -> bytes:
     """Read a loose SHA-1 Git object and authenticate its content address."""
     try:
+        _check_review_deadline(deadline)
         compressed = path.read_bytes()
         inflater = zlib.decompressobj()
         canonical = inflater.decompress(compressed, _MAX_REVIEW_GIT_OBJECT_BYTES + 1)
@@ -723,7 +787,9 @@ def _validated_loose_git_object_bytes(path: Path, expected_id: str) -> bytes:
     return compressed
 
 
-def _validate_loose_git_objects(source: Path) -> None:
+def _validate_loose_git_objects(
+    source: Path, *, deadline: Optional[float] = None
+) -> None:
     """Reject loose objects whose candidate-selected path does not match its bytes."""
     if not source.exists() and not source.is_symlink():
         return
@@ -732,18 +798,22 @@ def _validate_loose_git_objects(source: Path) -> None:
     loose_directory = re.compile(r"[0-9a-f]{2}")
     loose_object = re.compile(r"[0-9a-f]{38}")
     for child in source.iterdir():
+        _check_review_deadline(deadline)
         if not loose_directory.fullmatch(child.name):
             continue
         if child.is_symlink() or not child.is_dir():
             raise ValueError("reviewer workspace loose Git objects are unsafe")
         for obj in child.iterdir():
+            _check_review_deadline(deadline)
             if (
                 not loose_object.fullmatch(obj.name)
                 or obj.is_symlink()
                 or not obj.is_file()
             ):
                 raise ValueError("reviewer workspace loose Git objects are unsafe")
-            _validated_loose_git_object_bytes(obj, child.name + obj.name)
+            _validated_loose_git_object_bytes(
+                obj, child.name + obj.name, deadline=deadline
+            )
 
 
 def _copy_trusted_git_objects(
@@ -779,7 +849,7 @@ def _copy_trusted_git_objects(
                 ):
                     raise ValueError("reviewer workspace loose Git objects are unsafe")
                 authenticated = _validated_loose_git_object_bytes(
-                    obj, child.name + obj.name
+                    obj, child.name + obj.name, deadline=deadline
                 )
                 (target_dir / obj.name).write_bytes(authenticated)
         elif child.name == "pack":
@@ -876,8 +946,10 @@ def _verify_git_workspace_provenance_in_staging(
         if expected_git_sha is not None:
             raise ValueError("reviewer workspace is missing Git metadata for the assigned SHA")
         return
+    if deadline is None:
+        deadline = time.monotonic() + _REVIEW_PROVENANCE_DEADLINE_SECONDS
     _validate_local_git_metadata(git_entry)
-    _validate_loose_git_objects(git_entry / "objects")
+    _validate_loose_git_objects(git_entry / "objects", deadline=deadline)
     _head_text, commit = _git_commit_identity(git_entry)
     if expected_git_sha is not None:
         if not re.fullmatch(r"[0-9a-f]{40}", expected_git_sha):
@@ -887,8 +959,6 @@ def _verify_git_workspace_provenance_in_staging(
     git_exe = shutil.which("git")
     if git_exe is None:
         raise ValueError("git is required to authenticate a Git reviewer workspace")
-    if deadline is None:
-        deadline = time.monotonic() + _REVIEW_PROVENANCE_DEADLINE_SECONDS
 
     # Never let candidate-selected pack indexes participate in authentication.
     # Copy only content-addressed loose/pack bytes and rebuild every pack index
@@ -968,24 +1038,28 @@ def _verify_git_workspace_provenance_in_staging(
             candidate_mode = candidate.lstat().st_mode
         except OSError as exc:
             raise ValueError("reviewer workspace tracked files do not match HEAD") from exc
-        blob = run(["cat-file", "blob", object_id.decode("ascii")])
-        if blob.returncode != 0:
-            raise ValueError("reviewer workspace commit blob cannot be authenticated")
         if mode == b"120000":
             if not stat.S_ISLNK(candidate_mode):
                 raise ValueError("reviewer workspace tracked files do not match HEAD")
             actual = os.readlink(candidate).encode("utf-8", errors="surrogateescape")
+            blob_digest = hashlib.sha1(f"blob {len(actual)}\0".encode("ascii"))
+            blob_digest.update(actual)
         else:
             if not stat.S_ISREG(candidate_mode):
                 raise ValueError("reviewer workspace tracked files do not match HEAD")
-            try:
-                actual = candidate.read_bytes()
-            except OSError as exc:
-                raise ValueError("reviewer workspace tracked files do not match HEAD") from exc
             executable = bool(candidate_mode & stat.S_IXUSR)
             if executable != (mode == b"100755"):
                 raise ValueError("reviewer workspace tracked file modes do not match HEAD")
-        if actual != blob.stdout:
+            try:
+                size = candidate.lstat().st_size
+                blob_digest = hashlib.sha1(f"blob {size}\0".encode("ascii"))
+                with candidate.open("rb") as handle:
+                    while chunk := handle.read(1024 * 1024):
+                        check_deadline()
+                        blob_digest.update(chunk)
+            except OSError as exc:
+                raise ValueError("reviewer workspace tracked files do not match HEAD") from exc
+        if blob_digest.hexdigest().encode("ascii") != object_id:
             raise ValueError("reviewer workspace tracked files do not match HEAD")
 
     # Do not consult the candidate-controlled index for untracked detection.
@@ -1060,6 +1134,7 @@ def _materialize_readonly_workspace(
     expected_git_sha: Optional[str] = None,
     *,
     disposable: bool = False,
+    provenance_deadline: Optional[float] = None,
 ) -> str:
     """Materialize authenticated bytes in a daemon-owned volume.
 
@@ -1067,7 +1142,10 @@ def _materialize_readonly_workspace(
     so concurrent reviewers never populate the same mutable volume.
     """
     archive, content = _readonly_workspace_archive(
-        Path(source), str(expected["tree_metadata_sha256"]), expected_git_sha
+        Path(source),
+        str(expected["tree_metadata_sha256"]),
+        expected_git_sha,
+        provenance_deadline=provenance_deadline,
     )
     volume = (
         f"hermes-ro-{content[:16]}-{uuid.uuid4().hex[:8]}"
@@ -2339,6 +2417,11 @@ class DockerEnvironment(BaseEnvironment):
                 "docker_mount_cwd_to_workspace is enabled; remove the explicit "
                 "workspace mount or disable the automatic mount"
             )
+        reviewer_provenance_deadline = (
+            time.monotonic() + _REVIEW_PROVENANCE_DEADLINE_SECONDS
+            if reviewer_mode
+            else None
+        )
         if bind_host_cwd:
             assert host_cwd is not None
             if cwd_mount_mode not in {"ro", "rw"}:
@@ -2350,9 +2433,13 @@ class DockerEnvironment(BaseEnvironment):
             )
             if cwd_mount_mode == "ro":
                 if reviewer_mode:
-                    _enforce_reviewer_workspace_bounds(Path(canonical_host_cwd))
+                    _enforce_reviewer_workspace_bounds(
+                        Path(canonical_host_cwd), deadline=reviewer_provenance_deadline
+                    )
                 canonical_workspace_identity = _path_identity(
-                    canonical_host_cwd, content_digest=True
+                    canonical_host_cwd,
+                    content_digest=True,
+                    deadline=reviewer_provenance_deadline,
                 )
                 self._readonly_workspace_sources.append(
                     (canonical_host_cwd, "/workspace", canonical_workspace_identity)
@@ -2835,6 +2922,7 @@ class DockerEnvironment(BaseEnvironment):
                 expected,
                 expected_git_sha,
                 disposable=reviewer_mode,
+                provenance_deadline=reviewer_provenance_deadline,
             )
             if reviewer_mode:
                 self._snapshot_volumes.append(snapshot_volume)

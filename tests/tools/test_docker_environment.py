@@ -104,7 +104,8 @@ def _mock_subprocess_run(monkeypatch):
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
 
     def _materialize(
-        _docker, _image, _source, expected, _expected_git_sha=None, *, disposable=False
+        _docker, _image, _source, expected, _expected_git_sha=None, *,
+        disposable=False, provenance_deadline=None
     ):
         volume = f"hermes-ro-{str(expected['mounted_content_sha256'])[:24]}"
         snapshot_digests[volume] = str(expected["mounted_content_sha256"])
@@ -626,7 +627,7 @@ def test_read_only_workspace_digest_failure_is_fail_closed(monkeypatch, tmp_path
     monkeypatch.setattr(
         docker_env,
         "_readonly_tree_digest",
-        lambda _root: (_ for _ in ()).throw(OSError("unreadable")),
+        lambda _root, **_kwargs: (_ for _ in ()).throw(OSError("unreadable")),
     )
     _mock_subprocess_run(monkeypatch)
 
@@ -971,10 +972,10 @@ def test_pinned_workspace_archive_rejects_source_swap_restored_after_copy(
         capture_output=True, text=True,
     ).stdout.strip()
     expected_metadata = docker_env._readonly_tree_metadata_digest(project_dir)
-    original_copy2 = docker_env.shutil.copy2
+    original_copy_node = docker_env._copy_review_node
     swapped = False
 
-    def swap_copy_restore(source, destination, *args, **kwargs):
+    def swap_copy_restore(source, destination, deadline):
         nonlocal swapped
         if Path(source).name == "payload.txt" and not swapped:
             swapped = True
@@ -983,19 +984,30 @@ def test_pinned_workspace_archive_rejects_source_swap_restored_after_copy(
             project_dir.mkdir()
             (project_dir / "payload.txt").write_text("candidate substitution\n", encoding="utf-8")
             try:
-                return original_copy2(source, destination, *args, **kwargs)
+                return original_copy_node(source, destination, deadline)
             finally:
                 shutil.rmtree(project_dir)
                 original.rename(project_dir)
-        return original_copy2(source, destination, *args, **kwargs)
+        return original_copy_node(source, destination, deadline)
 
-    monkeypatch.setattr(docker_env.shutil, "copy2", swap_copy_restore)
+    monkeypatch.setattr(docker_env, "_copy_review_node", swap_copy_restore)
 
     with pytest.raises(ValueError, match="tracked files do not match HEAD"):
         docker_env._readonly_workspace_archive(
             project_dir, expected_metadata, assigned
         )
     assert swapped is True
+
+
+def test_reviewer_workspace_bounds_enforce_shared_provenance_deadline(tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    (project_dir / "payload.txt").write_text("candidate\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exceeded its deadline"):
+        docker_env._enforce_reviewer_workspace_bounds(
+            project_dir, deadline=docker_env.time.monotonic() - 1
+        )
 
 
 def test_trusted_git_objects_exclude_candidate_semantic_caches(tmp_path):
