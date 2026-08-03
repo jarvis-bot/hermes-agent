@@ -93,3 +93,19 @@ class TestFileToolsContainerConfig:
 
         assert captured["cwd"] == "/workspace"
         assert captured["host_cwd"] == str(ticket_cwd)
+
+    def test_exact_sha_file_first_recreation_uses_authenticated_host_source(
+        self, monkeypatch, tmp_path
+    ):
+        workspace = tmp_path / "ticket-review"
+        workspace.mkdir()
+        monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "a" * 40)
+
+        with patch("tools.terminal_tool.get_session_cwd", return_value="/tmp/review"):
+            captured = self._run(
+                _make_env_config(cwd="/workspace", host_cwd=str(workspace)),
+                "review-file-first",
+            )
+
+        assert captured["cwd"] == "/workspace"
+        assert captured["host_cwd"] == str(workspace)

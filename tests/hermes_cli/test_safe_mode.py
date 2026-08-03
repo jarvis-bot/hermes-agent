@@ -70,6 +70,30 @@ def test_plugin_discovery_skipped(monkeypatch):
     assert mgr._plugins == {}
 
 
+def test_safe_mode_skips_user_model_provider_plugins(monkeypatch, tmp_path):
+    import providers
+
+    bundled = tmp_path / "bundled"
+    user = tmp_path / "user"
+    bundled.joinpath("trusted").mkdir(parents=True)
+    user.joinpath("host-extension").mkdir(parents=True)
+    loaded = []
+    monkeypatch.setenv("HERMES_SAFE_MODE", "1")
+    monkeypatch.setattr(providers, "_discovered", False)
+    monkeypatch.setattr(providers, "_BUNDLED_PLUGINS_DIR", bundled)
+    monkeypatch.setattr(providers, "_user_plugins_dir", lambda: user)
+    monkeypatch.setattr(
+        providers,
+        "_import_plugin_dir",
+        lambda path, source: loaded.append((path.name, source)),
+    )
+
+    providers._discover_providers()
+
+    assert ("trusted", "bundled") in loaded
+    assert ("host-extension", "user") not in loaded
+
+
 
 
 

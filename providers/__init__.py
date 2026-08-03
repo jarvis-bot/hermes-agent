@@ -163,7 +163,9 @@ def _discover_providers() -> None:
     # 2. User plugins — under $HERMES_HOME/plugins/model-providers/<name>/.
     #    These can override any bundled profile of the same name (last-writer-wins
     #    in register_provider()).
-    user_dir = _user_plugins_dir()
+    from utils import env_var_enabled
+
+    user_dir = None if env_var_enabled("HERMES_SAFE_MODE") else _user_plugins_dir()
     if user_dir is not None:
         for child in sorted(user_dir.iterdir()):
             if not child.is_dir() or child.name.startswith(("_", ".")):

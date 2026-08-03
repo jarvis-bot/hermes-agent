@@ -81,6 +81,41 @@ def test_execute_code_preserves_raw_workspace_override(tmp_path):
     assert captured["host_cwd"] == str(ticket_cwd)
 
 
+def test_exact_sha_execute_first_recreation_uses_authenticated_host_source(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "ticket-review"
+    workspace.mkdir()
+    task_id = "execute-review-recreate"
+    captured = {}
+    config = {
+        "env_type": "docker",
+        "docker_image": "image",
+        "cwd": "/workspace",
+        "host_cwd": str(workspace),
+        "timeout": 30,
+        "docker_mount_cwd_to_workspace": True,
+    }
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "a" * 40)
+    with patch("tools.terminal_tool._get_env_config", return_value=config), \
+         patch("tools.terminal_tool._task_env_overrides", {}), \
+         patch("tools.terminal_tool._active_environments", {}), \
+         patch("tools.terminal_tool._creation_locks", {}), \
+         patch("tools.terminal_tool._creation_locks_lock", threading.Lock()), \
+         patch("tools.terminal_tool._create_environment", side_effect=create), \
+         patch("tools.terminal_tool._start_cleanup_thread"), \
+         patch("tools.terminal_tool.get_session_cwd", return_value="/tmp/review"):
+        code_execution_tool._get_or_create_env(task_id)
+
+    assert captured["cwd"] == "/workspace"
+    assert captured["host_cwd"] == str(workspace)
+
+
 def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None):
     """Mock dispatcher that returns canned responses for each tool."""
     if function_name == "terminal":

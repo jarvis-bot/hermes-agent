@@ -1019,9 +1019,11 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             except Exception:
                 recorded_cwd = None
             cwd = overrides.get("cwd") or recorded_cwd or config["cwd"]
-            from tools.terminal_tool import resolve_container_cwd_mount
+            from tools.terminal_tool import resolve_container_creation_cwd
 
-            cwd, host_cwd = resolve_container_cwd_mount(env_type, cwd, config)
+            cwd, host_cwd = resolve_container_creation_cwd(
+                env_type, cwd, config, overrides
+            )
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None

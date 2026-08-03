@@ -726,7 +726,7 @@ def _get_or_create_env(task_id: str):
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
         _creation_locks, _creation_locks_lock, _resolve_container_task_id,
-        get_session_cwd, resolve_container_cwd_mount, resolve_task_overrides,
+        get_session_cwd, resolve_container_creation_cwd, resolve_task_overrides,
     )
 
     effective_task_id = _resolve_container_task_id(task_id)
@@ -766,7 +766,7 @@ def _get_or_create_env(task_id: str):
 
         recorded_cwd = get_session_cwd(task_id)
         cwd = overrides.get("cwd") or recorded_cwd or config["cwd"]
-        cwd, host_cwd = resolve_container_cwd_mount(env_type, cwd, config)
+        cwd, host_cwd = resolve_container_creation_cwd(env_type, cwd, config, overrides)
 
         container_config = None
         if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:

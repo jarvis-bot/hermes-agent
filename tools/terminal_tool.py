@@ -1404,6 +1404,31 @@ def resolve_container_cwd_mount(
     return cwd, host_cwd
 
 
+def resolve_container_creation_cwd(
+    env_type: str,
+    cwd: str,
+    config: Dict[str, Any],
+    overrides: Dict[str, Any],
+) -> tuple[str, Optional[str]]:
+    """Resolve creation cwd while preserving an exact-SHA reviewer's host source.
+
+    Reviewer sessions record the container-local ``/tmp/review`` cwd. After an
+    idle cleanup, every tool entry point must rematerialize from the original
+    authenticated host workspace rather than interpreting that disposable path
+    as a host bind candidate.
+    """
+    reviewer_sha = os.environ.get("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "")
+    exact_sha_reviewer = (
+        env_type == "docker"
+        and len(reviewer_sha) == 40
+        and all(char in "0123456789abcdef" for char in reviewer_sha)
+    )
+    if exact_sha_reviewer:
+        mount_source = overrides.get("cwd") or config.get("host_cwd") or config["cwd"]
+        return resolve_container_cwd_mount(env_type, mount_source, config)
+    return resolve_container_cwd_mount(env_type, cwd, config)
+
+
 # One-shot guard for the config-fallback bridge below.  Purely an
 # optimization: after the first attempt either TERMINAL_ENV is set (bridge
 # succeeded — merged config always carries terminal.backend) or the import
@@ -2336,25 +2361,9 @@ def terminal_tool(
             image = ""
 
         cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
-        creation_cwd = cwd
-        reviewer_sha = os.environ.get("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "")
-        exact_sha_reviewer = (
-            env_type == "docker"
-            and len(reviewer_sha) == 40
-            and all(char in "0123456789abcdef" for char in reviewer_sha)
+        creation_cwd, host_cwd = resolve_container_creation_cwd(
+            env_type, cwd, config, overrides
         )
-        if exact_sha_reviewer:
-            # A reviewer records container-internal paths such as /tmp/review as
-            # its session cwd. Never reinterpret that disposable path as a new
-            # host bind source on the next call; the authenticated host source
-            # is fixed for the worker lifetime.
-            mount_source = overrides.get("cwd") or config.get("host_cwd") or config["cwd"]
-            creation_cwd, host_cwd = resolve_container_cwd_mount(
-                env_type, mount_source, config
-            )
-        else:
-            cwd, host_cwd = resolve_container_cwd_mount(env_type, cwd, config)
-            creation_cwd = cwd
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
