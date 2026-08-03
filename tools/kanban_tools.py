@@ -419,6 +419,9 @@ def _handle_show(args: dict, **kw) -> str:
         return tool_error(
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
+    own_task = os.environ.get("HERMES_KANBAN_TASK")
+    if _is_exact_sha_reviewer_worker() and tid != own_task:
+        return tool_error("exact-SHA reviewers may inspect only their assigned task")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -2065,7 +2068,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_SHOW_SCHEMA,
     handler=_handle_show,
-    check_fn=_check_kanban_extended_mode,
+    check_fn=_check_kanban_mode,
     emoji="📋",
 )
 

@@ -53,7 +53,17 @@ def test_exact_sha_reviewer_worker_gets_only_task_closure_tools(monkeypatch, tmp
     schema = registry.get_definitions(set(resolve_toolset("kanban")), quiet=True)
     names = {item["function"]["name"] for item in schema}
 
-    assert names == {"kanban_complete", "kanban_block"}
+    assert names == {"kanban_show", "kanban_complete", "kanban_block"}
+
+
+def test_exact_sha_reviewer_cannot_show_another_task(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_review")
+    monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "a" * 40)
+
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_show({"task_id": "t_other"}))
+    assert result["error"].startswith("exact-SHA reviewers may inspect only")
 
 
 # ---------------------------------------------------------------------------
