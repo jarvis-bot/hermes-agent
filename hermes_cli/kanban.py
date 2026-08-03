@@ -77,6 +77,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
+        "max_runtime_seconds": t.max_runtime_seconds,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
         "session_id": t.session_id,
