@@ -1098,7 +1098,8 @@ print(digest.hexdigest())
         try:
             populated = subprocess.run(
                 [docker_exe, "run", "--rm", "-i", "--network=none", "--cap-drop",
-                 "ALL", "-v", f"{volume}:/workspace", image, "python3", "-I", "-c", script],
+                 "ALL", "-v", f"{volume}:/workspace", "--entrypoint", "python3",
+                 image, "-I", "-c", script],
                 input=archive, capture_output=True, timeout=120, check=False,
             )
         except BaseException:
@@ -1121,7 +1122,7 @@ print(digest.hexdigest())
     try:
         verifier = subprocess.run(
             [docker_exe, "run", "-d", "--network=none", "--cap-drop", "ALL", "-v",
-             f"{volume}:/workspace:ro", image, "sleep", "120"],
+             f"{volume}:/workspace:ro", "--entrypoint", "sleep", image, "120"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=120, check=True, stdin=subprocess.DEVNULL,
         )

@@ -1063,6 +1063,47 @@ def test_materialize_reviewer_updates_expected_mounted_digest(monkeypatch, tmp_p
     assert expected["mounted_content_sha256"] == content
 
 
+def test_materialize_reviewer_overrides_image_entrypoint(monkeypatch, tmp_path):
+    """Helper containers must not execute an image-selected entrypoint."""
+    calls = []
+    content = "f" * 64
+    expected: dict[str, object] = {
+        "tree_metadata_sha256": "m",
+        "mounted_content_sha256": "original",
+    }
+    monkeypatch.setattr(
+        docker_env,
+        "_readonly_workspace_archive",
+        lambda *_args, **_kwargs: (b"archive", content),
+    )
+    monkeypatch.setattr(docker_env, "_container_tree_digest", lambda *_args: content)
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[1:3] == ["volume", "inspect"]:
+            return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
+        if command[1:3] == ["run", "--rm"]:
+            return subprocess.CompletedProcess(
+                command, 0, stdout=(content + "\n").encode(), stderr=b""
+            )
+        if command[1:3] == ["run", "-d"]:
+            return subprocess.CompletedProcess(command, 0, stdout="verifier\n", stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+
+    docker_env._materialize_readonly_workspace(
+        "docker", "entrypoint-image", str(tmp_path), expected, "1" * 40, disposable=True
+    )
+
+    populate = next(command for command in calls if command[1:3] == ["run", "--rm"])
+    verifier = next(command for command in calls if command[1:3] == ["run", "-d"])
+    assert populate[populate.index("--entrypoint") + 1] == "python3"
+    assert populate[populate.index("entrypoint-image") + 1 :][:2] == ["-I", "-c"]
+    assert verifier[verifier.index("--entrypoint") + 1] == "sleep"
+    assert verifier[verifier.index("entrypoint-image") + 1 :] == ["120"]
+
+
 def test_materialize_reviewer_volume_is_removed_when_verifier_start_fails(
     monkeypatch, tmp_path
 ):
