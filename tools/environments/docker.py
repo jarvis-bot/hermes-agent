@@ -936,6 +936,9 @@ def _verify_git_workspace_provenance_in_staging(
     object_check = run(["cat-file", "-e", f"{commit}^{{commit}}"])
     if object_check.returncode != 0:
         raise ValueError("reviewer workspace HEAD commit object is missing or invalid")
+    connectivity = run(["fsck", "--strict", "--connectivity-only", commit])
+    if connectivity.returncode != 0:
+        raise ValueError("reviewer workspace Git history is incomplete or invalid")
     tree = run(["ls-tree", "-r", "-z", "--full-tree", commit])
     if tree.returncode != 0:
         raise ValueError("reviewer workspace commit tree cannot be authenticated")

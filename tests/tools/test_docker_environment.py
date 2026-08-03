@@ -844,6 +844,37 @@ def test_git_workspace_provenance_rejects_candidate_history_metadata(
         docker_env._verify_git_workspace_provenance(project_dir, assigned)
 
 
+def test_git_workspace_provenance_rejects_incomplete_ancestry(tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"],
+        cwd=project_dir, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    payload = project_dir / "payload.txt"
+    payload.write_text("parent\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "parent"], cwd=project_dir, check=True)
+    parent = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    payload.write_text("assigned\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "assigned"], cwd=project_dir, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    (project_dir / ".git" / "objects" / parent[:2] / parent[2:]).unlink()
+
+    with pytest.raises(ValueError, match="history is incomplete or invalid"):
+        docker_env._verify_git_workspace_provenance(project_dir, assigned)
+
+
 def test_git_workspace_provenance_requires_out_of_band_assigned_sha(tmp_path):
     project_dir = tmp_path / "review-target"
     project_dir.mkdir()
