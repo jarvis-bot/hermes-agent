@@ -3545,6 +3545,14 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if initial_status == "blocked":
+                    # An explicit initial block is an operator decision, not a
+                    # transient circuit-breaker state. Record the same sticky
+                    # event used by block_task so recompute_ready cannot
+                    # silently dispatch it before an operator releases it.
+                    _append_event(
+                        conn, task_id, "blocked", {"reason": "initial-status"}
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:

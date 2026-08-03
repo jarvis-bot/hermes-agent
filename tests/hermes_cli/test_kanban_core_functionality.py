@@ -59,8 +59,10 @@ def kanban_home(tmp_path, monkeypatch):
 def test_complete_promotes_all_dependents_in_same_transaction(kanban_home):
     with kb.connect_closing() as conn:
         gate = kb.create_task(
-            conn, title="host gate", assignee=None, initial_status="running"
+            conn, title="host gate", assignee=None, initial_status="blocked"
         )
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, gate).status == "blocked"
         children = [
             kb.create_task(
                 conn, title=f"review {index}", assignee=f"reviewer-{index}",
