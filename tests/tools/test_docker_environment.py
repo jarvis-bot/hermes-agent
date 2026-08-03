@@ -1022,7 +1022,7 @@ def test_tree_authentication_rejects_regular_file_swapped_to_fifo(
 
     def swap_before_open(path, flags, *args, **kwargs):
         nonlocal swapped
-        if Path(path) == payload and not swapped:
+        if Path(path).name == payload.name and kwargs.get("dir_fd") is not None and not swapped:
             swapped = True
             payload.unlink()
             docker_env.os.mkfifo(payload)
@@ -1048,7 +1048,7 @@ def test_git_head_authentication_rejects_regular_file_swapped_to_fifo(
 
     def swap_before_open(path, flags, *args, **kwargs):
         nonlocal swapped
-        if Path(path) == head and not swapped:
+        if Path(path).name == head.name and kwargs.get("dir_fd") is not None and not swapped:
             swapped = True
             head.unlink()
             docker_env.os.mkfifo(head)
@@ -1226,7 +1226,7 @@ def test_materialize_reviewer_updates_expected_mounted_digest(monkeypatch, tmp_p
         calls.append(command)
         if command[1:3] == ["volume", "inspect"]:
             return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
-        if command[1:3] == ["run", "--rm"]:
+        if command[1] == "run" and "--rm" in command and "-i" in command:
             return subprocess.CompletedProcess(command, 0, stdout=(content + "\n").encode(), stderr=b"")
         if command[1] == "run" and "--name" in command and "-d" in command:
             return subprocess.CompletedProcess(command, 0, stdout="verifier\n", stderr="")
@@ -1260,7 +1260,7 @@ def test_materialize_reviewer_overrides_image_entrypoint(monkeypatch, tmp_path):
         calls.append(command)
         if command[1:3] == ["volume", "inspect"]:
             return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
-        if command[1:3] == ["run", "--rm"]:
+        if command[1] == "run" and "--rm" in command and "-i" in command:
             return subprocess.CompletedProcess(
                 command, 0, stdout=(content + "\n").encode(), stderr=b""
             )
@@ -1274,7 +1274,11 @@ def test_materialize_reviewer_overrides_image_entrypoint(monkeypatch, tmp_path):
         "docker", "entrypoint-image", str(tmp_path), expected, "1" * 40, disposable=True
     )
 
-    populate = next(command for command in calls if command[1:3] == ["run", "--rm"])
+    populate = next(
+        command
+        for command in calls
+        if command[1] == "run" and "--rm" in command and "-i" in command
+    )
     verifier = next(
         command
         for command in calls
@@ -1303,7 +1307,7 @@ def test_materialize_reviewer_volume_is_removed_when_verifier_start_fails(
             return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
         if command[1:3] == ["volume", "create"]:
             return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
-        if command[1:3] == ["run", "--rm"]:
+        if command[1] == "run" and "--rm" in command and "-i" in command:
             return subprocess.CompletedProcess(command, 0, stdout=("f" * 64 + "\n").encode(), stderr=b"")
         if command[1] == "run" and "--name" in command and "-d" in command:
             raise subprocess.TimeoutExpired(command, 120)

@@ -60,7 +60,9 @@ _RESOURCE_LIMITED_GIT_EXEC = r'''
 import os, resource, sys
 for name, requested in (
     ("RLIMIT_AS", 1536 * 1024 * 1024),
-    ("RLIMIT_FSIZE", 5 * 1024 * 1024 * 1024),
+    # stdout is redirected to a regular temporary file and index/read-tree
+    # outputs are regular files too, so this is also a live output ceiling.
+    ("RLIMIT_FSIZE", 64 * 1024 * 1024),
     ("RLIMIT_CPU", 150),
     ("RLIMIT_NOFILE", 128),
 ):
@@ -127,6 +129,35 @@ def _run_resource_limited_git(
 def _check_review_deadline(deadline: Optional[float]) -> None:
     if deadline is not None and time.monotonic() >= deadline:
         raise ValueError("Git reviewer workspace authentication exceeded its deadline")
+
+
+def _open_nofollow_path(path: Path, flags: int) -> int:
+    """Open every absolute path component through anchored no-follow dirfds."""
+    if os.name != "posix":
+        raise ValueError("reviewer path authentication requires POSIX dirfd support")
+    absolute = Path(os.path.abspath(path))
+    parts = absolute.parts[1:]
+    if not parts:
+        raise ValueError("reviewer file path is invalid")
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open("/", directory_flags)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, directory_flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        final_flags = flags | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        result = os.open(parts[-1], final_flags, dir_fd=descriptor)
+        os.close(descriptor)
+        return result
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -254,7 +285,7 @@ def _readonly_tree_digest(
                 | getattr(os, "O_NOFOLLOW", 0)
                 | getattr(os, "O_NONBLOCK", 0)
             )
-            descriptor = os.open(path, flags)
+            descriptor = _open_nofollow_path(path, flags)
             try:
                 opened = os.fstat(descriptor)
                 if (
@@ -694,7 +725,7 @@ def _copy_review_node(
     if not stat.S_ISREG(mode):
         raise ValueError(f"unsupported filesystem node in read-only workspace: {source}")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    descriptor = os.open(source, flags)
+    descriptor = _open_nofollow_path(source, flags)
     try:
         opened = os.fstat(descriptor)
         if (
@@ -721,7 +752,7 @@ def _read_bounded_regular_file(
     if not stat.S_ISREG(before.st_mode) or before.st_size > maximum_bytes:
         raise ValueError("reviewer workspace file exceeds its authentication size limit")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    descriptor = os.open(path, flags)
+    descriptor = _open_nofollow_path(path, flags)
     try:
         opened = os.fstat(descriptor)
         if (
@@ -901,7 +932,7 @@ def _readonly_workspace_archive(
                             | getattr(os, "O_NOFOLLOW", 0)
                             | getattr(os, "O_NONBLOCK", 0)
                         )
-                        descriptor = os.open(path, flags)
+                        descriptor = _open_nofollow_path(path, flags)
                         try:
                             opened = os.fstat(descriptor)
                             if (
@@ -1091,28 +1122,22 @@ def _copy_trusted_git_objects(
         git_exe = shutil.which("git")
         if git_exe is None:
             raise ValueError("git is required to authenticate a Git reviewer workspace")
-        result = subprocess.run(
-            _resource_limited_git_command(
-                git_exe, ["index-pack", "--strict", str(copied_pack)]
-            ),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+        result = _run_resource_limited_git(
+            git_exe,
+            ["index-pack", "--strict", str(copied_pack)],
+            capture=True,
+            maximum_output=128,
             timeout=(
                 120
                 if deadline is None
                 else max(0.1, min(120.0, deadline - time.monotonic()))
             ),
-            check=False,
-            stdin=subprocess.DEVNULL,
             env=safe_env,
         )
         generated_index = copied_pack.with_suffix(".idx")
         if (
             result.returncode != 0
-            or result.stdout.strip() != expected_checksum
+            or result.stdout.decode("ascii", errors="replace").strip() != expected_checksum
             or not generated_index.is_file()
             or generated_index.is_symlink()
         ):
@@ -1277,7 +1302,7 @@ def _verify_git_workspace_provenance_in_staging(
                     | getattr(os, "O_NOFOLLOW", 0)
                     | getattr(os, "O_NONBLOCK", 0)
                 )
-                descriptor = os.open(candidate, flags)
+                descriptor = _open_nofollow_path(candidate, flags)
                 try:
                     opened = os.fstat(descriptor)
                     if (
@@ -1441,14 +1466,20 @@ for path in [root, *sorted(root.rglob('*'))]:
     digest.update(b'\0')
 print(digest.hexdigest())
 '''
+        populate_name = f"{volume}-populate"
         try:
             populated = subprocess.run(
-                [docker_exe, "run", "--rm", "-i", "--network=none", "--cap-drop",
+                [docker_exe, "run", "--name", populate_name, "--rm", "-i",
+                 "--network=none", "--cap-drop",
                  "ALL", "-v", f"{volume}:/workspace", "--entrypoint", "python3",
                  image, "-I", "-c", script],
                 stdin=archive, capture_output=True, timeout=120, check=False,
             )
         except BaseException:
+            subprocess.run(
+                [docker_exe, "rm", "-f", "-v", populate_name], capture_output=True,
+                timeout=30, check=False, stdin=subprocess.DEVNULL,
+            )
             if created_volume:
                 subprocess.run(
                     [docker_exe, "volume", "rm", "-f", volume], capture_output=True,
