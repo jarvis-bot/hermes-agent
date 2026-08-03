@@ -1,7 +1,8 @@
 import logging
-from io import StringIO
+from io import BytesIO, StringIO
 import os
 import subprocess
+import tarfile
 
 import pytest
 
@@ -747,6 +748,79 @@ def test_git_workspace_provenance_requires_out_of_band_assigned_sha(tmp_path):
 
     with pytest.raises(ValueError, match="assigned SHA"):
         docker_env._verify_git_workspace_provenance(project_dir, "1" * 40)
+
+
+def test_pinned_workspace_archive_rebuilds_trusted_git_metadata(tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "review-branch"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"], cwd=project_dir, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    payload = project_dir / "payload.txt"
+    payload.write_text("assigned\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=project_dir, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "config", "diff.hostile.external", "/bin/true"],
+        cwd=project_dir,
+        check=True,
+    )
+    (project_dir / ".git" / "hooks" / "status").write_text(
+        "#!/bin/sh\nexit 99\n", encoding="utf-8"
+    )
+
+    archive, _digest = docker_env._readonly_workspace_archive(
+        project_dir,
+        docker_env._readonly_tree_metadata_digest(project_dir),
+        assigned,
+    )
+    extracted = tmp_path / "extracted"
+    extracted.mkdir()
+    with tarfile.open(fileobj=BytesIO(archive), mode="r:") as handle:
+        handle.extractall(extracted, filter="data")
+
+    config = (extracted / ".git" / "config").read_text(encoding="utf-8")
+    assert "hostile" not in config
+    assert not (extracted / ".git" / "hooks").exists()
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=extracted, check=True,
+        capture_output=True, text=True,
+    ).stdout == ""
+    assert subprocess.run(
+        ["git", "symbolic-ref", "--short", "HEAD"], cwd=extracted, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip() == "review-branch"
+
+
+def test_git_workspace_provenance_rejects_untracked_empty_directory(tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"], cwd=project_dir, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    (project_dir / "payload.txt").write_text("assigned\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=project_dir, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    (project_dir / "untracked-empty-dir").mkdir()
+
+    with pytest.raises(ValueError, match="untracked directories"):
+        docker_env._verify_git_workspace_provenance(project_dir, assigned)
 
 
 def test_assigned_sha_requires_git_metadata(tmp_path):

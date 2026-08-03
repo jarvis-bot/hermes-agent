@@ -544,33 +544,106 @@ def _extra_args_have_host_security_file(extra_args: list[str]) -> bool:
 
 def _readonly_workspace_archive(
     root: Path, expected_metadata: str, expected_git_sha: Optional[str] = None
-) -> bytes:
+) -> tuple[bytes, str]:
     """Create a stable regular/dir/symlink-only archive of an authenticated tree."""
     _verify_git_workspace_provenance(root, expected_git_sha)
     if _readonly_tree_metadata_digest(root) != expected_metadata:
         raise ValueError(f"read-only workspace changed before materialization: {root}")
     if not root.is_dir():
         raise ValueError("authenticated read-only workspace root must be a directory")
-    with tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as archive_file:
-        with tarfile.open(fileobj=archive_file, mode="w") as archive:
-            for path in sorted(root.rglob("*")):
-                mode = path.lstat().st_mode
-                if not any(check(mode) for check in (stat.S_ISREG, stat.S_ISDIR, stat.S_ISLNK)):
-                    raise ValueError(
-                        f"unsupported filesystem node in read-only workspace: {path}"
+    archive_root = root
+    staging: Optional[tempfile.TemporaryDirectory[str]] = None
+    if expected_git_sha is not None:
+        # Candidate-owned Git configuration, hooks, refs and index must never be
+        # exposed to reviewers.  They can execute code (for example fsmonitor)
+        # or change the meaning of an otherwise authenticated diff.  Preserve
+        # Git functionality with a minimal metadata directory built solely from
+        # the authenticated commit and its content-addressed object database.
+        staging = tempfile.TemporaryDirectory(prefix="hermes-review-workspace-")
+        archive_root = Path(staging.name)
+        for child in root.iterdir():
+            if child.name == ".git":
+                continue
+            destination = archive_root / child.name
+            if child.is_dir() and not child.is_symlink():
+                shutil.copytree(child, destination, symlinks=True)
+            elif child.is_symlink():
+                destination.symlink_to(os.readlink(child))
+            else:
+                shutil.copy2(child, destination, follow_symlinks=False)
+        source_git = root / ".git"
+        trusted_git = archive_root / ".git"
+        trusted_git.mkdir(mode=0o755)
+        shutil.copytree(source_git / "objects", trusted_git / "objects", symlinks=False)
+        head_text, commit = _git_commit_identity(source_git)
+        (trusted_git / "HEAD").write_text(f"{head_text}\n", encoding="utf-8")
+        (trusted_git / "config").write_text(
+            "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n"
+            "\tbare = false\n\tlogallrefupdates = true\n",
+            encoding="utf-8",
+        )
+        if head_text.startswith("ref:"):
+            ref_name = head_text[4:].strip()
+            if (
+                not re.fullmatch(r"refs/heads/[A-Za-z0-9._/-]+", ref_name)
+                or any(part in {"", ".", ".."} for part in Path(ref_name).parts)
+            ):
+                raise ValueError("reviewer workspace HEAD branch is unsafe")
+            ref_path = trusted_git / ref_name
+            ref_path.parent.mkdir(parents=True, exist_ok=True)
+            ref_path.write_text(f"{commit}\n", encoding="ascii")
+        git_exe = shutil.which("git")
+        if git_exe is None:
+            raise ValueError("git is required to build trusted reviewer metadata")
+        index = subprocess.run(
+            [
+                git_exe,
+                "-c", "core.fsmonitor=false",
+                "-c", "core.hooksPath=/dev/null",
+                f"--git-dir={trusted_git}",
+                f"--work-tree={archive_root}",
+                "read-tree", commit,
+            ],
+            capture_output=True,
+            timeout=30,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env={
+                "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                "LANG": "C",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_NO_REPLACE_OBJECTS": "1",
+            },
+        )
+        if index.returncode != 0:
+            raise ValueError("trusted reviewer Git index could not be materialized")
+
+    try:
+        mounted_digest = _authenticated_tree_digests(archive_root)[1]
+        with tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as archive_file:
+            with tarfile.open(fileobj=archive_file, mode="w") as archive:
+                for path in sorted(archive_root.rglob("*")):
+                    mode = path.lstat().st_mode
+                    if not any(check(mode) for check in (stat.S_ISREG, stat.S_ISDIR, stat.S_ISLNK)):
+                        raise ValueError(
+                            f"unsupported filesystem node in read-only workspace: {path}"
+                        )
+                    info = archive.gettarinfo(
+                        str(path), arcname=path.relative_to(archive_root).as_posix()
                     )
-                info = archive.gettarinfo(
-                    str(path), arcname=path.relative_to(root).as_posix()
-                )
-                if stat.S_ISREG(mode):
-                    with path.open("rb") as handle:
-                        archive.addfile(info, handle)
-                else:
-                    archive.addfile(info)
-        if _readonly_tree_metadata_digest(root) != expected_metadata:
-            raise ValueError(f"read-only workspace changed during materialization: {root}")
-        archive_file.seek(0)
-        return archive_file.read()
+                    if stat.S_ISREG(mode):
+                        with path.open("rb") as handle:
+                            archive.addfile(info, handle)
+                    else:
+                        archive.addfile(info)
+            if _readonly_tree_metadata_digest(root) != expected_metadata:
+                raise ValueError(f"read-only workspace changed during materialization: {root}")
+            archive_file.seek(0)
+            return archive_file.read(), mounted_digest
+    finally:
+        if staging is not None:
+            staging.cleanup()
 
 
 def _verify_git_workspace_provenance(
@@ -675,6 +748,7 @@ def _verify_git_workspace_provenance(
     # Do not consult the candidate-controlled index for untracked detection.
     # Compare the filesystem leaves directly to the authenticated commit tree.
     actual_paths: set[str] = set()
+    actual_directories: set[str] = set()
     for top_level in root.iterdir():
         if top_level.name == ".git":
             continue
@@ -682,10 +756,20 @@ def _verify_git_workspace_provenance(
         if top_level.is_dir() and not top_level.is_symlink():
             candidates.extend(top_level.rglob("*"))
         for candidate in candidates:
-            if not candidate.is_dir() or candidate.is_symlink():
+            if candidate.is_dir() and not candidate.is_symlink():
+                actual_directories.add(candidate.relative_to(root).as_posix())
+            else:
                 actual_paths.add(candidate.relative_to(root).as_posix())
     if actual_paths != expected_paths:
         raise ValueError("reviewer workspace contains missing or untracked files")
+    expected_directories = {
+        parent.as_posix()
+        for relative in expected_paths
+        for parent in Path(relative).parents
+        if parent != Path(".")
+    }
+    if actual_directories != expected_directories:
+        raise ValueError("reviewer workspace contains untracked directories")
 
     # Replacement refs alter ordinary reviewer Git commands even though the
     # authentication commands above disable them. Never preserve that
@@ -715,11 +799,10 @@ def _materialize_readonly_workspace(
     expected_git_sha: Optional[str] = None,
 ) -> str:
     """Materialize authenticated bytes in a daemon-owned, content-named volume."""
-    content = str(expected["mounted_content_sha256"])
-    volume = f"hermes-ro-{content[:24]}"
-    archive = _readonly_workspace_archive(
+    archive, content = _readonly_workspace_archive(
         Path(source), str(expected["tree_metadata_sha256"]), expected_git_sha
     )
+    volume = f"hermes-ro-{content[:24]}"
     inspect = subprocess.run(
         [docker_exe, "volume", "inspect", volume],
         capture_output=True, timeout=30, check=False, stdin=subprocess.DEVNULL,
