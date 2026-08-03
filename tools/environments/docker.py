@@ -640,6 +640,13 @@ def _readonly_workspace_archive(
             raise ValueError(f"trusted reviewer Git index could not be materialized: {detail}")
         (trusted_git / "HEAD").write_text(f"{commit}\n", encoding="ascii")
         trusted_ref.unlink()
+        # Authenticate the actual staged bytes against the assigned commit too.
+        # Source metadata checks detect swap/restore attacks today, but this
+        # independent proof keeps the final snapshot fail-closed even if a host
+        # filesystem does not report an intermediate rename in inode metadata.
+        _verify_git_workspace_provenance(
+            archive_root, expected_git_sha, deadline=provenance_deadline
+        )
 
     try:
         mounted_digest = _authenticated_tree_digests(archive_root)[1]

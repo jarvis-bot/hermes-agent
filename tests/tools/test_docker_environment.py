@@ -1,6 +1,8 @@
 import logging
 from io import BytesIO, StringIO
 import os
+from pathlib import Path
+import shutil
 import subprocess
 import tarfile
 
@@ -945,6 +947,55 @@ def test_pinned_workspace_archive_rebuilds_trusted_git_metadata(tmp_path):
         ["git", "symbolic-ref", "--quiet", "HEAD"], cwd=extracted,
         capture_output=True, text=True,
     ).returncode == 1
+
+
+def test_pinned_workspace_archive_rejects_source_swap_restored_after_copy(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"],
+        cwd=project_dir, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    payload = project_dir / "payload.txt"
+    payload.write_text("assigned\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=project_dir, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    expected_metadata = docker_env._readonly_tree_metadata_digest(project_dir)
+    original_copy2 = docker_env.shutil.copy2
+    swapped = False
+
+    def swap_copy_restore(source, destination, *args, **kwargs):
+        nonlocal swapped
+        if Path(source).name == "payload.txt" and not swapped:
+            swapped = True
+            original = project_dir.with_name("review-target-authenticated")
+            project_dir.rename(original)
+            project_dir.mkdir()
+            (project_dir / "payload.txt").write_text("candidate substitution\n", encoding="utf-8")
+            try:
+                return original_copy2(source, destination, *args, **kwargs)
+            finally:
+                shutil.rmtree(project_dir)
+                original.rename(project_dir)
+        return original_copy2(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(docker_env.shutil, "copy2", swap_copy_restore)
+
+    with pytest.raises(ValueError, match="tracked files do not match HEAD"):
+        docker_env._readonly_workspace_archive(
+            project_dir, expected_metadata, assigned
+        )
+    assert swapped is True
 
 
 def test_trusted_git_objects_exclude_candidate_semantic_caches(tmp_path):
