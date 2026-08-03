@@ -1009,12 +1009,71 @@ def test_git_workspace_provenance_rejects_untracked_empty_directory(tmp_path):
         docker_env._verify_git_workspace_provenance(project_dir, assigned)
 
 
+def test_materialize_reviewer_volume_is_removed_when_verifier_start_fails(
+    monkeypatch, tmp_path
+):
+    calls = []
+
+    monkeypatch.setattr(
+        docker_env,
+        "_readonly_workspace_archive",
+        lambda *_args, **_kwargs: (b"archive", "f" * 64),
+    )
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[1:3] == ["volume", "inspect"]:
+            return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
+        if command[1:3] == ["volume", "create"]:
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+        if command[1:3] == ["run", "--rm"]:
+            return subprocess.CompletedProcess(command, 0, stdout=("f" * 64 + "\n").encode(), stderr=b"")
+        if command[1:3] == ["run", "-d"]:
+            raise subprocess.TimeoutExpired(command, 120)
+        if command[1:4] == ["volume", "rm", "-f"]:
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        docker_env._materialize_readonly_workspace(
+            "docker", "image", str(tmp_path), {"tree_metadata_sha256": "m"},
+            "1" * 40, disposable=True,
+        )
+
+    assert any(command[1:4] == ["volume", "rm", "-f"] for command in calls)
+
+
 def test_assigned_sha_requires_git_metadata(tmp_path):
     project_dir = tmp_path / "not-a-repository"
     project_dir.mkdir()
 
     with pytest.raises(ValueError, match="missing Git metadata"):
         docker_env._verify_git_workspace_provenance(project_dir, "1" * 40)
+
+
+def test_loose_git_object_rejects_oversized_expansion(monkeypatch, tmp_path):
+    import hashlib
+    import zlib
+
+    canonical = b"blob 32\0" + b"x" * 32
+    object_id = hashlib.sha1(canonical).hexdigest()
+    loose = tmp_path / object_id
+    loose.write_bytes(zlib.compress(canonical))
+    monkeypatch.setattr(docker_env, "_MAX_REVIEW_GIT_OBJECT_BYTES", 16)
+
+    with pytest.raises(ValueError, match="exceeds reviewer size limit"):
+        docker_env._validated_loose_git_object_bytes(loose, object_id)
+
+
+def test_reviewer_workspace_rejects_too_many_nodes(monkeypatch, tmp_path):
+    (tmp_path / "one").write_text("1", encoding="utf-8")
+    (tmp_path / "two").write_text("2", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "_MAX_REVIEW_WORKSPACE_NODES", 1)
+
+    with pytest.raises(ValueError, match="node limit"):
+        docker_env._enforce_reviewer_workspace_bounds(tmp_path)
 
 
 @pytest.mark.parametrize(

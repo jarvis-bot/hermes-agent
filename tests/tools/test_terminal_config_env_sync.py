@@ -374,6 +374,15 @@ def test_assigned_workspace_sha_reaches_docker_constructor(monkeypatch):
     assert captured["expected_git_sha"] == assigned_sha
 
 
+def test_assigned_workspace_sha_rejects_non_docker_backend(monkeypatch):
+    from tools import terminal_tool
+
+    monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "a" * 40)
+
+    with pytest.raises(ValueError, match="requires the docker terminal backend"):
+        terminal_tool._create_environment("local", "", "/workspace", 60)
+
+
 def test_mini_swe_docker_factory_uses_configured_tmp_storage(monkeypatch):
     import mini_swe_runner
 

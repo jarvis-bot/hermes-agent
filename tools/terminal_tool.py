@@ -1642,6 +1642,10 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     docker_extra_args = cc.get("docker_extra_args", [])
     docker_network = cc.get("docker_network", True)
 
+    expected_workspace_sha = _expected_kanban_workspace_sha()
+    if expected_workspace_sha is not None and env_type != "docker":
+        raise ValueError("an assigned Kanban workspace SHA requires the docker terminal backend")
+
     if env_type == "local":
         return _LocalEnvironment(cwd=cwd, timeout=timeout)
     
@@ -1669,7 +1673,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             network=docker_network,
             extra_args=docker_extra_args,
             tmp_storage=cc.get("docker_tmp_storage", "tmpfs"),
-            expected_git_sha=_expected_kanban_workspace_sha(),
+            expected_git_sha=expected_workspace_sha,
             persist_across_processes=cc.get("docker_persist_across_processes", True),
         )
     

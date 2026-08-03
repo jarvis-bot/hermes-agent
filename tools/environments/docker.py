@@ -16,6 +16,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import time
 import zlib
 
 import sys
@@ -47,6 +48,10 @@ _EGRESS_LABEL_KEY = "hermes-egress"
 _WORKSPACE_LABEL_KEY = "hermes-workspace"
 _TMP_STORAGE_LABEL_KEY = "hermes-tmp-storage"
 _POLICY_LABEL_KEY = "hermes-policy"
+_MAX_REVIEW_WORKSPACE_NODES = 100_000
+_MAX_REVIEW_WORKSPACE_BYTES = 1024 * 1024 * 1024
+_MAX_REVIEW_GIT_OBJECT_BYTES = 512 * 1024 * 1024
+_REVIEW_PROVENANCE_DEADLINE_SECONDS = 180.0
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -552,6 +557,7 @@ def _readonly_workspace_archive(
     # provenance contract is required only for reviewer workspaces carrying an
     # out-of-band assigned SHA.
     if expected_git_sha is not None:
+        _enforce_reviewer_workspace_bounds(root)
         _verify_git_workspace_provenance(root, expected_git_sha)
     if _readonly_tree_metadata_digest(root) != expected_metadata:
         raise ValueError(f"read-only workspace changed before materialization: {root}")
@@ -653,12 +659,30 @@ def _readonly_workspace_archive(
             staging.cleanup()
 
 
+def _enforce_reviewer_workspace_bounds(root: Path) -> None:
+    """Bound candidate-controlled host work before reviewer isolation exists."""
+    nodes = 0
+    total_bytes = 0
+    for path in root.rglob("*"):
+        nodes += 1
+        if nodes > _MAX_REVIEW_WORKSPACE_NODES:
+            raise ValueError("reviewer workspace exceeds reviewer node limit")
+        stat_result = path.lstat()
+        if stat.S_ISREG(stat_result.st_mode):
+            total_bytes += stat_result.st_size
+            if total_bytes > _MAX_REVIEW_WORKSPACE_BYTES:
+                raise ValueError("reviewer workspace exceeds reviewer byte limit")
+
+
 def _validated_loose_git_object_bytes(path: Path, expected_id: str) -> bytes:
     """Read a loose SHA-1 Git object and authenticate its content address."""
     try:
         compressed = path.read_bytes()
         inflater = zlib.decompressobj()
-        canonical = inflater.decompress(compressed) + inflater.flush()
+        canonical = inflater.decompress(compressed, _MAX_REVIEW_GIT_OBJECT_BYTES + 1)
+        if len(canonical) > _MAX_REVIEW_GIT_OBJECT_BYTES or inflater.unconsumed_tail:
+            raise ValueError("reviewer workspace loose Git object exceeds reviewer size limit")
+        canonical += inflater.flush()
     except (OSError, zlib.error) as exc:
         raise ValueError(
             "reviewer workspace loose Git object failed independent validation"
@@ -829,10 +853,18 @@ def _verify_git_workspace_provenance(
         "GIT_NO_LAZY_FETCH": "1",
     }
 
+    deadline = time.monotonic() + _REVIEW_PROVENANCE_DEADLINE_SECONDS
+
+    def check_deadline() -> None:
+        if time.monotonic() >= deadline:
+            raise ValueError("Git reviewer workspace authentication exceeded its deadline")
+
     def run(args: list[str]) -> subprocess.CompletedProcess[bytes]:
+        check_deadline()
         try:
             return subprocess.run(
-                [*base, *args], capture_output=True, timeout=30, check=False,
+                [*base, *args], capture_output=True,
+                timeout=max(0.1, min(30.0, deadline - time.monotonic())), check=False,
                 stdin=subprocess.DEVNULL, env=safe_env,
             )
         except (OSError, subprocess.SubprocessError) as exc:
@@ -846,6 +878,7 @@ def _verify_git_workspace_provenance(
         raise ValueError("reviewer workspace commit tree cannot be authenticated")
     expected_paths: set[str] = set()
     for record in tree.stdout.split(b"\0"):
+        check_deadline()
         if not record:
             continue
         metadata, separator, raw_path = record.partition(b"\t")
@@ -891,6 +924,7 @@ def _verify_git_workspace_provenance(
     actual_paths: set[str] = set()
     actual_directories: set[str] = set()
     for top_level in root.iterdir():
+        check_deadline()
         if top_level.name == ".git":
             continue
         candidates = [top_level]
@@ -954,6 +988,7 @@ def _materialize_readonly_workspace(
         if disposable
         else f"hermes-ro-{content[:24]}"
     )
+    created_volume = False
     inspect = subprocess.run(
         [docker_exe, "volume", "inspect", volume],
         capture_output=True, timeout=30, check=False, stdin=subprocess.DEVNULL,
@@ -963,6 +998,7 @@ def _materialize_readonly_workspace(
             [docker_exe, "volume", "create", "--label", "hermes-agent=1", volume],
             capture_output=True, timeout=30, check=True, stdin=subprocess.DEVNULL,
         )
+        created_volume = True
         script = r'''
 import hashlib, os, pathlib, shutil, stat, sys, tarfile
 root = pathlib.Path('/workspace')
@@ -992,11 +1028,19 @@ for path in [root, *sorted(root.rglob('*'))]:
     digest.update(b'\0')
 print(digest.hexdigest())
 '''
-        populated = subprocess.run(
-            [docker_exe, "run", "--rm", "-i", "--network=none", "--cap-drop",
-             "ALL", "-v", f"{volume}:/workspace", image, "python3", "-I", "-c", script],
-            input=archive, capture_output=True, timeout=120, check=False,
-        )
+        try:
+            populated = subprocess.run(
+                [docker_exe, "run", "--rm", "-i", "--network=none", "--cap-drop",
+                 "ALL", "-v", f"{volume}:/workspace", image, "python3", "-I", "-c", script],
+                input=archive, capture_output=True, timeout=120, check=False,
+            )
+        except BaseException:
+            if created_volume:
+                subprocess.run(
+                    [docker_exe, "volume", "rm", "-f", volume], capture_output=True,
+                    timeout=30, check=False, stdin=subprocess.DEVNULL,
+                )
+            raise
         output = populated.stdout.decode("utf-8", errors="replace").strip()
         if populated.returncode != 0 or output != content:
             subprocess.run(
@@ -1007,24 +1051,32 @@ print(digest.hexdigest())
             raise RuntimeError(
                 f"materialized read-only workspace failed authentication: {detail}"
             )
-    verifier = subprocess.run(
-        [docker_exe, "run", "-d", "--network=none", "--cap-drop", "ALL", "-v",
-         f"{volume}:/workspace:ro", image, "sleep", "120"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=120, check=True, stdin=subprocess.DEVNULL,
-    )
-    verifier_id = verifier.stdout.strip()
     try:
-        if _container_tree_digest(docker_exe, verifier_id, "/workspace") != content:
-            raise RuntimeError(
-                "materialized read-only workspace failed digest authentication"
-            )
-    finally:
-        subprocess.run(
-            [docker_exe, "rm", "-f", "-v", verifier_id], capture_output=True,
-            timeout=30, check=False, stdin=subprocess.DEVNULL,
+        verifier = subprocess.run(
+            [docker_exe, "run", "-d", "--network=none", "--cap-drop", "ALL", "-v",
+             f"{volume}:/workspace:ro", image, "sleep", "120"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=120, check=True, stdin=subprocess.DEVNULL,
         )
-    return volume
+        verifier_id = verifier.stdout.strip()
+        try:
+            if _container_tree_digest(docker_exe, verifier_id, "/workspace") != content:
+                raise RuntimeError(
+                    "materialized read-only workspace failed digest authentication"
+                )
+        finally:
+            subprocess.run(
+                [docker_exe, "rm", "-f", "-v", verifier_id], capture_output=True,
+                timeout=30, check=False, stdin=subprocess.DEVNULL,
+            )
+        return volume
+    except BaseException:
+        if created_volume:
+            subprocess.run(
+                [docker_exe, "volume", "rm", "-f", volume], capture_output=True,
+                timeout=30, check=False, stdin=subprocess.DEVNULL,
+            )
+        raise
 
 
 def _resolve_image_identity(docker_exe: str, image: str) -> str:
@@ -2893,8 +2945,9 @@ class DockerEnvironment(BaseEnvironment):
         policy_error = self._effective_policy_violation(self._container_id)
         if policy_error:
             container_id = self._container_id
-            self._remove_rejected_container(container_id)
-            self._container_id = None
+            assert container_id is not None
+            if self._remove_rejected_container(container_id):
+                self._container_id = None
             raise RuntimeError(policy_error)
 
         if reviewer_mode:
