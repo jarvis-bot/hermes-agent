@@ -546,7 +546,12 @@ def _readonly_workspace_archive(
     root: Path, expected_metadata: str, expected_git_sha: Optional[str] = None
 ) -> tuple[bytes, str]:
     """Create a stable regular/dir/symlink-only archive of an authenticated tree."""
-    _verify_git_workspace_provenance(root, expected_git_sha)
+    # General-purpose read-only mounts may legitimately contain dirty Git
+    # worktrees.  Their exact bytes are authenticated below.  The stronger Git
+    # provenance contract is required only for reviewer workspaces carrying an
+    # out-of-band assigned SHA.
+    if expected_git_sha is not None:
+        _verify_git_workspace_provenance(root, expected_git_sha)
     if _readonly_tree_metadata_digest(root) != expected_metadata:
         raise ValueError(f"read-only workspace changed before materialization: {root}")
     if not root.is_dir():
@@ -574,7 +579,7 @@ def _readonly_workspace_archive(
         source_git = root / ".git"
         trusted_git = archive_root / ".git"
         trusted_git.mkdir(mode=0o755)
-        shutil.copytree(source_git / "objects", trusted_git / "objects", symlinks=False)
+        _copy_trusted_git_objects(source_git / "objects", trusted_git / "objects")
         head_text, commit = _git_commit_identity(source_git)
         (trusted_git / "HEAD").write_text(f"{head_text}\n", encoding="utf-8")
         (trusted_git / "config").write_text(
@@ -614,6 +619,7 @@ def _readonly_workspace_archive(
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_CONFIG_GLOBAL": os.devnull,
                 "GIT_NO_REPLACE_OBJECTS": "1",
+                "GIT_NO_LAZY_FETCH": "1",
             },
         )
         if index.returncode != 0:
@@ -644,6 +650,55 @@ def _readonly_workspace_archive(
     finally:
         if staging is not None:
             staging.cleanup()
+
+
+def _copy_trusted_git_objects(source: Path, destination: Path) -> None:
+    """Copy only content-addressed Git object files, excluding semantic caches.
+
+    Commit graphs, multi-pack indexes, bitmaps and other auxiliary files are
+    candidate-selected interpretations of the object database.  Reviewers need
+    only loose objects and checksum-addressed pack/index pairs; Git can derive
+    every acceleration structure from those trusted primitives.
+    """
+    if source.is_symlink() or not source.is_dir():
+        raise ValueError("reviewer workspace Git object database is unsafe")
+    destination.mkdir(mode=0o755)
+    loose_directory = re.compile(r"[0-9a-f]{2}")
+    loose_object = re.compile(r"[0-9a-f]{38}")
+    pack_file = re.compile(r"pack-([0-9a-f]{40})\.(pack|idx)")
+    pack_members: dict[str, set[str]] = {}
+    for child in source.iterdir():
+        if loose_directory.fullmatch(child.name):
+            if child.is_symlink() or not child.is_dir():
+                raise ValueError("reviewer workspace loose Git objects are unsafe")
+            target_dir = destination / child.name
+            target_dir.mkdir(mode=0o755)
+            for obj in child.iterdir():
+                if (
+                    not loose_object.fullmatch(obj.name)
+                    or obj.is_symlink()
+                    or not obj.is_file()
+                ):
+                    raise ValueError("reviewer workspace loose Git objects are unsafe")
+                shutil.copy2(obj, target_dir / obj.name, follow_symlinks=False)
+        elif child.name == "pack":
+            if child.is_symlink() or not child.is_dir():
+                raise ValueError("reviewer workspace packed Git objects are unsafe")
+            target_pack = destination / "pack"
+            target_pack.mkdir(mode=0o755)
+            for packed in child.iterdir():
+                match = pack_file.fullmatch(packed.name)
+                if match is None:
+                    # Exclude commit-graph chains, MIDX, bitmaps, reverse indexes,
+                    # cruft metadata and temporary pack artifacts.
+                    continue
+                if packed.is_symlink() or not packed.is_file():
+                    raise ValueError("reviewer workspace packed Git objects are unsafe")
+                pack_members.setdefault(match.group(1), set()).add(match.group(2))
+                shutil.copy2(packed, target_pack / packed.name, follow_symlinks=False)
+        # Deliberately omit objects/info and every unknown auxiliary entry.
+    if any(kinds != {"pack", "idx"} for kinds in pack_members.values()):
+        raise ValueError("reviewer workspace Git pack is incomplete")
 
 
 def _verify_git_workspace_provenance(
@@ -686,6 +741,7 @@ def _verify_git_workspace_provenance(
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_NO_LAZY_FETCH": "1",
     }
 
     def run(args: list[str]) -> subprocess.CompletedProcess[bytes]:

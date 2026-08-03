@@ -800,6 +800,65 @@ def test_pinned_workspace_archive_rebuilds_trusted_git_metadata(tmp_path):
     ).stdout.strip() == "review-branch"
 
 
+def test_trusted_git_objects_exclude_candidate_semantic_caches(tmp_path):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    loose = source / "ab"
+    packed = source / "pack"
+    info = source / "info"
+    loose.mkdir(parents=True)
+    packed.mkdir()
+    info.mkdir()
+    (loose / ("c" * 38)).write_bytes(b"loose-object")
+    pack_id = "d" * 40
+    (packed / f"pack-{pack_id}.pack").write_bytes(b"pack")
+    (packed / f"pack-{pack_id}.idx").write_bytes(b"index")
+    (packed / f"pack-{pack_id}.bitmap").write_bytes(b"candidate-bitmap")
+    (packed / "multi-pack-index").write_bytes(b"candidate-midx")
+    (info / "commit-graph").write_bytes(b"candidate-graph")
+
+    docker_env._copy_trusted_git_objects(source, destination)
+
+    assert (destination / "ab" / ("c" * 38)).read_bytes() == b"loose-object"
+    assert (destination / "pack" / f"pack-{pack_id}.pack").read_bytes() == b"pack"
+    assert (destination / "pack" / f"pack-{pack_id}.idx").read_bytes() == b"index"
+    assert not (destination / "pack" / f"pack-{pack_id}.bitmap").exists()
+    assert not (destination / "pack" / "multi-pack-index").exists()
+    assert not (destination / "info").exists()
+
+
+def test_git_workspace_provenance_disables_lazy_fetch(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"], cwd=project_dir, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    (project_dir / "payload.txt").write_text("assigned\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=project_dir, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    original_run = subprocess.run
+    environments = []
+
+    def recording_run(*args, **kwargs):
+        environments.append(kwargs.get("env"))
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(docker_env.subprocess, "run", recording_run)
+
+    docker_env._verify_git_workspace_provenance(project_dir, assigned)
+
+    assert environments
+    assert all(env is not None and env.get("GIT_NO_LAZY_FETCH") == "1" for env in environments)
+
+
 def test_git_workspace_provenance_rejects_untracked_empty_directory(tmp_path):
     project_dir = tmp_path / "review-target"
     project_dir.mkdir()
