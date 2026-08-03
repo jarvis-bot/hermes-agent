@@ -104,6 +104,28 @@ class TestConfigYamlRouting:
         config = _read_config(_isolated_hermes_home)
         assert "python:3.12" in config
 
+    @pytest.mark.parametrize("value", ["DISK", "disk ", "", "true", "512"])
+    def test_terminal_tmp_storage_rejects_invalid_value_before_writing(
+        self, _isolated_hermes_home, value
+    ):
+        with pytest.raises(ValueError, match="exactly 'tmpfs' or 'disk'"):
+            set_config_value("terminal.docker_tmp_storage", value)
+
+        assert "docker_tmp_storage" not in _read_config(_isolated_hermes_home)
+        assert "TERMINAL_DOCKER_TMP_STORAGE" not in _read_env(_isolated_hermes_home)
+
+    @pytest.mark.parametrize("value", ["tmpfs", "disk"])
+    def test_terminal_tmp_storage_accepts_exact_allowed_values(
+        self, _isolated_hermes_home, value
+    ):
+        import yaml
+
+        set_config_value("terminal.docker_tmp_storage", value)
+
+        config = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert config["terminal"]["docker_tmp_storage"] == value
+        assert get_env_value("TERMINAL_DOCKER_TMP_STORAGE") == value
+
     def test_terminal_docker_cwd_mount_flag_goes_to_config_and_env(self, _isolated_hermes_home):
         set_config_value("terminal.docker_mount_cwd_to_workspace", "true")
         config = _read_config(_isolated_hermes_home)

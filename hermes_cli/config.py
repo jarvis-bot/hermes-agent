@@ -4865,6 +4865,14 @@ def set_config_value(key: str, value: str, force: bool = False):
         print(f"✓ Set {key} in {get_env_path()}")
         return
 
+    # Fail before touching config.yaml or its synchronized environment bridge.
+    # Runtime validation is intentionally exact too, but setter-level rejection
+    # prevents a successful-looking command from poisoning both config sources.
+    if key == "terminal.docker_tmp_storage" and value not in {"tmpfs", "disk"}:
+        raise ValueError(
+            "terminal.docker_tmp_storage must be exactly 'tmpfs' or 'disk'"
+        )
+
     # Unknown-key notice (#34067): the key is still written (arbitrary keys
     # are supported — top-level scalars are bridged into os.environ for
     # skills and external apps), but a plausible-but-wrong dotted path like
