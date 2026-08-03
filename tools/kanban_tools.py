@@ -108,6 +108,19 @@ def _check_kanban_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def _is_exact_sha_reviewer_worker() -> bool:
+    """Return whether the dispatcher scoped this worker to an immutable review."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return False
+    sha = os.environ.get("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "")
+    return len(sha) == 40 and all(char in "0123456789abcdef" for char in sha)
+
+
+def _check_kanban_extended_mode() -> bool:
+    """Hide board discovery, delegation, attachment, and comment tools from reviewers."""
+    return not _is_exact_sha_reviewer_worker() and _check_kanban_mode()
+
+
 def _check_kanban_orchestrator_mode() -> bool:
     """Board-routing tools (kanban_list, kanban_unblock) are intentionally
     hidden from task workers.
@@ -2052,7 +2065,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_SHOW_SCHEMA,
     handler=_handle_show,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_extended_mode,
     emoji="📋",
 )
 
@@ -2088,7 +2101,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_HEARTBEAT_SCHEMA,
     handler=_handle_heartbeat,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_extended_mode,
     emoji="💓",
 )
 
@@ -2097,7 +2110,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_COMMENT_SCHEMA,
     handler=_handle_comment,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_extended_mode,
     emoji="💬",
 )
 
@@ -2106,7 +2119,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_ATTACH_SCHEMA,
     handler=_handle_attach,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_extended_mode,
     emoji="📎",
 )
 
@@ -2115,7 +2128,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_ATTACH_URL_SCHEMA,
     handler=_handle_attach_url,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_extended_mode,
     emoji="📎",
 )
 
@@ -2124,7 +2137,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_ATTACHMENTS_SCHEMA,
     handler=_handle_attachments,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_extended_mode,
     emoji="📎",
 )
 
@@ -2133,7 +2146,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_CREATE_SCHEMA,
     handler=_handle_create,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_extended_mode,
     emoji="➕",
 )
 
@@ -2151,6 +2164,6 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_LINK_SCHEMA,
     handler=_handle_link,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_extended_mode,
     emoji="🔗",
 )
