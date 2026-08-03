@@ -51,6 +51,7 @@ _POLICY_LABEL_KEY = "hermes-policy"
 _MAX_REVIEW_WORKSPACE_NODES = 100_000
 _MAX_REVIEW_WORKSPACE_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_REVIEW_GIT_OBJECT_BYTES = 512 * 1024 * 1024
+_MAX_REVIEW_LOOSE_OBJECT_COMPRESSED_BYTES = 128 * 1024 * 1024
 _MAX_REVIEW_PACKED_REFS_BYTES = 16 * 1024 * 1024
 _REVIEW_PROVENANCE_DEADLINE_SECONDS = 180.0
 
@@ -170,19 +171,37 @@ def _readonly_tree_digest(
         relative = "." if path == root else path.relative_to(root).as_posix()
         digest.update(relative.encode("utf-8", errors="surrogateescape"))
         digest.update(b"\0")
+        path_stat = path.lstat()
         if include_root_mode or path != root:
-            digest.update(f"{stat.S_IMODE(path.lstat().st_mode):04o}".encode("ascii"))
+            digest.update(f"{stat.S_IMODE(path_stat.st_mode):04o}".encode("ascii"))
         digest.update(b"\0")
-        mode = path.lstat().st_mode
+        mode = path_stat.st_mode
         if stat.S_ISLNK(mode):
             digest.update(b"L")
             digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
         elif stat.S_ISREG(mode):
             digest.update(b"F")
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            descriptor = os.open(path, flags)
+            try:
+                opened = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or (opened.st_dev, opened.st_ino, opened.st_size)
+                    != (path_stat.st_dev, path_stat.st_ino, path_stat.st_size)
+                ):
+                    raise ValueError(
+                        "read-only workspace file changed during authentication"
+                    )
+                while chunk := os.read(descriptor, 1024 * 1024):
                     _check_review_deadline(deadline)
                     digest.update(chunk)
+            finally:
+                os.close(descriptor)
         elif stat.S_ISDIR(mode):
             digest.update(b"D")
         else:
@@ -569,10 +588,13 @@ def _extra_args_have_host_security_file(extra_args: list[str]) -> bool:
     return False
 
 
-def _copy_review_node(source: Path, destination: Path, deadline: float) -> None:
+def _copy_review_node(
+    source: Path, destination: Path, deadline: Optional[float]
+) -> None:
     """Copy one authenticated review node while enforcing the shared deadline."""
     _check_review_deadline(deadline)
-    mode = source.lstat().st_mode
+    source_stat = source.lstat()
+    mode = source_stat.st_mode
     if stat.S_ISLNK(mode):
         destination.symlink_to(os.readlink(source))
         return
@@ -583,11 +605,68 @@ def _copy_review_node(source: Path, destination: Path, deadline: float) -> None:
         return
     if not stat.S_ISREG(mode):
         raise ValueError(f"unsupported filesystem node in read-only workspace: {source}")
-    with source.open("rb") as reader, destination.open("xb") as writer:
-        while chunk := reader.read(1024 * 1024):
-            _check_review_deadline(deadline)
-            writer.write(chunk)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(source, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_size)
+            != (source_stat.st_dev, source_stat.st_ino, source_stat.st_mode, source_stat.st_size)
+        ):
+            raise ValueError("reviewer workspace file changed during copy")
+        with os.fdopen(descriptor, "rb", closefd=False) as reader, destination.open("xb") as writer:
+            while chunk := reader.read(1024 * 1024):
+                _check_review_deadline(deadline)
+                writer.write(chunk)
+    finally:
+        os.close(descriptor)
     shutil.copystat(source, destination, follow_symlinks=False)
+
+
+def _read_bounded_regular_file(
+    path: Path, *, maximum_bytes: int, deadline: Optional[float]
+) -> bytes:
+    """Read a path via a nonblocking, no-follow descriptor with a hard bound."""
+    _check_review_deadline(deadline)
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode) or before.st_size > maximum_bytes:
+        raise ValueError("reviewer workspace file exceeds its authentication size limit")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino, opened.st_size)
+            != (before.st_dev, before.st_ino, before.st_size)
+        ):
+            raise ValueError("reviewer workspace file changed during authentication")
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(descriptor, min(1024 * 1024, maximum_bytes + 1 - total)):
+            _check_review_deadline(deadline)
+            total += len(chunk)
+            if total > maximum_bytes:
+                raise ValueError("reviewer workspace file exceeds its authentication size limit")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+class _DeadlineReader:
+    """Minimal tarfile reader that checks the shared deadline on every read."""
+
+    def __init__(self, handle: IO[bytes], deadline: Optional[float]) -> None:
+        self._handle = handle
+        self._deadline = deadline
+
+    def read(self, size: int = -1) -> bytes:
+        _check_review_deadline(self._deadline)
+        value = self._handle.read(size)
+        _check_review_deadline(self._deadline)
+        return value
 
 
 def _readonly_workspace_archive(
@@ -709,7 +788,8 @@ def _readonly_workspace_archive(
             with tarfile.open(fileobj=archive_file, mode="w") as archive:
                 for path in sorted(archive_root.rglob("*")):
                     _check_review_deadline(provenance_deadline)
-                    mode = path.lstat().st_mode
+                    path_stat = path.lstat()
+                    mode = path_stat.st_mode
                     if not any(check(mode) for check in (stat.S_ISREG, stat.S_ISDIR, stat.S_ISLNK)):
                         raise ValueError(
                             f"unsupported filesystem node in read-only workspace: {path}"
@@ -718,8 +798,28 @@ def _readonly_workspace_archive(
                         str(path), arcname=path.relative_to(archive_root).as_posix()
                     )
                     if stat.S_ISREG(mode):
-                        with path.open("rb") as handle:
-                            archive.addfile(info, handle)
+                        flags = (
+                            os.O_RDONLY
+                            | getattr(os, "O_NOFOLLOW", 0)
+                            | getattr(os, "O_NONBLOCK", 0)
+                        )
+                        descriptor = os.open(path, flags)
+                        try:
+                            opened = os.fstat(descriptor)
+                            if (
+                                not stat.S_ISREG(opened.st_mode)
+                                or (opened.st_dev, opened.st_ino, opened.st_size)
+                                != (path_stat.st_dev, path_stat.st_ino, path_stat.st_size)
+                            ):
+                                raise ValueError(
+                                    "reviewer workspace file changed during archiving"
+                                )
+                            with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                                archive.addfile(
+                                    info, _DeadlineReader(handle, provenance_deadline)
+                                )
+                        finally:
+                            os.close(descriptor)
                     else:
                         archive.addfile(info)
             if (
@@ -761,7 +861,11 @@ def _validated_loose_git_object_bytes(
     """Read a loose SHA-1 Git object and authenticate its content address."""
     try:
         _check_review_deadline(deadline)
-        compressed = path.read_bytes()
+        compressed = _read_bounded_regular_file(
+            path,
+            maximum_bytes=_MAX_REVIEW_LOOSE_OBJECT_COMPRESSED_BYTES,
+            deadline=deadline,
+        )
         inflater = zlib.decompressobj()
         canonical = inflater.decompress(compressed, _MAX_REVIEW_GIT_OBJECT_BYTES + 1)
         if len(canonical) > _MAX_REVIEW_GIT_OBJECT_BYTES or inflater.unconsumed_tail:
@@ -866,7 +970,7 @@ def _copy_trusted_git_objects(
                 if packed.is_symlink() or not packed.is_file():
                     raise ValueError("reviewer workspace packed Git objects are unsafe")
                 copied = target_pack / packed.name
-                shutil.copy2(packed, copied, follow_symlinks=False)
+                _copy_review_node(packed, copied, deadline)
                 copied_packs.append((copied, match.group(1)))
         # Deliberately omit objects/info and every unknown auxiliary entry.
 
@@ -886,7 +990,8 @@ def _copy_trusted_git_objects(
         # preserving the candidate-selected index.
         result = subprocess.run(
             ["git", "index-pack", "--strict", str(copied_pack)],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
             encoding="utf-8",
             errors="replace",
@@ -1051,12 +1156,30 @@ def _verify_git_workspace_provenance_in_staging(
             if executable != (mode == b"100755"):
                 raise ValueError("reviewer workspace tracked file modes do not match HEAD")
             try:
-                size = candidate.lstat().st_size
+                candidate_stat = candidate.lstat()
+                size = candidate_stat.st_size
                 blob_digest = hashlib.sha1(f"blob {size}\0".encode("ascii"))
-                with candidate.open("rb") as handle:
-                    while chunk := handle.read(1024 * 1024):
+                flags = (
+                    os.O_RDONLY
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_NONBLOCK", 0)
+                )
+                descriptor = os.open(candidate, flags)
+                try:
+                    opened = os.fstat(descriptor)
+                    if (
+                        not stat.S_ISREG(opened.st_mode)
+                        or (opened.st_dev, opened.st_ino, opened.st_size)
+                        != (candidate_stat.st_dev, candidate_stat.st_ino, size)
+                    ):
+                        raise ValueError(
+                            "reviewer workspace tracked files changed during authentication"
+                        )
+                    while chunk := os.read(descriptor, 1024 * 1024):
                         check_deadline()
                         blob_digest.update(chunk)
+                finally:
+                    os.close(descriptor)
             except OSError as exc:
                 raise ValueError("reviewer workspace tracked files do not match HEAD") from exc
         if blob_digest.hexdigest().encode("ascii") != object_id:

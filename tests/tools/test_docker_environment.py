@@ -1010,6 +1010,32 @@ def test_reviewer_workspace_bounds_enforce_shared_provenance_deadline(tmp_path):
         )
 
 
+def test_tree_authentication_rejects_regular_file_swapped_to_fifo(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    payload = project_dir / "payload.txt"
+    payload.write_text("candidate\n", encoding="utf-8")
+    original_open = docker_env.os.open
+    swapped = False
+
+    def swap_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == payload and not swapped:
+            swapped = True
+            payload.unlink()
+            docker_env.os.mkfifo(payload)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(docker_env.os, "open", swap_before_open)
+    with pytest.raises(ValueError, match="changed during authentication"):
+        docker_env._readonly_tree_digest(
+            project_dir, deadline=docker_env.time.monotonic() + 2
+        )
+    assert swapped is True
+
+
 def test_trusted_git_objects_exclude_candidate_semantic_caches(tmp_path):
     repository = tmp_path / "repository"
     destination = tmp_path / "destination"
