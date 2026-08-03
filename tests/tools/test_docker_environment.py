@@ -968,6 +968,8 @@ def test_assigned_reviewer_workspace_omits_automatic_host_data(monkeypatch, tmp_
         "_egress_proxy_args_for_docker",
         lambda: pytest.fail("reviewer must not load egress credentials"),
     )
+    monkeypatch.setattr("tools.env_passthrough.get_all_passthrough", lambda: {"REVIEW_SECRET"})
+    monkeypatch.setenv("REVIEW_SECRET", "credential-from-host")
 
     _make_dummy_env(
         cwd="/workspace",
@@ -975,13 +977,22 @@ def test_assigned_reviewer_workspace_omits_automatic_host_data(monkeypatch, tmp_
         auto_mount_cwd=True,
         cwd_mount_mode="ro",
         network=False,
+        persistent_filesystem=True,
         expected_git_sha="1" * 40,
-        persist_across_processes=False,
+        persist_across_processes=True,
     )
 
     run_args = [call[0] for call in calls if call[0][1] == "run"][-1]
     assert "--network=none" in run_args
     assert any(arg.endswith(":/workspace:ro") for arg in run_args)
+    assert "/root:rw,exec,size=1g" in run_args
+    assert not any(
+        run_args[index] == "-v" and run_args[index + 1].endswith(":/root")
+        for index in range(len(run_args) - 1)
+    )
+    assert not any(call[0][1:3] == ["ps", "-a"] for call in calls)
+    assert "REVIEW_SECRET" not in repr(calls)
+    assert "credential-from-host" not in repr(calls)
 
 
 def test_read_only_workspace_is_materialized_away_from_mutable_host_bind(

@@ -1983,12 +1983,17 @@ class DockerEnvironment(BaseEnvironment):
         if cwd == "~":
             cwd = "/root"
         super().__init__(cwd=cwd, timeout=timeout)
-        self._persistent = persistent_filesystem
-        self._persist_across_processes = persist_across_processes
+        reviewer_mode = expected_git_sha is not None
+        self._reviewer_mode = reviewer_mode
+        self._expected_git_sha = expected_git_sha
+        # Reviewer scratch state must remain inside the disposable container.
+        # Never bind a host-backed /root or reuse its mutable writable layer,
+        # even when global terminal defaults request persistence.
+        self._persistent = persistent_filesystem and not reviewer_mode
+        self._persist_across_processes = persist_across_processes and not reviewer_mode
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
-        reviewer_mode = expected_git_sha is not None
         if reviewer_mode:
             if network:
                 raise ValueError("assigned reviewer workspaces require docker_network=false")
@@ -2621,6 +2626,8 @@ class DockerEnvironment(BaseEnvironment):
             "cwd": cwd,
             "image_uses_s6_init": image_uses_s6_init,
             "persistent_filesystem": self._persistent,
+            "reviewer_mode": reviewer_mode,
+            "expected_git_sha": expected_git_sha,
             "run_args": all_run_args,
             "bind_sources": bind_source_identities,
             "canonical_workspace": canonical_workspace_identity,
@@ -2683,7 +2690,7 @@ class DockerEnvironment(BaseEnvironment):
         # container creation — reusing a pre-egress or pre-rotation container
         # would silently bypass the credential firewall.
         reused = False
-        if persist_across_processes:
+        if self._persist_across_processes:
             existing = self._find_reusable_container(
                 task_label, profile_name, egress_label, workspace_label, tmp_storage,
                 policy_label,
@@ -2821,6 +2828,8 @@ class DockerEnvironment(BaseEnvironment):
         These are used once during init_session() so that export -p captures
         them into the snapshot.  Subsequent execute() calls don't need -e flags.
         """
+        if getattr(self, "_reviewer_mode", False):
+            return []
         exec_env: dict[str, str] = dict(self._env)
 
         explicit_forward_keys = set(self._forward_env)
