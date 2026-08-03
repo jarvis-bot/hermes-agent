@@ -4039,18 +4039,17 @@ if clean.returncode != 0 or clean.stdout:
                 )
         if self._tmp_storage == "disk":
             resolved_tmp = self._container_resolved_path(container_id, "/tmp")
-            if resolved_tmp is None or self._container_has_mount_at_or_below(
+            # Requiring the path itself (not merely its current final target) to
+            # live on the writable layer closes a mutable-symlink race.  An
+            # intermediate link inside an image-declared volume could otherwise
+            # be redirected after this one-time policy check.
+            if resolved_tmp != "/tmp" or self._container_has_mount_at_or_below(
                 container_id, "/tmp", include_ancestors=True
-            ) or (
-                resolved_tmp != "/tmp"
-                and self._container_has_mount_at_or_below(
-                    container_id, resolved_tmp, include_ancestors=True
-                )
             ):
                 return (
                     "docker_tmp_storage=disk requires /tmp on the container "
                     "writable layer, but the effective image/container declares "
-                    "a mount at /tmp"
+                    "a mount at /tmp or resolves /tmp through a symlink"
                 )
         else:
             resolved_tmp = self._container_resolved_path(container_id, "/tmp")
