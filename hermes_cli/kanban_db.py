@@ -4384,7 +4384,11 @@ def recompute_ready(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
-    with write_txn(conn):
+    # Completion may call this while holding its write transaction so the
+    # parent transition and every dependent promotion commit atomically.
+    # Standalone callers retain the historical IMMEDIATE transaction.
+    txn = contextlib.nullcontext(conn) if conn.in_transaction else write_txn(conn)
+    with txn:
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
@@ -5219,6 +5223,9 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        # Parent completion and dependent readiness are one atomic mutation.
+        # If either fails, write_txn rolls both back for a safe retry.
+        recompute_ready(conn)
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -5245,8 +5252,6 @@ def complete_task(
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
-    # Recompute ready status for dependents (separate txn so children see done).
-    recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)

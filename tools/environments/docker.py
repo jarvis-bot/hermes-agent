@@ -3048,6 +3048,12 @@ class DockerEnvironment(BaseEnvironment):
         try:
             self.init_session()
         except BaseException:
+            # Exact-SHA reviewer resources are always newly created and
+            # disposable. Ordinary environments may be attached to a reused
+            # persistent container; preserve their historical cleanup contract
+            # rather than destroying an existing container on an init hiccup.
+            if not reviewer_mode:
+                raise
             container_id = self._container_id
             try:
                 if container_id:

@@ -52,6 +52,48 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Atomic dependency release
+# ---------------------------------------------------------------------------
+
+
+def test_complete_promotes_all_dependents_in_same_transaction(kanban_home):
+    with kb.connect_closing() as conn:
+        gate = kb.create_task(
+            conn, title="host gate", assignee=None, initial_status="running"
+        )
+        children = [
+            kb.create_task(
+                conn, title=f"review {index}", assignee=f"reviewer-{index}",
+                parents=(gate,),
+            )
+            for index in range(3)
+        ]
+        statements: list[str] = []
+        conn.set_trace_callback(statements.append)
+
+        assert kb.complete_task(conn, gate, result="release") is True
+
+        conn.set_trace_callback(None)
+        assert kb.get_task(conn, gate).status == "done"
+        assert [kb.get_task(conn, child).status for child in children] == [
+            "ready", "ready", "ready"
+        ]
+        boundaries = [
+            statement.strip().upper()
+            for statement in statements
+            if statement.strip().upper().startswith(("BEGIN", "COMMIT"))
+        ]
+        assert boundaries[:2] == ["BEGIN IMMEDIATE", "COMMIT"]
+        first_commit = next(
+            index for index, statement in enumerate(statements)
+            if statement.strip().upper() == "COMMIT"
+        )
+        atomic_sql = "\n".join(statements[:first_commit]).lower()
+        assert "set status       = 'done'" in atomic_sql
+        assert atomic_sql.count("set status = 'ready'") == 3
+
+
+# ---------------------------------------------------------------------------
 # Idempotency key
 # ---------------------------------------------------------------------------
 
