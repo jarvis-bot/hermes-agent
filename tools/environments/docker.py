@@ -1064,11 +1064,22 @@ def _materialize_readonly_workspace(
         capture_output=True, timeout=30, check=False, stdin=subprocess.DEVNULL,
     )
     if disposable or inspect.returncode != 0:
-        subprocess.run(
-            [docker_exe, "volume", "create", "--label", "hermes-agent=1", volume],
-            capture_output=True, timeout=30, check=True, stdin=subprocess.DEVNULL,
-        )
-        created_volume = True
+        try:
+            subprocess.run(
+                [docker_exe, "volume", "create", "--label", "hermes-agent=1", volume],
+                capture_output=True, timeout=30, check=True, stdin=subprocess.DEVNULL,
+            )
+            created_volume = True
+        except BaseException:
+            # The daemon may have created the deterministically known volume
+            # before the client timed out or lost its connection. Reviewer
+            # volumes are disposable, so always attempt removal by name.
+            if disposable:
+                subprocess.run(
+                    [docker_exe, "volume", "rm", "-f", volume], capture_output=True,
+                    timeout=30, check=False, stdin=subprocess.DEVNULL,
+                )
+            raise
         script = r'''
 import hashlib, os, pathlib, shutil, stat, sys, tarfile
 root = pathlib.Path('/workspace')
@@ -2994,24 +3005,22 @@ class DockerEnvironment(BaseEnvironment):
                     check=True,
                     stdin=subprocess.DEVNULL,
                 )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            except BaseException as e:
                 # Docker may create the container object before `docker run`
-                # fails to start it (e.g. exit code 125 when the daemon isn't
-                # ready, or a timeout mid-pull). That orphan is left in
-                # "Created" state — which the exited-only orphan reaper
-                # (reap_orphan_containers, status=exited) never catches, so it
-                # leaks permanently. Remove it by its known name before
-                # re-raising. See #7439.
+                # fails to start it, including client-side OSError failures.
+                # Remove by known name because no container id may be returned.
                 logger.warning(
                     "docker run failed for %s, cleaning up orphaned container: %s",
                     container_name, e,
                 )
-                subprocess.run(
-                    [self._docker_exe, "rm", "-f", container_name],
-                    capture_output=True, timeout=10,
-                    stdin=subprocess.DEVNULL,
-                )
-                self._remove_snapshot_volumes()
+                try:
+                    subprocess.run(
+                        [self._docker_exe, "rm", "-f", container_name],
+                        capture_output=True, timeout=10, check=False,
+                        stdin=subprocess.DEVNULL,
+                    )
+                finally:
+                    self._remove_snapshot_volumes()
                 raise
             self._container_id = result.stdout.strip()
             logger.info(f"Started container {container_name} ({self._container_id[:12]})")
@@ -3032,8 +3041,25 @@ class DockerEnvironment(BaseEnvironment):
         # them from the snapshot file).
         self._init_env_args = self._build_init_env_args()
 
-        # Initialize session snapshot inside the container
-        self.init_session()
+        # Initialize session snapshot inside the container. Construction has
+        # already acquired a running container and (for reviewers) a uniquely
+        # owned snapshot volume, so a late failure must roll both back here:
+        # callers never receive an environment on which they could call cleanup.
+        try:
+            self.init_session()
+        except BaseException:
+            container_id = self._container_id
+            try:
+                if container_id:
+                    subprocess.run(
+                        [self._docker_exe, "rm", "-f", "-v", container_id],
+                        capture_output=True, timeout=30, check=False,
+                        stdin=subprocess.DEVNULL,
+                    )
+                    self._container_id = None
+            finally:
+                self._remove_snapshot_volumes()
+            raise
 
     def _build_init_env_args(self) -> list[str]:
         """Build -e KEY=VALUE args for injecting host env vars into init_session.
@@ -3809,6 +3835,10 @@ if clean.returncode != 0 or clean.stdout:
         """
         container_id = self._container_id
         if not container_id:
+            # Construction can fail after a reviewer snapshot is materialized
+            # but before a container handle is established. Do not make
+            # snapshot cleanup contingent on the container existing.
+            self._remove_snapshot_volumes()
             # Still drop the bind-mount dirs if any were allocated and we're
             # NOT in persist mode (persist mode preserves them).
             if not self._persistent:

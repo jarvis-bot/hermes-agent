@@ -1342,6 +1342,54 @@ def test_reviewer_cleanup_removes_snapshot_volume(monkeypatch):
     ] in commands
 
 
+def test_reviewer_init_session_failure_removes_container_and_snapshot(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    (project_dir / "candidate.txt").write_text("reviewed", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "init_session",
+        lambda _self: (_ for _ in ()).throw(RuntimeError("injected init failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="injected init failure"):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+            network=False,
+            expected_git_sha="1" * 40,
+        )
+
+    commands = [call[0] for call in calls if isinstance(call[0], list)]
+    assert ["/usr/bin/docker", "rm", "-f", "-v", "fake-container-id"] in commands
+    assert any(command[1:4] == ["volume", "rm", "-f"] for command in commands)
+
+
+def test_cleanup_without_container_still_removes_snapshot_volume(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    env._container_id = None
+    env._persistent = False
+    env._docker_exe = "/usr/bin/docker"
+    env._workspace_dir = None
+    env._home_dir = None
+    env._snapshot_volumes = ["hermes-ro-unattached-snapshot"]
+
+    env.cleanup()
+
+    commands = [call[0] for call in calls if isinstance(call[0], list)]
+    assert [
+        "/usr/bin/docker", "volume", "rm", "-f", "hermes-ro-unattached-snapshot"
+    ] in commands
+
+
 def test_general_read_only_workspace_retains_live_host_bind(
     monkeypatch, tmp_path
 ):
