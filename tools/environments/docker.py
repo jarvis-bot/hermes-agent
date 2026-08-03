@@ -55,6 +55,28 @@ _MAX_REVIEW_LOOSE_OBJECT_COMPRESSED_BYTES = 128 * 1024 * 1024
 _MAX_REVIEW_PACKED_REFS_BYTES = 16 * 1024 * 1024
 _REVIEW_PROVENANCE_DEADLINE_SECONDS = 180.0
 
+_RESOURCE_LIMITED_GIT_EXEC = r'''
+import os, resource, sys
+for name, requested in (
+    ("RLIMIT_AS", 1536 * 1024 * 1024),
+    ("RLIMIT_FSIZE", 5 * 1024 * 1024 * 1024),
+    ("RLIMIT_CPU", 150),
+    ("RLIMIT_NOFILE", 128),
+):
+    kind = getattr(resource, name, None)
+    if kind is None:
+        continue
+    _soft, hard = resource.getrlimit(kind)
+    limit = requested if hard == resource.RLIM_INFINITY else min(requested, hard)
+    resource.setrlimit(kind, (limit, limit))
+os.execve(sys.argv[1], sys.argv[1:], os.environ)
+'''
+
+
+def _resource_limited_git_command(git_exe: str, args: list[str]) -> list[str]:
+    """Run candidate-object Git work behind hard host resource ceilings."""
+    return [sys.executable, "-I", "-c", _RESOURCE_LIMITED_GIT_EXEC, git_exe, *args]
+
 
 def _check_review_deadline(deadline: Optional[float]) -> None:
     if deadline is not None and time.monotonic() >= deadline:
@@ -321,11 +343,17 @@ print(digest.hexdigest())
     raise RuntimeError("; ".join(filter(None, failures)) or "container digest failed")
 
 
-def _packed_git_ref(git_dir: Path, ref_name: str) -> Optional[str]:
+def _packed_git_ref(
+    git_dir: Path, ref_name: str, *, deadline: Optional[float] = None
+) -> Optional[str]:
     """Resolve *ref_name* from packed-refs, ignoring comments/peeled lines."""
     packed_refs = git_dir / "packed-refs"
     try:
-        lines = packed_refs.read_text(encoding="utf-8").splitlines()
+        lines = _read_bounded_git_text(
+            packed_refs,
+            maximum_bytes=_MAX_REVIEW_PACKED_REFS_BYTES,
+            deadline=deadline,
+        ).splitlines()
     except FileNotFoundError:
         return None
     for line in lines:
@@ -337,10 +365,14 @@ def _packed_git_ref(git_dir: Path, ref_name: str) -> Optional[str]:
     return None
 
 
-def _git_metadata_dirs(git_entry: Path) -> tuple[Path, Path]:
+def _git_metadata_dirs(
+    git_entry: Path, *, deadline: Optional[float] = None
+) -> tuple[Path, Path]:
     """Return the worktree-specific and common Git metadata directories."""
     if git_entry.is_file():
-        marker = git_entry.read_text(encoding="utf-8").strip()
+        marker = _read_bounded_git_text(
+            git_entry, maximum_bytes=16 * 1024, deadline=deadline
+        ).strip()
         if not marker.startswith("gitdir:"):
             raise ValueError(f"invalid Git metadata marker: {git_entry}")
         git_dir_text = marker[7:].strip()
@@ -353,7 +385,9 @@ def _git_metadata_dirs(git_entry: Path) -> tuple[Path, Path]:
     common_dir = git_dir
     commondir_file = git_dir / "commondir"
     if commondir_file.is_file():
-        common_dir_text = commondir_file.read_text(encoding="utf-8").strip()
+        common_dir_text = _read_bounded_git_text(
+            commondir_file, maximum_bytes=16 * 1024, deadline=deadline
+        ).strip()
         if not common_dir_text:
             raise ValueError(f"invalid Git common metadata marker: {commondir_file}")
         common_dir = (git_dir / common_dir_text).resolve(strict=True)
@@ -378,11 +412,15 @@ def _validate_local_git_metadata(git_entry: Path) -> None:
             raise ValueError("external Git metadata is not allowed")
 
 
-def _git_commit_identity(git_entry: Path) -> tuple[str, str]:
+def _git_commit_identity(
+    git_entry: Path, *, deadline: Optional[float] = None
+) -> tuple[str, str]:
     """Return ``(HEAD text, commit)`` for normal and linked Git worktrees."""
-    git_dir, common_dir = _git_metadata_dirs(git_entry)
+    git_dir, common_dir = _git_metadata_dirs(git_entry, deadline=deadline)
 
-    head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+    head = _read_bounded_git_text(
+        git_dir / "HEAD", maximum_bytes=16 * 1024, deadline=deadline
+    ).strip()
     if not head.startswith("ref:"):
         if not re.fullmatch(r"[0-9a-fA-F]{40,64}", head):
             raise ValueError(f"invalid detached Git HEAD in {git_dir}")
@@ -394,9 +432,11 @@ def _git_commit_identity(git_entry: Path) -> tuple[str, str]:
     for ref_root in dict.fromkeys((git_dir, common_dir)):
         ref_path = ref_root / ref_name
         try:
-            value = ref_path.read_text(encoding="utf-8").strip()
+            value = _read_bounded_git_text(
+                ref_path, maximum_bytes=16 * 1024, deadline=deadline
+            ).strip()
         except FileNotFoundError:
-            value = _packed_git_ref(ref_root, ref_name) or ""
+            value = _packed_git_ref(ref_root, ref_name, deadline=deadline) or ""
         if value:
             if not re.fullmatch(r"[0-9a-fA-F]{40,64}", value):
                 raise ValueError(f"invalid Git ref {ref_name} in {ref_root}")
@@ -475,7 +515,7 @@ def _path_identity(
     git_entry = resolved / ".git" if resolved.is_dir() else None
     if git_entry is not None and git_entry.exists():
         try:
-            head, commit = _git_commit_identity(git_entry)
+            head, commit = _git_commit_identity(git_entry, deadline=deadline)
             identity["git_head"] = head
             identity["git_ref"] = commit
             # A linked worktree's .git file points outside the mounted source,
@@ -484,7 +524,9 @@ def _path_identity(
             # config, index and attributes can all change Git's interpretation
             # while HEAD itself remains unchanged.
             if content_digest and git_entry.is_file():
-                git_dir, common_dir = _git_metadata_dirs(git_entry)
+                git_dir, common_dir = _git_metadata_dirs(
+                    git_entry, deadline=deadline
+                )
                 git_content, _, git_metadata = _authenticated_tree_digests(git_dir)
                 common_content, _, common_metadata = _authenticated_tree_digests(common_dir)
                 identity["git_metadata_sha256"] = git_content
@@ -653,6 +695,15 @@ def _read_bounded_regular_file(
         return b"".join(chunks)
     finally:
         os.close(descriptor)
+
+
+def _read_bounded_git_text(
+    path: Path, *, maximum_bytes: int, deadline: Optional[float]
+) -> str:
+    """Decode bounded candidate Git metadata read from an authenticated fd."""
+    return _read_bounded_regular_file(
+        path, maximum_bytes=maximum_bytes, deadline=deadline
+    ).decode("utf-8", errors="strict")
 
 
 class _DeadlineReader:
@@ -987,9 +1038,16 @@ def _copy_trusted_git_objects(
             raise ValueError("Git reviewer workspace authentication exceeded its deadline")
         # A pack index selects which object and offset Git associates with an
         # object ID. Rebuild it from authenticated pack bytes rather than
-        # preserving the candidate-selected index.
+        # preserving the candidate-selected index. The isolated Python exec
+        # wrapper applies hard memory, output-file, CPU, and descriptor ceilings
+        # before Git can expand candidate-selected pack objects on the host.
+        git_exe = shutil.which("git")
+        if git_exe is None:
+            raise ValueError("git is required to authenticate a Git reviewer workspace")
         result = subprocess.run(
-            ["git", "index-pack", "--strict", str(copied_pack)],
+            _resource_limited_git_command(
+                git_exe, ["index-pack", "--strict", str(copied_pack)]
+            ),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -1055,7 +1113,7 @@ def _verify_git_workspace_provenance_in_staging(
         deadline = time.monotonic() + _REVIEW_PROVENANCE_DEADLINE_SECONDS
     _validate_local_git_metadata(git_entry)
     _validate_loose_git_objects(git_entry / "objects", deadline=deadline)
-    _head_text, commit = _git_commit_identity(git_entry)
+    _head_text, commit = _git_commit_identity(git_entry, deadline=deadline)
     if expected_git_sha is not None:
         if not re.fullmatch(r"[0-9a-f]{40}", expected_git_sha):
             raise ValueError("expected reviewer Git SHA must be 40 lowercase hex characters")
@@ -1081,7 +1139,6 @@ def _verify_git_workspace_provenance_in_staging(
         source_objects, trusted_git / "objects", deadline=deadline
     )
     base = [
-        git_exe,
         "-c", "core.fsmonitor=false",
         "-c", "core.hooksPath=/dev/null",
         f"--git-dir={trusted_git}",
@@ -1100,21 +1157,30 @@ def _verify_git_workspace_provenance_in_staging(
         if time.monotonic() >= deadline:
             raise ValueError("Git reviewer workspace authentication exceeded its deadline")
 
-    def run(args: list[str]) -> subprocess.CompletedProcess[bytes]:
+    def run(
+        args: list[str], *, capture: bool = True
+    ) -> subprocess.CompletedProcess[bytes]:
         check_deadline()
         try:
             return subprocess.run(
-                [*base, *args], capture_output=True,
+                _resource_limited_git_command(git_exe, [*base, *args]),
+                stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                stderr=subprocess.PIPE if capture else subprocess.DEVNULL,
                 timeout=max(0.1, min(30.0, deadline - time.monotonic())), check=False,
                 stdin=subprocess.DEVNULL, env=safe_env,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise ValueError("Git reviewer workspace authentication failed") from exc
 
-    object_check = run(["cat-file", "-e", f"{commit}^{{commit}}"])
+    object_check = run(
+        ["cat-file", "-e", f"{commit}^{{commit}}"], capture=False
+    )
     if object_check.returncode != 0:
         raise ValueError("reviewer workspace HEAD commit object is missing or invalid")
-    connectivity = run(["fsck", "--strict", "--connectivity-only", commit])
+    connectivity = run(
+        ["fsck", "--strict", "--connectivity-only", "--no-dangling", commit],
+        capture=False,
+    )
     if connectivity.returncode != 0:
         raise ValueError("reviewer workspace Git history is incomplete or invalid")
     tree = run(["ls-tree", "-r", "-z", "--full-tree", commit])
@@ -1221,12 +1287,13 @@ def _verify_git_workspace_provenance_in_staging(
     packed_refs = git_entry / "packed-refs"
     if packed_refs.exists() or packed_refs.is_symlink():
         try:
-            if (
-                not packed_refs.is_file()
-                or packed_refs.stat().st_size > _MAX_REVIEW_PACKED_REFS_BYTES
-            ):
+            if not packed_refs.is_file():
                 raise ValueError("reviewer workspace Git refs cannot be authenticated")
-            packed_ref_bytes = packed_refs.read_bytes()
+            packed_ref_bytes = _read_bounded_regular_file(
+                packed_refs,
+                maximum_bytes=_MAX_REVIEW_PACKED_REFS_BYTES,
+                deadline=deadline,
+            )
         except OSError as exc:
             raise ValueError("reviewer workspace Git refs cannot be authenticated") from exc
         if any(

@@ -1036,6 +1036,45 @@ def test_tree_authentication_rejects_regular_file_swapped_to_fifo(
     assert swapped is True
 
 
+def test_git_head_authentication_rejects_regular_file_swapped_to_fifo(
+    monkeypatch, tmp_path
+):
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    head = git_dir / "HEAD"
+    head.write_text("1" * 40 + "\n", encoding="ascii")
+    original_open = docker_env.os.open
+    swapped = False
+
+    def swap_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == head and not swapped:
+            swapped = True
+            head.unlink()
+            docker_env.os.mkfifo(head)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(docker_env.os, "open", swap_before_open)
+    with pytest.raises((OSError, ValueError)):
+        docker_env._git_commit_identity(
+            git_dir, deadline=docker_env.time.monotonic() + 2
+        )
+    assert swapped is True
+
+
+def test_host_git_authentication_uses_resource_limited_exec_wrapper():
+    command = docker_env._resource_limited_git_command(
+        "/usr/bin/git", ["index-pack", "--strict", "/tmp/review.pack"]
+    )
+
+    assert command[:3] == [docker_env.sys.executable, "-I", "-c"]
+    assert "RLIMIT_AS" in command[3]
+    assert "RLIMIT_FSIZE" in command[3]
+    assert command[-4:] == [
+        "/usr/bin/git", "index-pack", "--strict", "/tmp/review.pack"
+    ]
+
+
 def test_trusted_git_objects_exclude_candidate_semantic_caches(tmp_path):
     repository = tmp_path / "repository"
     destination = tmp_path / "destination"

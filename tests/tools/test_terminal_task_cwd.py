@@ -115,6 +115,46 @@ def test_exact_sha_reviewer_does_not_remount_recorded_container_cwd(monkeypatch,
     assert calls == [{"timeout": 60, "cwd": "/tmp", "bounded_capture": True}]
 
 
+def test_exact_sha_reviewer_first_command_uses_writable_review_copy(monkeypatch, tmp_path):
+    calls = []
+    ticket = tmp_path / "ticket"
+    ticket.mkdir()
+
+    class FakeEnv:
+        env = {}
+        cwd = "/tmp/review"
+
+        def execute(self, command, **kwargs):
+            calls.append(kwargs)
+            return {"output": "ok", "returncode": 0}
+
+    config = {
+        "env_type": "docker",
+        "cwd": "/workspace",
+        "host_cwd": str(ticket),
+        "docker_image": "python:3.11-slim",
+        "docker_mount_cwd_to_workspace": True,
+        "timeout": 60,
+        "lifetime_seconds": 3600,
+    }
+    monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "a" * 40)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+
+    result = json.loads(terminal_tool.terminal_tool(command="pwd"))
+
+    assert result["exit_code"] == 0
+    assert calls == [{"timeout": 60, "cwd": "/tmp/review", "bounded_capture": True}]
+
+
 def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monkeypatch):
     """Background process launches must also use the recorded session cwd."""
 

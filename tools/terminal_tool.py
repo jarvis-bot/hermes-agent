@@ -2616,6 +2616,11 @@ def terminal_tool(
         from tools.approval import get_current_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
+        # Exact-SHA reviewer environments expose their writable tree at
+        # /tmp/review while the requested /workspace mount stays read-only.
+        # Use the environment's effective cwd for a first command; explicit
+        # workdir and per-session cwd records still win below.
+        command_default_cwd = getattr(env, "cwd", cwd)
 
         if background:
             # Spawn a tracked background process via the process registry.
@@ -2625,7 +2630,7 @@ def terminal_tool(
 
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
-                default_cwd=cwd,
+                default_cwd=command_default_cwd,
                 session_key=session_key,
             )
             try:
@@ -2885,7 +2890,7 @@ def terminal_tool(
                 try:
                     command_cwd = _resolve_command_cwd(
                         workdir=workdir,
-                        default_cwd=cwd,
+                        default_cwd=command_default_cwd,
                         session_key=session_key,
                     )
                     execute_kwargs = {
