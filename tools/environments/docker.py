@@ -656,17 +656,17 @@ def _copy_trusted_git_objects(source: Path, destination: Path) -> None:
     """Copy only content-addressed Git object files, excluding semantic caches.
 
     Commit graphs, multi-pack indexes, bitmaps and other auxiliary files are
-    candidate-selected interpretations of the object database.  Reviewers need
-    only loose objects and checksum-addressed pack/index pairs; Git can derive
-    every acceleration structure from those trusted primitives.
+    candidate-selected interpretations of the object database. Reviewers need
+    only loose objects and checksum-addressed pack bytes; pack indexes are
+    independently rebuilt from those trusted primitives.
     """
     if source.is_symlink() or not source.is_dir():
         raise ValueError("reviewer workspace Git object database is unsafe")
     destination.mkdir(mode=0o755)
     loose_directory = re.compile(r"[0-9a-f]{2}")
     loose_object = re.compile(r"[0-9a-f]{38}")
-    pack_file = re.compile(r"pack-([0-9a-f]{40})\.(pack|idx)")
-    pack_members: dict[str, set[str]] = {}
+    pack_file = re.compile(r"pack-([0-9a-f]{40})\.pack")
+    copied_packs: list[tuple[Path, str]] = []
     for child in source.iterdir():
         if loose_directory.fullmatch(child.name):
             if child.is_symlink() or not child.is_dir():
@@ -689,16 +689,47 @@ def _copy_trusted_git_objects(source: Path, destination: Path) -> None:
             for packed in child.iterdir():
                 match = pack_file.fullmatch(packed.name)
                 if match is None:
-                    # Exclude commit-graph chains, MIDX, bitmaps, reverse indexes,
-                    # cruft metadata and temporary pack artifacts.
+                    # Exclude candidate-selected indexes, commit-graph chains,
+                    # MIDX, bitmaps, reverse indexes and temporary artifacts.
                     continue
                 if packed.is_symlink() or not packed.is_file():
                     raise ValueError("reviewer workspace packed Git objects are unsafe")
-                pack_members.setdefault(match.group(1), set()).add(match.group(2))
-                shutil.copy2(packed, target_pack / packed.name, follow_symlinks=False)
+                copied = target_pack / packed.name
+                shutil.copy2(packed, copied, follow_symlinks=False)
+                copied_packs.append((copied, match.group(1)))
         # Deliberately omit objects/info and every unknown auxiliary entry.
-    if any(kinds != {"pack", "idx"} for kinds in pack_members.values()):
-        raise ValueError("reviewer workspace Git pack is incomplete")
+
+    safe_env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "LANG": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+    }
+    for copied_pack, expected_checksum in copied_packs:
+        # A pack index selects which object and offset Git associates with an
+        # object ID. Rebuild it from authenticated pack bytes rather than
+        # preserving the candidate-selected index.
+        result = subprocess.run(
+            ["git", "index-pack", "--strict", str(copied_pack)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env=safe_env,
+        )
+        generated_index = copied_pack.with_suffix(".idx")
+        if (
+            result.returncode != 0
+            or result.stdout.strip() != expected_checksum
+            or not generated_index.is_file()
+            or generated_index.is_symlink()
+        ):
+            raise ValueError("reviewer workspace Git pack failed independent validation")
 
 
 def _verify_git_workspace_provenance(
@@ -1796,6 +1827,8 @@ def _container_path_is_at_or_below(candidate: str, protected: str) -> bool:
     # does not provide a separate namespace there, so collapse all of them.
     canonical = posixpath.normpath("/" + candidate.lstrip("/"))
     root = posixpath.normpath("/" + protected.lstrip("/"))
+    if root == "/":
+        return canonical.startswith("/")
     return canonical == root or canonical.startswith(root + "/")
 
 
@@ -1955,6 +1988,22 @@ class DockerEnvironment(BaseEnvironment):
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
+        reviewer_mode = expected_git_sha is not None
+        if reviewer_mode:
+            if network:
+                raise ValueError("assigned reviewer workspaces require docker_network=false")
+            if self._forward_env or self._env:
+                raise ValueError(
+                    "assigned reviewer workspaces cannot receive forwarded or configured environment variables"
+                )
+            if volumes:
+                raise ValueError(
+                    "assigned reviewer workspaces cannot receive configured Docker volumes"
+                )
+            if extra_args:
+                raise ValueError(
+                    "assigned reviewer workspaces cannot receive raw Docker arguments"
+                )
         self._container_id: Optional[str] = None
         self._labels: dict[str, str] = {}
         self._image: str = ""
@@ -2123,7 +2172,7 @@ class DockerEnvironment(BaseEnvironment):
                 get_cache_directory_mounts,
             )
 
-            for mount_entry in get_credential_file_mounts():
+            for mount_entry in ([] if reviewer_mode else get_credential_file_mounts()):
                 src = Path(mount_entry["host_path"])
                 if src.is_dir():
                     # Docker-in-Docker: Docker auto-created the source path as
@@ -2152,7 +2201,7 @@ class DockerEnvironment(BaseEnvironment):
 
             # Mount skill directories (local + external) so skill
             # scripts/templates are available inside the container.
-            for skills_mount in get_skills_directory_mount():
+            for skills_mount in ([] if reviewer_mode else get_skills_directory_mount()):
                 src = Path(skills_mount["host_path"])
                 if not src.is_dir():
                     logger.warning(
@@ -2174,7 +2223,7 @@ class DockerEnvironment(BaseEnvironment):
             # screenshots) so the agent can access uploaded files and other
             # cached media from inside the container.  Read-only — the
             # container reads these but the host gateway manages writes.
-            for cache_mount in get_cache_directory_mounts():
+            for cache_mount in ([] if reviewer_mode else get_cache_directory_mounts()):
                 src = Path(cache_mount["host_path"])
                 if not src.is_dir():
                     logger.warning(
@@ -2198,9 +2247,12 @@ class DockerEnvironment(BaseEnvironment):
         # mount the CA cert into the sandbox and set HTTPS_PROXY + CA-bundle
         # env vars so outbound traffic routes through the host-side proxy.
         # The sandbox receives PROXY tokens instead of real API keys.
-        egress_volume_args, egress_env_overrides, egress_host_args = (
-            _egress_proxy_args_for_docker()
-        )
+        if reviewer_mode:
+            egress_volume_args, egress_env_overrides, egress_host_args = [], {}, []
+        else:
+            egress_volume_args, egress_env_overrides, egress_host_args = (
+                _egress_proxy_args_for_docker()
+            )
         egress_label = _egress_reuse_fingerprint(
             egress_volume_args, egress_env_overrides, egress_host_args,
         )
@@ -3206,7 +3258,7 @@ class DockerEnvironment(BaseEnvironment):
         if self._tmp_storage == "disk":
             resolved_tmp = self._container_resolved_path(container_id, "/tmp")
             if resolved_tmp is None or self._container_has_mount_at_or_below(
-                container_id, "/tmp"
+                container_id, "/tmp", include_ancestors=True
             ) or (
                 resolved_tmp != "/tmp"
                 and self._container_has_mount_at_or_below(
