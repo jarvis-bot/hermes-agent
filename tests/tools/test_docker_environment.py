@@ -954,6 +954,27 @@ def test_trusted_git_objects_exclude_candidate_semantic_caches(tmp_path):
     assert not (destination / "info").exists()
 
 
+def test_git_workspace_provenance_ignores_candidate_pack_index(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.email", "review@test.invalid"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.name", "Review Test"], cwd=repository, check=True)
+    (repository / "payload.txt").write_text("assigned packed tree\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=repository, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "gc", "--prune=now"], cwd=repository, check=True)
+    candidate_index = next((repository / ".git" / "objects" / "pack").glob("pack-*.idx"))
+    candidate_index.chmod(0o644)
+    candidate_index.write_bytes(b"candidate-selected-index")
+
+    docker_env._verify_git_workspace_provenance(repository, assigned)
+
+
 def test_git_workspace_provenance_disables_lazy_fetch(monkeypatch, tmp_path):
     project_dir = tmp_path / "review-target"
     project_dir.mkdir()

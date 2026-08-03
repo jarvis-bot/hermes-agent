@@ -833,6 +833,23 @@ def _verify_git_workspace_provenance(
     *,
     deadline: Optional[float] = None,
 ) -> None:
+    """Authenticate a reviewer tree using a promptly reclaimed object store."""
+    with tempfile.TemporaryDirectory(prefix="hermes-review-git-auth-") as staging:
+        _verify_git_workspace_provenance_in_staging(
+            root,
+            expected_git_sha,
+            deadline=deadline,
+            trusted_git=Path(staging),
+        )
+
+
+def _verify_git_workspace_provenance_in_staging(
+    root: Path,
+    expected_git_sha: Optional[str] = None,
+    *,
+    deadline: Optional[float] = None,
+    trusted_git: Path,
+) -> None:
     """Require a Git workspace to be the complete clean tree of its real HEAD.
 
     Merely hashing candidate-supplied ``.git/HEAD`` text does not establish
@@ -858,7 +875,32 @@ def _verify_git_workspace_provenance(
     git_exe = shutil.which("git")
     if git_exe is None:
         raise ValueError("git is required to authenticate a Git reviewer workspace")
+    if deadline is None:
+        deadline = time.monotonic() + _REVIEW_PROVENANCE_DEADLINE_SECONDS
+
+    # Never let candidate-selected pack indexes participate in authentication.
+    # Copy only content-addressed loose/pack bytes and rebuild every pack index
+    # before resolving the assigned commit, tree, or blobs.
+    (trusted_git / "refs").mkdir()
+    (trusted_git / "HEAD").write_text(f"{commit}\n", encoding="ascii")
+    (trusted_git / "config").write_text(
+        "[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+        encoding="utf-8",
+    )
+    source_objects = git_entry / "objects"
+    if not source_objects.exists() and not source_objects.is_symlink():
+        raise ValueError("reviewer workspace HEAD commit object is missing or invalid")
+    _copy_trusted_git_objects(
+        source_objects, trusted_git / "objects", deadline=deadline
+    )
     base = [
+        git_exe,
+        "-c", "core.fsmonitor=false",
+        "-c", "core.hooksPath=/dev/null",
+        f"--git-dir={trusted_git}",
+        f"--work-tree={root}",
+    ]
+    candidate_base = [
         git_exe,
         "-c", "core.fsmonitor=false",
         "-c", "core.hooksPath=/dev/null",
@@ -874,18 +916,17 @@ def _verify_git_workspace_provenance(
         "GIT_NO_LAZY_FETCH": "1",
     }
 
-    if deadline is None:
-        deadline = time.monotonic() + _REVIEW_PROVENANCE_DEADLINE_SECONDS
-
     def check_deadline() -> None:
         if time.monotonic() >= deadline:
             raise ValueError("Git reviewer workspace authentication exceeded its deadline")
 
-    def run(args: list[str]) -> subprocess.CompletedProcess[bytes]:
+    def run(
+        args: list[str], *, candidate_metadata: bool = False
+    ) -> subprocess.CompletedProcess[bytes]:
         check_deadline()
         try:
             return subprocess.run(
-                [*base, *args], capture_output=True,
+                [*(candidate_base if candidate_metadata else base), *args], capture_output=True,
                 timeout=max(0.1, min(30.0, deadline - time.monotonic())), check=False,
                 stdin=subprocess.DEVNULL, env=safe_env,
             )
@@ -971,7 +1012,10 @@ def _verify_git_workspace_provenance(
     # Replacement refs alter ordinary reviewer Git commands even though the
     # authentication commands above disable them. Never preserve that
     # candidate-selected interpretation in the copied reviewer workspace.
-    replace_refs = run(["for-each-ref", "--format=%(refname)", "refs/replace"])
+    replace_refs = run(
+        ["for-each-ref", "--format=%(refname)", "refs/replace"],
+        candidate_metadata=True,
+    )
     if replace_refs.returncode != 0:
         raise ValueError("reviewer workspace Git refs cannot be authenticated")
     if replace_refs.stdout:
@@ -986,6 +1030,7 @@ def _verify_git_workspace_provenance(
             raise ValueError(
                 "reviewer workspace contains candidate-selected Git history metadata"
             )
+
 
 
 def _materialize_readonly_workspace(
@@ -3456,6 +3501,15 @@ result = subprocess.run(
 )
 if result.returncode != 0 or result.stdout.strip() != sys.argv[1]:
     raise RuntimeError('writable reviewer copy does not match assigned SHA')
+clean = subprocess.run(
+    ['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+     'status', '--porcelain=v1', '--untracked-files=all'],
+    cwd=target, capture_output=True, text=True, encoding='utf-8',
+    errors='replace', timeout=30, check=False, stdin=subprocess.DEVNULL,
+    env=safe_env,
+)
+if clean.returncode != 0 or clean.stdout:
+    raise RuntimeError('writable reviewer copy is not the clean assigned tree')
 '''
         try:
             result = subprocess.run(
