@@ -4392,6 +4392,10 @@ def recompute_ready(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
+    # Preserve the DB-layer delegated-child trust boundary even when the
+    # caller already owns the transaction and write_txn is intentionally
+    # skipped to keep a larger mutation atomic.
+    _assert_not_delegated_child_mutation()
     # Completion may call this while holding its write transaction so the
     # parent transition and every dependent promotion commit atomically.
     # Standalone callers retain the historical IMMEDIATE transaction.

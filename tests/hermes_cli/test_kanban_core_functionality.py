@@ -95,6 +95,23 @@ def test_complete_promotes_all_dependents_in_same_transaction(kanban_home):
         assert atomic_sql.count("set status = 'ready'") == 3
 
 
+def test_nested_recompute_preserves_delegated_child_guard(kanban_home, monkeypatch):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn, title="waiting", assignee="reviewer", initial_status="blocked"
+        )
+        conn.execute("BEGIN IMMEDIATE")
+        monkeypatch.setattr(
+            kb,
+            "_assert_not_delegated_child_mutation",
+            lambda: (_ for _ in ()).throw(PermissionError("delegated child")),
+        )
+        with pytest.raises(PermissionError, match="delegated child"):
+            kb.recompute_ready(conn)
+        conn.execute("ROLLBACK")
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+
 # ---------------------------------------------------------------------------
 # Idempotency key
 # ---------------------------------------------------------------------------
