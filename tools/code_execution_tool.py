@@ -776,8 +776,20 @@ def _get_or_create_env(task_id: str):
                 "vercel_runtime": config.get("vercel_runtime", ""),
                 "docker_tmp_storage": config.get("docker_tmp_storage", "tmpfs"),
                 "docker_volumes": config.get("docker_volumes", []),
+                "docker_forward_env": config.get("docker_forward_env", []),
+                "docker_env": config.get("docker_env", {}),
+                "docker_extra_args": config.get("docker_extra_args", []),
+                "docker_mount_cwd_to_workspace": config.get(
+                    "docker_mount_cwd_to_workspace", False
+                ),
+                "docker_cwd_mount_mode": config.get("docker_cwd_mount_mode", "rw"),
+                "docker_cwd_path_mappings": config.get("docker_cwd_path_mappings", {}),
+                "docker_cwd_allowed_roots": config.get("docker_cwd_allowed_roots", []),
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                 "docker_network": config.get("docker_network", True),
+                "docker_persist_across_processes": config.get(
+                    "docker_persist_across_processes", True
+                ),
             }
 
         ssh_config = None

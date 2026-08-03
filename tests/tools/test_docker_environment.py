@@ -824,10 +824,11 @@ def test_pinned_workspace_archive_rebuilds_trusted_git_metadata(tmp_path):
         ["git", "status", "--porcelain"], cwd=extracted, check=True,
         capture_output=True, text=True,
     ).stdout == ""
+    assert (extracted / ".git" / "HEAD").read_text(encoding="ascii").strip() == assigned
     assert subprocess.run(
-        ["git", "symbolic-ref", "--short", "HEAD"], cwd=extracted, check=True,
+        ["git", "symbolic-ref", "--quiet", "HEAD"], cwd=extracted,
         capture_output=True, text=True,
-    ).stdout.strip() == "review-branch"
+    ).returncode == 1
 
 
 def test_trusted_git_objects_exclude_candidate_semantic_caches(tmp_path):
@@ -986,6 +987,7 @@ def test_assigned_reviewer_workspace_omits_automatic_host_data(monkeypatch, tmp_
 
     run_args = [call[0] for call in calls if call[0][1] == "run"][-1]
     assert "--network=none" in run_args
+    assert run_args[run_args.index("-w") + 1] == "/tmp"
     assert any(arg.endswith(":/workspace:ro") for arg in run_args)
     assert "/root:rw,exec,size=1g" in run_args
     assert not any(
@@ -995,6 +997,15 @@ def test_assigned_reviewer_workspace_omits_automatic_host_data(monkeypatch, tmp_
     assert not any(call[0][1:3] == ["ps", "-a"] for call in calls)
     assert "REVIEW_SECRET" not in repr(calls)
     assert "credential-from-host" not in repr(calls)
+    copy_call = next(
+        call[0]
+        for call in calls
+        if call[0][1:3] == ["exec", "fake-container-id"]
+        and "/tmp/review" in " ".join(call[0])
+    )
+    assert "shutil.rmtree(target)" in copy_call[-2]
+    assert "source.iterdir()" in copy_call[-2]
+    assert copy_call[-1] == "1" * 40
 
 
 def test_assigned_reviewer_rejects_unexpected_image_writable_volume(monkeypatch, tmp_path):
@@ -1057,7 +1068,7 @@ def test_reviewer_cleanup_removes_snapshot_volume(monkeypatch):
     ] in commands
 
 
-def test_read_only_workspace_is_materialized_away_from_mutable_host_bind(
+def test_general_read_only_workspace_retains_live_host_bind(
     monkeypatch, tmp_path
 ):
     project_dir = tmp_path / "review-target"
@@ -1079,8 +1090,7 @@ def test_read_only_workspace_is_materialized_away_from_mutable_host_bind(
         for index, arg in enumerate(run_args[:-1])
         if arg == "-v" and run_args[index + 1].endswith(":/workspace:ro")
     )
-    assert not workspace_spec.startswith(f"{project_dir}:")
-    assert workspace_spec.startswith("hermes-ro-")
+    assert workspace_spec == f"{project_dir}:/workspace:ro"
 
 
 @pytest.mark.parametrize(
@@ -1164,6 +1174,9 @@ def test_mounted_workspace_content_must_match_authenticated_source(
             host_cwd=str(project_dir),
             auto_mount_cwd=True,
             cwd_mount_mode="ro",
+            network=False,
+            tmp_storage="disk",
+            expected_git_sha="1" * 40,
             persist_across_processes=False,
         )
 
@@ -1463,11 +1476,7 @@ def test_auto_mount_host_cwd_read_only_adds_ro_volume(monkeypatch, tmp_path):
     )
 
     run_args = next(c[0] for c in calls if c[0][1] == "run")
-    assert any(
-        arg.startswith("hermes-ro-") and arg.endswith(":/workspace:ro")
-        for arg in run_args
-    )
-    assert f"{project_dir}:/workspace:ro" not in run_args
+    assert f"{project_dir}:/workspace:ro" in run_args
     reuse_probe = next(c[0] for c in calls if c[0][1:3] == ["ps", "-a"])
     assert any(arg.startswith("label=hermes-workspace=") for arg in reuse_probe)
 

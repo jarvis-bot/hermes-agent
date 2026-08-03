@@ -275,6 +275,36 @@ def test_sibling_container_config_sites_carry_docker_tmp_storage():
     assert sites >= len(modules)
 
 
+def test_execute_code_carries_exact_sha_reviewer_mount_policy():
+    """execute_code must be able to create the same reviewer env as terminal/file."""
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(
+        Path("tools/code_execution_tool.py").read_text(encoding="utf-8")
+    )
+    required = {
+        "docker_mount_cwd_to_workspace",
+        "docker_cwd_mount_mode",
+        "docker_cwd_path_mappings",
+        "docker_cwd_allowed_roots",
+        "docker_forward_env",
+        "docker_env",
+        "docker_extra_args",
+        "docker_network",
+        "docker_tmp_storage",
+    }
+    configs = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        keys = {key.value for key in node.keys if isinstance(key, ast.Constant)}
+        if "docker_tmp_storage" in keys:
+            configs.append(keys)
+    assert configs
+    assert all(required <= keys for keys in configs)
+
+
 def test_terminal_env_config_parses_docker_tmp_storage(monkeypatch):
     from tools import terminal_tool
 

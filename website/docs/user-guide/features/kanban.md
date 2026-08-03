@@ -78,6 +78,9 @@ valid for `scratch` or `worktree` tasks.
 ```bash
 hermes config set terminal.backend docker --profile security-reviewer
 hermes config set terminal.docker_network false --profile security-reviewer
+hermes config set terminal.docker_mount_cwd_to_workspace true --profile security-reviewer
+hermes config set terminal.docker_cwd_mount_mode ro --profile security-reviewer
+hermes config set terminal.docker_tmp_storage disk --profile security-reviewer
 hermes kanban create "Security review" \
   --assignee security-reviewer \
   --workspace dir:/srv/reviews/project \
@@ -87,8 +90,11 @@ hermes kanban create "Security review" \
 Hermes authenticates the clean filesystem against that commit without trusting
 candidate-selected Git configuration, copies the authenticated bytes and
 rebuilt Git metadata into a daemon-owned snapshot, and mounts that snapshot
-read-only at `/workspace`. Reviewer writes are confined to disposable container
-storage. Dispatch fails closed unless Docker networking is disabled and the
+read-only at `/workspace`. Before any tool command, Hermes removes stale
+`/tmp/review` state, copies `/workspace/.` (including rebuilt `.git`) into a
+fresh writable `/tmp/review`, verifies its detached HEAD against the assigned
+SHA, and uses that copy as the reviewer working directory. Dispatch fails
+closed unless Docker networking is disabled and the
 profile supplies no forwarded/configured environment, Docker volumes, or raw
 Docker arguments; it also rejects SHA/content drift, unsupported image tooling,
 and image-declared writable volumes outside the fixed scratch mounts.

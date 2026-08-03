@@ -580,23 +580,20 @@ def _readonly_workspace_archive(
         trusted_git = archive_root / ".git"
         trusted_git.mkdir(mode=0o755)
         _copy_trusted_git_objects(source_git / "objects", trusted_git / "objects")
-        head_text, commit = _git_commit_identity(source_git)
-        (trusted_git / "HEAD").write_text(f"{head_text}\n", encoding="utf-8")
+        _head_text, commit = _git_commit_identity(source_git)
+        # Branch/ref identity is candidate-controlled and can make ordinary
+        # reviewer comparisons misleading. Trust only the out-of-band commit.
+        trusted_ref = trusted_git / "refs" / "heads" / "hermes-assigned-review"
+        trusted_ref.parent.mkdir(parents=True)
+        trusted_ref.write_text(f"{commit}\n", encoding="ascii")
+        (trusted_git / "HEAD").write_text(
+            "ref: refs/heads/hermes-assigned-review\n", encoding="ascii"
+        )
         (trusted_git / "config").write_text(
             "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n"
             "\tbare = false\n\tlogallrefupdates = true\n",
             encoding="utf-8",
         )
-        if head_text.startswith("ref:"):
-            ref_name = head_text[4:].strip()
-            if (
-                not re.fullmatch(r"refs/heads/[A-Za-z0-9._/-]+", ref_name)
-                or any(part in {"", ".", ".."} for part in Path(ref_name).parts)
-            ):
-                raise ValueError("reviewer workspace HEAD branch is unsafe")
-            ref_path = trusted_git / ref_name
-            ref_path.parent.mkdir(parents=True, exist_ok=True)
-            ref_path.write_text(f"{commit}\n", encoding="ascii")
         git_exe = shutil.which("git")
         if git_exe is None:
             raise ValueError("git is required to build trusted reviewer metadata")
@@ -623,7 +620,10 @@ def _readonly_workspace_archive(
             },
         )
         if index.returncode != 0:
-            raise ValueError("trusted reviewer Git index could not be materialized")
+            detail = index.stderr.decode("utf-8", errors="replace").strip()
+            raise ValueError(f"trusted reviewer Git index could not be materialized: {detail}")
+        (trusted_git / "HEAD").write_text(f"{commit}\n", encoding="ascii")
+        trusted_ref.unlink()
 
     try:
         mounted_digest = _authenticated_tree_digests(archive_root)[1]
@@ -1993,8 +1993,11 @@ class DockerEnvironment(BaseEnvironment):
     ):
         if cwd == "~":
             cwd = "/root"
-        super().__init__(cwd=cwd, timeout=timeout)
         reviewer_mode = expected_git_sha is not None
+        requested_cwd = cwd
+        effective_cwd = "/tmp/review" if reviewer_mode else cwd
+        startup_cwd = "/tmp" if reviewer_mode else cwd
+        super().__init__(cwd=effective_cwd, timeout=timeout)
         self._reviewer_mode = reviewer_mode
         self._expected_git_sha = expected_git_sha
         # Reviewer scratch state must remain inside the disposable container.
@@ -2591,10 +2594,12 @@ class DockerEnvironment(BaseEnvironment):
                 "an assigned reviewer Git SHA requires an authenticated read-only workspace"
             )
 
-        # A read-only host bind is not immutable: a host checkout can change
-        # between the pre-command digest and the command's read. Replace every
-        # authenticated workspace bind with a daemon-owned content snapshot.
-        for source, destination, expected in list(self._readonly_workspace_sources):
+        # Exact-SHA reviewers require immutable bytes. Ordinary read-only mounts
+        # retain their historical live-bind semantics.
+        sources_to_materialize = (
+            list(self._readonly_workspace_sources) if reviewer_mode else []
+        )
+        for source, destination, expected in sources_to_materialize:
             snapshot_volume = _materialize_readonly_workspace(
                 self._docker_exe,
                 image_identity,
@@ -2618,10 +2623,16 @@ class DockerEnvironment(BaseEnvironment):
                 raise RuntimeError(
                     f"cannot locate authenticated read-only workspace mount: {destination}"
                 )
-        self._readonly_workspace_sources = [
-            ("", destination, expected)
-            for _, destination, expected in self._readonly_workspace_sources
-        ]
+        if reviewer_mode:
+            self._readonly_workspace_sources = [
+                ("", destination, expected)
+                for _, destination, expected in self._readonly_workspace_sources
+            ]
+        else:
+            # A general read-only bind remains a live view by design. Its source
+            # identity still participates in reuse fingerprinting, but subsequent
+            # host-side updates are not treated as reviewer provenance failures.
+            self._readonly_workspace_sources = []
 
         all_run_args = (
             security_args
@@ -2638,7 +2649,8 @@ class DockerEnvironment(BaseEnvironment):
             "version": 1,
             "image": image,
             "image_identity": image_identity,
-            "cwd": cwd,
+            "cwd": effective_cwd,
+            "requested_cwd": requested_cwd,
             "image_uses_s6_init": image_uses_s6_init,
             "persistent_filesystem": self._persistent,
             "reviewer_mode": reviewer_mode,
@@ -2786,7 +2798,7 @@ class DockerEnvironment(BaseEnvironment):
                 *init_args,
                 "--name", container_name,
                 *label_args,
-                "-w", cwd,
+                "-w", startup_cwd,
                 *all_run_args,
                 image_identity,
                 "sleep", "infinity",  # no fixed lifetime — idle reaper handles cleanup
@@ -2828,6 +2840,9 @@ class DockerEnvironment(BaseEnvironment):
             self._remove_rejected_container(container_id)
             self._container_id = None
             raise RuntimeError(policy_error)
+
+        if reviewer_mode:
+            self._initialize_reviewer_copy(self._container_id, expected_git_sha)
 
         # Build the init-time env forwarding args (used only by init_session
         # to inject host env vars into the snapshot; subsequent commands get
@@ -3273,6 +3288,59 @@ class DockerEnvironment(BaseEnvironment):
             )
             return None
         return posixpath.normpath(resolved)
+
+    def _initialize_reviewer_copy(self, container_id: str, expected_git_sha: str) -> None:
+        """Replace stale reviewer state and verify a writable exact-SHA copy."""
+        script = r'''
+import os, pathlib, shutil, subprocess, sys
+source = pathlib.Path('/workspace')
+target = pathlib.Path('/tmp/review')
+if target.is_symlink() or target.is_file():
+    target.unlink()
+elif target.exists():
+    shutil.rmtree(target)
+target.mkdir(mode=0o700)
+for child in source.iterdir():
+    destination = target / child.name
+    if child.is_dir() and not child.is_symlink():
+        shutil.copytree(child, destination, symlinks=True)
+    elif child.is_symlink():
+        destination.symlink_to(os.readlink(child))
+    else:
+        shutil.copy2(child, destination, follow_symlinks=False)
+safe_env = {
+    'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C',
+    'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull,
+    'GIT_NO_REPLACE_OBJECTS': '1', 'GIT_NO_LAZY_FETCH': '1',
+}
+result = subprocess.run(
+    ['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+     'rev-parse', '--verify', 'HEAD^{commit}'],
+    cwd=target, capture_output=True, text=True, encoding='utf-8',
+    errors='replace', timeout=30, check=False, stdin=subprocess.DEVNULL,
+    env=safe_env,
+)
+if result.returncode != 0 or result.stdout.strip() != sys.argv[1]:
+    raise RuntimeError('writable reviewer copy does not match assigned SHA')
+'''
+        try:
+            result = subprocess.run(
+                [self._docker_exe, "exec", container_id, "python3", "-I", "-c",
+                 script, expected_git_sha],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=120, check=False, stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            self._remove_rejected_container(container_id)
+            self._container_id = None
+            raise RuntimeError("failed to create writable reviewer copy") from exc
+        if result.returncode != 0:
+            detail = result.stderr.strip()
+            self._remove_rejected_container(container_id)
+            self._container_id = None
+            raise RuntimeError(
+                f"failed to create writable reviewer copy at assigned SHA: {detail}"
+            )
 
     def _unexpected_reviewer_writable_mount(self, container_id: str) -> Optional[str]:
         """Return a writable mount outside the fixed disposable scratch roots."""
