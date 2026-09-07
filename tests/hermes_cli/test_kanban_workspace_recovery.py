@@ -167,3 +167,86 @@ def test_all_unavailable_leaves_existing_owner_unclaimed_for_later_recovery(
     assert task.status == "ready"
     assert task.assignee == "quality-reviewer"
     assert task.current_run_id is None
+
+
+def test_recovery_does_not_apply_probe_after_workspace_changes(
+    kanban_home, tmp_path
+):
+    original = tmp_path / "original"
+    replacement = tmp_path / "replacement"
+    original.mkdir()
+    replacement.mkdir()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="review",
+            assignee="security-reviewer",
+            workspace_kind="dir",
+            workspace_path=str(original),
+        )
+        kb.block_task(conn, task_id, reason="mount denied", kind="capability")
+
+        def capability(profile: str, candidate: Path) -> WorkspaceCapability:
+            assert profile == "security-reviewer"
+            assert candidate == original
+            kb.set_workspace_path(conn, task_id, replacement)
+            return WorkspaceCapability(True, profile, str(candidate), read_only=True)
+
+        recovered = kb.recover_workspace_capability_tasks(
+            conn,
+            fallback_profile="default",
+            capability_fn=capability,
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert recovered == 0
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.workspace_path == str(replacement)
+
+
+def test_dispatch_does_not_claim_after_workspace_changes_during_probe(
+    kanban_home, tmp_path, monkeypatch
+):
+    original = tmp_path / "original"
+    replacement = tmp_path / "replacement"
+    original.mkdir()
+    replacement.mkdir()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="review",
+            assignee="quality-reviewer",
+            workspace_kind="dir",
+            workspace_path=str(original),
+        )
+        monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+
+        def capability(profile: str, candidate: Path) -> WorkspaceCapability:
+            assert profile == "quality-reviewer"
+            assert candidate == original
+            kb.set_workspace_path(conn, task_id, replacement)
+            return WorkspaceCapability(True, profile, str(candidate), read_only=True)
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_: (_ for _ in ()).throw(AssertionError("must not spawn")),
+            default_assignee="default",
+            workspace_capability_fn=capability,
+        )
+        task = kb.get_task(conn, task_id)
+        claimed_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'claimed'",
+            (task_id,),
+        ).fetchone()[0]
+        run_count = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+
+    assert result.spawned == []
+    assert task is not None
+    assert task.status == "ready"
+    assert task.current_run_id is None
+    assert task.workspace_path == str(replacement)
+    assert claimed_events == 0
+    assert run_count == 0

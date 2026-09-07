@@ -468,6 +468,9 @@ def decompose_task(
                 children=children,
                 author=audit_author,
                 auto_promote=auto_promote,
+                expected_workspace_path=(
+                    str(task.workspace_path) if task.workspace_path else None
+                ),
             )
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")

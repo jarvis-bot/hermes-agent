@@ -79,6 +79,22 @@ def test_mapping_miss_fails_closed_without_runtime_probe(tmp_path: Path) -> None
     assert called is False
 
 
+def test_missing_profile_fails_closed_instead_of_defaulting_to_local(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _profile: False)
+
+    result = preflight_workspace_for_profile("removed-reviewer", workspace)
+
+    assert result.available is False
+    assert "does not exist" in result.reason
+
+
 def test_symlink_escape_fails_closed(tmp_path: Path) -> None:
     allowed = tmp_path / "allowed"
     outside = tmp_path / "outside"

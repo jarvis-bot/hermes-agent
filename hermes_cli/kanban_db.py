@@ -4463,6 +4463,8 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_assignee: Optional[str] = None,
+    expected_workspace_path: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4473,6 +4475,27 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Security/capability callers can bind an out-of-transaction preflight
+        # to the exact row snapshot they inspected.  Check before repairing a
+        # stale run so a failed optimistic CAS has no side effects.
+        if expected_assignee is not None or expected_workspace_path is not None:
+            observed = conn.execute(
+                "SELECT assignee, workspace_path FROM tasks "
+                "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL",
+                (task_id,),
+            ).fetchone()
+            if observed is None:
+                return None
+            if (
+                expected_assignee is not None
+                and observed["assignee"] != expected_assignee
+            ):
+                return None
+            if (
+                expected_workspace_path is not None
+                and observed["workspace_path"] != expected_workspace_path
+            ):
+                return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4518,8 +4541,7 @@ def claim_task(
                 """,
                 (now, int(stale["current_run_id"])),
             )
-        cur = conn.execute(
-            """
+        claim_sql = """
             UPDATE tasks
                SET status        = 'running',
                    claim_lock    = ?,
@@ -4528,9 +4550,15 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
-            """,
-            (lock, expires, now, task_id),
-        )
+            """
+        claim_params: list[Any] = [lock, expires, now, task_id]
+        if expected_assignee is not None:
+            claim_sql += " AND assignee = ?"
+            claim_params.append(expected_assignee)
+        if expected_workspace_path is not None:
+            claim_sql += " AND workspace_path = ?"
+            claim_params.append(expected_workspace_path)
+        cur = conn.execute(claim_sql, tuple(claim_params))
         if cur.rowcount != 1:
             return None
         # Look up the current task row so we can populate the run with
@@ -6298,6 +6326,7 @@ def decompose_triage_task(
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    expected_workspace_path: Optional[str] = None,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -6391,6 +6420,11 @@ def decompose_triage_task(
         if root_row is None:
             return None
         if root_row["status"] != "triage":
+            return None
+        if (
+            expected_workspace_path is not None
+            and root_row["workspace_path"] != expected_workspace_path
+        ):
             return None
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out
@@ -8484,8 +8518,10 @@ def recover_workspace_capability_tasks(
     recovered = 0
     fallback = (fallback_profile or "").strip() or None
     for row in rows:
-        selected = (row["assignee"] or "").strip()
-        workspace = Path(row["workspace_path"])
+        selected_raw = row["assignee"]
+        selected = (selected_raw or "").strip()
+        workspace_raw = row["workspace_path"]
+        workspace = Path(workspace_raw)
         try:
             selected_capability = (
                 capability_fn(selected, workspace) if selected else None
@@ -8514,18 +8550,30 @@ def recover_workspace_capability_tasks(
         if target is None:
             continue
 
-        parents_done = not conn.execute(
-            "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
-            (row["id"],),
-        ).fetchone()
-        target_status = "ready" if parents_done else "todo"
         with write_txn(conn):
+            # Recompute dependency state under the same write lock as the
+            # optimistic mutation.  The canary stays outside the transaction,
+            # so the UPDATE also binds its result to the exact assignee and
+            # workspace snapshot that was probed.
+            parents_done = not conn.execute(
+                "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? "
+                "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                (row["id"],),
+            ).fetchone()
+            target_status = "ready" if parents_done else "todo"
             cur = conn.execute(
                 "UPDATE tasks SET assignee = ?, status = ? "
                 "WHERE id = ? AND status = 'blocked' "
-                "AND block_kind = 'capability'",
-                (target, target_status, row["id"]),
+                "AND block_kind = 'capability' AND assignee IS ? "
+                "AND workspace_path = ?",
+                (
+                    target,
+                    target_status,
+                    row["id"],
+                    selected_raw,
+                    workspace_raw,
+                ),
             )
             if cur.rowcount != 1:
                 continue
@@ -8887,8 +8935,13 @@ def _dispatch_once_locked(
                         cur = conn.execute(
                             "UPDATE tasks SET assignee = ? WHERE id = ? "
                             "AND status = 'ready' AND claim_lock IS NULL "
-                            "AND assignee = ?",
-                            (row_assignee, row["id"], previous_assignee),
+                            "AND assignee = ? AND workspace_path = ?",
+                            (
+                                row_assignee,
+                                row["id"],
+                                previous_assignee,
+                                task_for_preflight.workspace_path,
+                            ),
                         )
                         if cur.rowcount != 1:
                             continue
@@ -8950,7 +9003,21 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            expected_assignee=(
+                row_assignee
+                if task_for_preflight and task_for_preflight.workspace_path
+                else None
+            ),
+            expected_workspace_path=(
+                task_for_preflight.workspace_path
+                if task_for_preflight and task_for_preflight.workspace_path
+                else None
+            ),
+        )
         if claimed is None:
             continue
         try:
