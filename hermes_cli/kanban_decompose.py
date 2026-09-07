@@ -45,6 +45,9 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import profiles as profiles_mod
+from hermes_cli.kanban_workspace_preflight import (
+    route_children_to_capable_profiles,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -428,6 +431,33 @@ def decompose_task(
             "assignee": chosen,
             "parents": clean_parents,
         })
+
+    # A profile's presence in the roster proves only that its configuration
+    # directory exists.  Before publishing any child cards, prove that each
+    # selected runtime can access this task's exact workspace.  Incapable
+    # assignments are routed to the orchestrator (the durable owner of the
+    # root); if that owner is also unavailable, abort before the atomic DB
+    # mutation so no doomed cards or parent dependencies are created.
+    if task.workspace_path:
+        try:
+            children, unavailable = route_children_to_capable_profiles(
+                children,
+                task.workspace_path,
+                fallback_profile=orchestrator,
+            )
+        except RuntimeError as exc:
+            return DecomposeOutcome(
+                task_id, False, f"workspace preflight failed: {exc}"
+            )
+        for capability in unavailable:
+            logger.warning(
+                "decompose: task %s profile %s cannot access exact workspace; "
+                "routing child to orchestrator %s (%s)",
+                task_id,
+                capability.profile,
+                orchestrator,
+                capability.reason,
+            )
 
     try:
         with kb.connect_closing() as conn:

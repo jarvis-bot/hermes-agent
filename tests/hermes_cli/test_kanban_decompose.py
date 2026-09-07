@@ -161,3 +161,108 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_decompose_preflights_exact_workspace_and_reroutes_before_create(
+    kanban_home, tmp_path
+):
+    workspace = tmp_path / "dynamic" / "ticket" / "repo"
+    workspace.mkdir(parents=True)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="review candidate",
+            triage=True,
+            assignee="orchestrator",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "independent reviews",
+        "tasks": [
+            {"title": "functional", "body": "review", "assignee": "functional-reviewer", "parents": []},
+            {"title": "security", "body": "review", "assignee": "security-reviewer", "parents": []},
+        ],
+    })
+    checked = []
+
+    def route(children, selected_workspace, *, fallback_profile):
+        from hermes_cli.kanban_workspace_preflight import WorkspaceCapability
+
+        checked.append((Path(selected_workspace), fallback_profile))
+        failures = [
+            WorkspaceCapability(False, child["assignee"], str(selected_workspace), "denied")
+            for child in children
+        ]
+        return ([dict(child, assignee="orchestrator") for child in children], failures)
+
+    patches = _patch_list_profiles(
+        ["orchestrator", "functional-reviewer", "security-reviewer"]
+    )
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose.route_children_to_capable_profiles",
+            side_effect=route,
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is True
+    assert checked == [(workspace.resolve(), "orchestrator")]
+    with kb.connect() as conn:
+        children = [kb.get_task(conn, child_id) for child_id in outcome.child_ids]
+    assert [child.assignee for child in children] == ["orchestrator", "orchestrator"]
+
+
+def test_decompose_aborts_atomically_when_selected_and_fallback_cannot_mount(
+    kanban_home, tmp_path
+):
+    workspace = tmp_path / "dynamic" / "repo"
+    workspace.mkdir(parents=True)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="review candidate",
+            triage=True,
+            assignee="orchestrator",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "review",
+        "tasks": [
+            {"title": "security", "body": "review", "assignee": "security-reviewer", "parents": []},
+        ],
+    })
+    patches = _patch_list_profiles(["orchestrator", "security-reviewer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose.route_children_to_capable_profiles",
+            side_effect=RuntimeError("fallback unavailable"),
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "workspace preflight failed" in outcome.reason
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+        created = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE kind = 'created' AND task_id != ?",
+            (tid,),
+        ).fetchone()[0]
+    assert root.status == "triage"
+    assert root.assignee == "orchestrator"
+    assert created == 0
+
+

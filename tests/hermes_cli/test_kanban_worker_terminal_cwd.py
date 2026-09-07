@@ -39,7 +39,12 @@ def _make_task(kb, *, assignee: str = "w", expected_workspace_sha: str | None = 
 
 
 def _capture_spawn_env(
-    kb, monkeypatch, workspace: str, *, expected_workspace_sha: str | None = None
+    kb,
+    monkeypatch,
+    workspace: str,
+    *,
+    expected_workspace_sha: str | None = None,
+    assignee: str = "w",
 ) -> dict:
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
 
@@ -56,7 +61,12 @@ def _capture_spawn_env(
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     kb._default_spawn(
-        _make_task(kb, expected_workspace_sha=expected_workspace_sha), workspace
+        _make_task(
+            kb,
+            assignee=assignee,
+            expected_workspace_sha=expected_workspace_sha,
+        ),
+        workspace,
     )
     return captured
 
@@ -127,5 +137,42 @@ def test_unpinned_worker_clears_inherited_expected_workspace_sha(monkeypatch, tm
     captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
 
     assert "HERMES_KANBAN_EXPECTED_WORKSPACE_SHA" not in captured["env"]
+
+
+def test_read_only_reviewer_worker_forces_safe_restricted_tool_surface(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "security-reviewer"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        "toolsets:\n"
+        "  - hermes-cli\n"
+        "terminal:\n"
+        "  backend: docker\n"
+        "  docker_mount_cwd_to_workspace: true\n"
+        "  docker_cwd_mount_mode: ro\n"
+        "  docker_network: false\n",
+        encoding="utf-8",
+    )
+    root.joinpath("config.yaml").write_text("toolsets:\n  - hermes-cli\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    captured = _capture_spawn_env(
+        kb,
+        monkeypatch,
+        str(workspace),
+        assignee="security-reviewer",
+    )
+
+    assert captured["env"]["HERMES_SAFE_MODE"] == "1"
+    assert "--accept-hooks" not in captured["cmd"]
+    assert "--ignore-rules" in captured["cmd"]
+    toolsets_index = captured["cmd"].index("--toolsets")
+    assert captured["cmd"][toolsets_index + 1] == "terminal,kanban"
 
 
