@@ -1,0 +1,10 @@
+{
+  "board": "cowbone",
+  "db_path": "/opt/data/kanban/boards/cowbone/kanban.db",
+  "task_id": "t_8d82ac4d",
+  "workspace_path": "REPLACE_WITH_REVIEWED_EXISTING_17_FILE_CANDIDATE_WORKSPACE",
+  "branch": "REPLACE_WITH_REVIEWED_BRANCH",
+  "sha": "REPLACE_AFTER_FRAMEWORK_CI_AND_EXACT_SHA_REVIEW",
+  "candidate_fingerprint": "REPLACE_WITH_SHA256_FINGERPRINT_FROM_INSTALLED_FRAMEWORK",
+  "state_file": "/opt/data/kanban/resume-observer-state/cowbone-t_8d82ac4d.json"
+}

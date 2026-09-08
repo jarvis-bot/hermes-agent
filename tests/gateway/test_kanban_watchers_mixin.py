@@ -8,6 +8,8 @@ that GatewayRunner picks them up via the MRO (behavior-neutral relocation).
 from __future__ import annotations
 
 import inspect
+import asyncio
+from unittest.mock import patch
 
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 
@@ -26,3 +28,18 @@ def test_mixin_defines_kanban_methods():
         assert hasattr(GatewayKanbanWatchersMixin, m), f"mixin missing {m}"
 
 
+def test_reviewer_gateway_cannot_start_dispatcher():
+    class Reviewer(GatewayKanbanWatchersMixin):
+        _running = True
+
+        @staticmethod
+        def _active_profile_name():
+            return "reviewer"
+
+    with patch(
+        "hermes_cli.config.load_config",
+        return_value={"kanban": {"dispatch_in_gateway": True}},
+    ):
+        # Returning before the initial sleep proves the profile gate is before
+        # every board open, request consume, reclaim, claim, and spawn path.
+        asyncio.run(Reviewer()._kanban_dispatcher_watcher())

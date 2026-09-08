@@ -1366,6 +1366,34 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Append-only control-plane requests. A deterministic host observer writes
+-- immutable expectations; only the default gateway validates and consumes.
+CREATE TABLE IF NOT EXISTS kanban_resume_requests (
+    request_id                    TEXT PRIMARY KEY,
+    board_slug                   TEXT NOT NULL,
+    task_id                      TEXT NOT NULL,
+    action                       TEXT NOT NULL,
+    producer                     TEXT NOT NULL,
+    expected_status              TEXT NOT NULL,
+    expected_state_version       INTEGER NOT NULL,
+    expected_workspace_path      TEXT NOT NULL,
+    expected_branch              TEXT NOT NULL,
+    expected_sha                 TEXT NOT NULL,
+    expected_candidate_fingerprint TEXT NOT NULL,
+    expected_block_kind          TEXT NOT NULL,
+    expected_block_reason_sha256 TEXT NOT NULL,
+    state                        TEXT NOT NULL DEFAULT 'pending',
+    lease_owner                  TEXT,
+    lease_expires                INTEGER,
+    fence                        INTEGER NOT NULL DEFAULT 0,
+    result_code                  TEXT,
+    detail                       TEXT,
+    created_at                   INTEGER NOT NULL,
+    finished_at                  INTEGER,
+    CHECK (action = 'resume_iteration_budget'),
+    CHECK (state IN ('pending', 'leased', 'accepted', 'rejected'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1376,6 +1404,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_resume_requests_state ON kanban_resume_requests(state, created_at);
 """
 
 
@@ -2270,6 +2299,31 @@ def connect(
         except Exception:
             conn.close()
             raise
+    return conn
+
+
+def connect_read_only(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> sqlite3.Connection:
+    """Open an existing board without initialization, migration, or writes."""
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    resolved = path.expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(resolved)
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    conn = connect_tracked(
+        resolved.as_uri() + "?mode=ro",
+        tracking_path=resolved,
+        connect_fn=sqlite3.connect,
+        uri=True,
+        isolation_level=None,
+        timeout=_resolve_busy_timeout_ms() / 1000.0,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
     return conn
 
 
@@ -9894,6 +9948,12 @@ def _dispatch_once_locked(
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
+            continue
+        from hermes_cli.kanban_resume_requests import (
+            revalidate_accepted_request_before_dispatch,
+        )
+
+        if not revalidate_accepted_request_before_dispatch(conn, row["id"]):
             continue
         if effective_capability is None:
             continue

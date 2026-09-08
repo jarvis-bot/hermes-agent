@@ -987,12 +987,23 @@ class GatewayKanbanWatchersMixin:
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
             )
             return
+        if self._active_profile_name() != "default":
+            logger.info(
+                "kanban dispatcher: profile %s is not the default gateway; disabled",
+                self._active_profile_name(),
+            )
+            return
 
         try:
             from hermes_cli import kanban_db as _kb
+            from hermes_cli import kanban_resume_requests as _resume_requests
         except Exception:
-            logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
+            logger.warning("kanban dispatcher: kanban modules not importable; dispatcher disabled")
             return
+
+        _resume_policies = _resume_requests.policies_from_config(
+            kanban_cfg.get("resume_request_policies", [])
+        )
 
         # Single-dispatcher backstop. dispatch_in_gateway defaults to true, so a
         # new profile gateway (or a same-profile restart race) can silently
@@ -1216,6 +1227,27 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
+                # Observer requests are consumed by this sole authenticated
+                # dispatcher immediately before its ordinary claim pass.
+                _request_results = _resume_requests.consume_resume_requests(
+                    conn,
+                    board=slug,
+                    gateway_profile="default",
+                    policies=_resume_policies,
+                )
+                for _request_result in _request_results:
+                    _result_log = (
+                        logger.info
+                        if _request_result.state == "accepted"
+                        else logger.error
+                    )
+                    _result_log(
+                        "kanban resume request [%s]: %s state=%s code=%s",
+                        slug,
+                        _request_result.request_id,
+                        _request_result.state,
+                        _request_result.result_code,
+                    )
                 return _kb.dispatch_once(
                     conn,
                     board=slug,

@@ -456,6 +456,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                         help="Include archived tasks")
     p_list.add_argument("--json", action="store_true")
     p_list.add_argument(
+        "--read-only",
+        action="store_true",
+        help="Inspect without schema migration, readiness recompute, or DB writes",
+    )
+    p_list.add_argument(
         "--sort",
         default=None,
         choices=sorted(kb.VALID_SORT_ORDERS.keys()),
@@ -1060,7 +1065,10 @@ def kanban_command(args: argparse.Namespace) -> int:
         if action == "capabilities":
             return _cmd_capabilities(args)
         try:
-            kb.init_db()
+            # Read-only list deliberately bypasses schema initialization and
+            # migrations; it must be a pure observation even on old boards.
+            if not (action in {"list", "ls"} and getattr(args, "read_only", False)):
+                kb.init_db()
         except Exception as exc:
             print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
             return 1
@@ -1184,7 +1192,11 @@ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
 
 def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
     action = getattr(args, "kanban_action", None)
-    if action == "boards":
+    # ``list`` historically recomputes readiness and therefore is a mutation.
+    # Delegated children may inspect only through the explicit query-only path.
+    if action in {"list", "ls"} and not getattr(args, "read_only", False):
+        pass
+    elif action == "boards":
         boards_action = getattr(args, "boards_action", None) or "list"
         if boards_action not in _DELEGATED_CHILD_DENIED_BOARD_ACTIONS:
             return False
@@ -1630,10 +1642,13 @@ def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
-    with kb.connect_closing() as conn:
-        # Cheap "mini-dispatch": recompute ready so list output reflects
-        # dependencies that may have cleared since the last dispatcher tick.
-        kb.recompute_ready(conn)
+    read_only = bool(getattr(args, "read_only", False))
+    connector = kb.connect_read_only if read_only else kb.connect
+    with contextlib.closing(connector()) as conn:
+        # Cheap "mini-dispatch" for normal interactive output only. The
+        # explicit read-only path reflects stored state exactly and never writes.
+        if not read_only:
+            kb.recompute_ready(conn)
         tasks = kb.list_tasks(
             conn,
             assignee=assignee,

@@ -2168,6 +2168,9 @@ DEFAULT_CONFIG = {
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Fixed, operator-reviewed allowlist for durable supervisor resume
+        # requests. Empty by default: no request can be consumed accidentally.
+        "resume_request_policies": [],
         # Auto-block after this many consecutive non-success attempts for the
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
