@@ -9,8 +9,12 @@ a profile directory or a successful historical canary is not sufficient.
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import stat
 import subprocess
+import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +31,14 @@ class WorkspaceCapability:
     runtime_path: Optional[str] = None
     device: Optional[int] = None
     inode: Optional[int] = None
+    content_sha256: Optional[str] = None
+
+
+_PROBE_CACHE_TTL_SECONDS = 30.0
+_PROBE_CACHE_MAX_ENTRIES = 256
+_probe_cache_lock = threading.Lock()
+_probe_cache: dict[tuple[object, ...], tuple[float, WorkspaceCapability]] = {}
+_probe_inflight: dict[tuple[object, ...], threading.Event] = {}
 
 
 def workspace_capability_matches(
@@ -116,6 +128,19 @@ def _validate_reviewer_policy(profile: str, config: dict, terminal: dict) -> Opt
         return "reviewer profile must mount the assigned workspace"
     if terminal.get("docker_cwd_mount_mode") != "ro":
         return "reviewer workspace mount must be read-only"
+    allowed_roots = terminal.get("docker_cwd_allowed_roots")
+    if not isinstance(allowed_roots, list) or not allowed_roots:
+        return "reviewer profiles require a non-empty docker_cwd_allowed_roots allowlist"
+    for root in allowed_roots:
+        if not isinstance(root, str) or not root.strip():
+            return "reviewer workspace allowlist entries must be non-empty absolute paths"
+        candidate = Path(root).expanduser()
+        if not candidate.is_absolute():
+            return "reviewer workspace allowlist entries must be absolute paths"
+        try:
+            candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return "reviewer workspace allowlist entries must resolve to existing paths"
     if terminal.get("docker_network", True) is not False:
         return "reviewer Docker network must be disabled"
     if terminal.get("docker_forward_env") or terminal.get("docker_env"):
@@ -256,7 +281,10 @@ def preflight_workspace_for_profile(
         if terminal.get("docker_mount_cwd_to_workspace") is not True:
             raise ValueError("Docker profile does not mount the assigned workspace")
 
-        from tools.environments.docker import _resolve_cwd_mount_source
+        from tools.environments.docker import (
+            _readonly_tree_digest,
+            _resolve_cwd_mount_source,
+        )
 
         canonical_source, docker_source = _resolve_cwd_mount_source(
             str(canonical),
@@ -281,14 +309,26 @@ def preflight_workspace_for_profile(
             source_before.st_ino,
         ):
             raise ValueError("workspace filesystem object changed during preflight")
+        content_sha256 = (
+            _readonly_tree_digest(Path(canonical_source), include_root_mode=False)
+            if reviewer
+            else None
+        )
+        source_final = os.stat(canonical_source, follow_symlinks=False)
+        if (source_final.st_dev, source_final.st_ino) != (
+            source_after.st_dev,
+            source_after.st_ino,
+        ):
+            raise ValueError("workspace filesystem object changed during authentication")
         return WorkspaceCapability(
             True,
             profile,
             canonical_source,
             read_only=read_only,
             runtime_path=docker_source,
-            device=source_after.st_dev,
-            inode=source_after.st_ino,
+            device=source_final.st_dev,
+            inode=source_final.st_ino,
+            content_sha256=content_sha256,
         )
     except Exception as exc:
         return WorkspaceCapability(
@@ -297,6 +337,68 @@ def preflight_workspace_for_profile(
             str(requested),
             reason=str(exc) or type(exc).__name__,
         )
+
+
+def cached_preflight_workspace_for_profile(
+    profile: str, workspace: str | Path
+) -> WorkspaceCapability:
+    """Run/cache a bounded probe by profile, workspace object, and config bytes."""
+    requested = Path(workspace).expanduser()
+    try:
+        canonical = requested.resolve(strict=True)
+        identity = os.stat(canonical, follow_symlinks=False)
+        config = _profile_config(profile)
+        terminal = config.get("terminal") if isinstance(config, dict) else {}
+        if not isinstance(terminal, dict):
+            terminal = {}
+        if _is_reviewer_profile(profile, terminal):
+            from tools.environments.docker import _readonly_tree_metadata_digest
+
+            workspace_identity = _readonly_tree_metadata_digest(canonical)
+        else:
+            workspace_identity = identity.st_mtime_ns
+        config_identity = hashlib.sha256(
+            json.dumps(config, sort_keys=True, separators=(",", ":"), default=str).encode()
+        ).hexdigest()
+        key = (
+            profile, str(canonical), identity.st_dev, identity.st_ino,
+            workspace_identity, config_identity,
+        )
+    except Exception:
+        # The ordinary implementation returns structured failure diagnostics;
+        # let it do so rather than making cache-key construction authoritative.
+        return preflight_workspace_for_profile(profile, requested)
+    now = time.monotonic()
+    with _probe_cache_lock:
+        cached = _probe_cache.get(key)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        wait_for = _probe_inflight.get(key)
+        owner = wait_for is None
+        if owner:
+            wait_for = threading.Event()
+            _probe_inflight[key] = wait_for
+    assert wait_for is not None
+    if not owner:
+        # A competing tick already scheduled this exact expensive canary. Wait
+        # outside both the cache mutex and board lock, then consume its result.
+        wait_for.wait(timeout=35)
+        with _probe_cache_lock:
+            cached = _probe_cache.get(key)
+            if cached is not None and cached[0] > time.monotonic():
+                return cached[1]
+        # The owner timed out or failed before publishing; this caller becomes
+        # a bounded retry rather than trusting stale/absent evidence.
+    result = preflight_workspace_for_profile(profile, canonical, profile_config=config)
+    with _probe_cache_lock:
+        if len(_probe_cache) >= _PROBE_CACHE_MAX_ENTRIES:
+            oldest = min(_probe_cache, key=lambda item: _probe_cache[item][0])
+            _probe_cache.pop(oldest, None)
+        _probe_cache[key] = (now + _PROBE_CACHE_TTL_SECONDS, result)
+        completed = _probe_inflight.pop(key, None)
+        if completed is not None:
+            completed.set()
+    return result
 
 
 def route_children_to_capable_profiles(
@@ -330,6 +432,17 @@ def route_children_to_capable_profiles(
                     f"selected profile {selected!r} cannot access workspace "
                     f"({selected_capability.reason}); fallback profile "
                     f"{fallback_profile!r} is unavailable ({fallback.reason})"
+                )
+            if (
+                profile_uses_restricted_reviewer_runtime(selected)
+                and not (
+                    fallback.read_only
+                    and profile_uses_restricted_reviewer_runtime(fallback_profile)
+                )
+            ):
+                raise RuntimeError(
+                    f"reviewer profile {selected!r} cannot access workspace and fallback "
+                    f"profile {fallback_profile!r} does not prove reviewer isolation"
                 )
             target = fallback_profile
             effective_capability = fallback

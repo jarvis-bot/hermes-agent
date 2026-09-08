@@ -432,6 +432,36 @@ def decompose_task(
             "parents": clean_parents,
         })
 
+    # Materialize the root workspace before publishing the dependency graph.
+    # Scratch tasks and repo-anchored worktrees otherwise carry no exact path,
+    # making a capability check either impossible or about the wrong object.
+    try:
+        if task.workspace_kind == "worktree":
+            materialized, branch_name = kb._resolve_worktree_workspace(task)
+        else:
+            materialized = kb.resolve_workspace(task)
+            branch_name = None
+        materialized = materialized.resolve(strict=True)
+        with kb.connect_closing() as conn:
+            with kb.write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET workspace_path = ?, "
+                    "branch_name = COALESCE(?, branch_name) "
+                    "WHERE id = ? AND status = 'triage' AND workspace_path IS ?",
+                    (str(materialized), branch_name, task.id, task.workspace_path),
+                )
+            if cur.rowcount != 1:
+                return DecomposeOutcome(
+                    task_id, False, "task workspace changed during materialization"
+                )
+            task = kb.get_task(conn, task_id)
+        if task is None:
+            return DecomposeOutcome(task_id, False, "task disappeared during materialization")
+    except Exception as exc:
+        return DecomposeOutcome(
+            task_id, False, f"workspace materialization failed: {exc}"
+        )
+
     # A profile's presence in the roster proves only that its configuration
     # directory exists.  Before publishing any child cards, prove that each
     # selected runtime can access this task's exact workspace.  Incapable

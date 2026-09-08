@@ -56,17 +56,17 @@ def test_restart_recovers_capability_block_to_fallback_idempotently(
             workspace_path=str(workspace),
         )
         kb.link_tasks(conn, parent_id=child, child_id=root)
-        kb.block_task(conn, child, reason="mount denied", kind="capability")
+        kb.block_task(conn, child, reason="mount denied", kind="workspace_capability")
 
         first = kb.recover_workspace_capability_tasks(
             conn,
-            fallback_profile="default",
-            capability_fn=_capability(workspace, {"default"}),
+            fallback_profile="fallback-reviewer",
+            capability_fn=_capability(workspace, {"fallback-reviewer"}),
         )
         second = kb.recover_workspace_capability_tasks(
             conn,
-            fallback_profile="default",
-            capability_fn=_capability(workspace, {"default"}),
+            fallback_profile="fallback-reviewer",
+            capability_fn=_capability(workspace, {"fallback-reviewer"}),
         )
         recovered = kb.get_task(conn, child)
         recovery_events = conn.execute(
@@ -77,7 +77,7 @@ def test_restart_recovers_capability_block_to_fallback_idempotently(
     assert first == 1
     assert second == 0
     assert recovered is not None
-    assert recovered.assignee == "default"
+    assert recovered.assignee == "fallback-reviewer"
     assert recovered.status == "ready"
     assert recovered.requires_reviewer_isolation is True
     assert recovered.block_kind is None
@@ -104,11 +104,11 @@ def test_recovered_child_completion_reconciles_parent(kanban_home, tmp_path):
             workspace_path=str(workspace),
         )
         kb.link_tasks(conn, parent_id=child, child_id=root)
-        kb.block_task(conn, child, reason="mount denied", kind="capability")
+        kb.block_task(conn, child, reason="mount denied", kind="workspace_capability")
         kb.recover_workspace_capability_tasks(
             conn,
-            fallback_profile="default",
-            capability_fn=_capability(workspace, {"default"}),
+            fallback_profile="fallback-reviewer",
+            capability_fn=_capability(workspace, {"fallback-reviewer"}),
         )
         claimed = kb.claim_task(conn, child)
         assert claimed is not None
@@ -129,7 +129,7 @@ def test_recovery_to_reviewer_fallback_persists_isolation(kanban_home, tmp_path)
             workspace_kind="dir",
             workspace_path=str(workspace),
         )
-        kb.block_task(conn, task_id, reason="mount denied", kind="capability")
+        kb.block_task(conn, task_id, reason="mount denied", kind="workspace_capability")
 
         recovered = kb.recover_workspace_capability_tasks(
             conn,
@@ -142,6 +142,29 @@ def test_recovery_to_reviewer_fallback_persists_isolation(kanban_home, tmp_path)
     assert task is not None
     assert task.assignee == "quality-reviewer"
     assert task.requires_reviewer_isolation is True
+
+
+def test_generic_capability_block_is_never_workspace_recovered(kanban_home, tmp_path):
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="publish image", assignee="default",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        kb.block_task(
+            conn, task_id, reason="missing registry credential", kind="capability"
+        )
+        recovered = kb.recover_workspace_capability_tasks(
+            conn, fallback_profile="default",
+            capability_fn=_capability(workspace, {"default"}),
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert recovered == 0
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.block_kind == "capability"
 
 
 def test_dispatch_preflights_before_claim_and_reroutes_to_active_owner(
@@ -163,16 +186,146 @@ def test_dispatch_preflights_before_claim_and_reroutes_to_active_owner(
         result = kb.dispatch_once(
             conn,
             spawn_fn=lambda task, path: spawned.append((task.assignee, path)) or 1234,
+            default_assignee="fallback-reviewer",
+            workspace_capability_fn=_capability(workspace, {"fallback-reviewer"}),
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert result.spawned == [(task_id, "fallback-reviewer", str(workspace.resolve()))]
+    assert spawned == [("fallback-reviewer", str(workspace.resolve()))]
+    assert task.assignee == "fallback-reviewer"
+    assert task.requires_reviewer_isolation is True
+    assert task.status == "running"
+
+
+def test_reviewer_isolation_never_downgrades_to_ordinary_fallback(
+    kanban_home, tmp_path, monkeypatch
+):
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="security review", assignee="security-reviewer",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_: (_ for _ in ()).throw(AssertionError("must not spawn")),
             default_assignee="default",
             workspace_capability_fn=_capability(workspace, {"default"}),
         )
         task = kb.get_task(conn, task_id)
 
-    assert result.spawned == [(task_id, "default", str(workspace.resolve()))]
-    assert spawned == [("default", str(workspace.resolve()))]
-    assert task.assignee == "default"
-    assert task.requires_reviewer_isolation is True
-    assert task.status == "running"
+    assert result.spawned == []
+    assert task is not None
+    assert task.assignee == "security-reviewer"
+    assert task.status == "ready"
+    assert task.current_run_id is None
+
+
+def test_scratch_workspace_is_materialized_then_preflighted_before_claim(
+    kanban_home, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="scratch review", assignee="quality-reviewer"
+        )
+
+        def capability(profile: str, candidate: Path) -> WorkspaceCapability:
+            calls.append((profile, candidate, kb.get_task(conn, task_id).status))
+            identity = candidate.stat()
+            return WorkspaceCapability(
+                True, profile, str(candidate), read_only=True,
+                device=identity.st_dev, inode=identity.st_ino,
+            )
+
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda _task, _path: 1234,
+            workspace_capability_fn=capability,
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert len(calls) == 1
+    assert calls[0][1].is_dir()
+    assert calls[0][2] == "ready"
+    assert result.spawned == [(task_id, "quality-reviewer", str(calls[0][1]))]
+    assert task is not None and task.status == "running"
+
+
+def test_review_column_materializes_and_preflights_before_claim(
+    kanban_home, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="review lane", assignee="quality-reviewer"
+        )
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+        conn.commit()
+
+        def capability(profile: str, candidate: Path) -> WorkspaceCapability:
+            calls.append((profile, candidate, kb.get_task(conn, task_id).status))
+            identity = candidate.stat()
+            return WorkspaceCapability(
+                True, profile, str(candidate), read_only=True,
+                device=identity.st_dev, inode=identity.st_ino,
+            )
+
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda _task, _path: 1234,
+            workspace_capability_fn=capability,
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert len(calls) == 1
+    assert calls[0][1].is_dir()
+    assert calls[0][2] == "review"
+    assert result.spawned == [(task_id, "quality-reviewer", str(calls[0][1]))]
+    assert task is not None and task.status == "running"
+
+
+def test_slow_workspace_probe_runs_outside_dispatch_lock(
+    kanban_home, tmp_path, monkeypatch
+):
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    lock_depth = 0
+    from contextlib import contextmanager
+
+    @contextmanager
+    def tracked_lock(_path):
+        nonlocal lock_depth
+        lock_depth += 1
+        try:
+            yield True
+        finally:
+            lock_depth -= 1
+
+    monkeypatch.setattr(kb, "_dispatch_tick_lock", tracked_lock)
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    with kb.connect() as conn:
+        kb.create_task(
+            conn, title="review", assignee="quality-reviewer",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+
+        def capability(profile: str, candidate: Path) -> WorkspaceCapability:
+            assert lock_depth == 0
+            identity = candidate.stat()
+            return WorkspaceCapability(
+                True, profile, str(candidate), read_only=True,
+                device=identity.st_dev, inode=identity.st_ino,
+            )
+
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda *_: 1234, workspace_capability_fn=capability
+        )
+
+    assert len(result.spawned) == 1
 
 
 def test_all_unavailable_leaves_existing_owner_unclaimed_for_later_recovery(
@@ -358,7 +511,7 @@ def test_recovery_does_not_apply_probe_after_workspace_changes(
             workspace_kind="dir",
             workspace_path=str(original),
         )
-        kb.block_task(conn, task_id, reason="mount denied", kind="capability")
+        kb.block_task(conn, task_id, reason="mount denied", kind="workspace_capability")
 
         def capability(profile: str, candidate: Path) -> WorkspaceCapability:
             assert profile == "security-reviewer"

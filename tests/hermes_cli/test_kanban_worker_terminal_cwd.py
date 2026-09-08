@@ -179,6 +179,7 @@ def test_read_only_reviewer_worker_forces_safe_restricted_tool_surface(
     )
 
     assert captured["env"]["HERMES_SAFE_MODE"] == "1"
+    assert captured["env"]["HERMES_KANBAN_REVIEWER_ISOLATION"] == "1"
     assert "--accept-hooks" not in captured["cmd"]
     assert "--ignore-rules" in captured["cmd"]
     toolsets_index = captured["cmd"].index("--toolsets")
@@ -212,6 +213,7 @@ def test_reviewer_isolation_survives_fallback_assignee_without_sha(
     )
 
     assert captured["env"]["HERMES_SAFE_MODE"] == "1"
+    assert captured["env"]["HERMES_KANBAN_REVIEWER_ISOLATION"] == "1"
     assert "--accept-hooks" not in captured["cmd"]
     assert "--ignore-rules" in captured["cmd"]
     toolsets_index = captured["cmd"].index("--toolsets")

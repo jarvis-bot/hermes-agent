@@ -104,8 +104,8 @@ def _mock_subprocess_run(monkeypatch):
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
 
     def _materialize(
-        _docker, _image, _source, expected, _expected_git_sha=None, *,
-        disposable=False, provenance_deadline=None
+        _docker, _image, _source, expected, _expected_git_sha=None,
+        _expected_content_sha256=None, *, disposable=False, provenance_deadline=None
     ):
         volume = f"hermes-ro-{str(expected['mounted_content_sha256'])[:24]}"
         snapshot_digests[volume] = str(expected["mounted_content_sha256"])
@@ -1272,6 +1272,28 @@ def test_materialize_reviewer_updates_expected_mounted_digest(monkeypatch, tmp_p
     )
 
     assert expected["mounted_content_sha256"] == content
+
+
+def test_materialize_reviewer_rejects_content_changed_since_dispatch_preflight(
+    monkeypatch, tmp_path
+):
+    archive = BytesIO(b"archive")
+    monkeypatch.setattr(
+        docker_env,
+        "_readonly_workspace_archive",
+        lambda *_args, **_kwargs: (archive, "f" * 64),
+    )
+    with pytest.raises(ValueError, match="changed after dispatcher preflight"):
+        docker_env._materialize_readonly_workspace(
+            "docker",
+            "image",
+            str(tmp_path),
+            {"tree_metadata_sha256": "m"},
+            None,
+            "e" * 64,
+            disposable=True,
+        )
+    assert archive.closed
 
 
 def test_materialize_reviewer_overrides_image_entrypoint(monkeypatch, tmp_path):

@@ -130,6 +130,21 @@ def test_reviewer_writable_mount_is_rejected(tmp_path: Path) -> None:
     assert "read-only" in result.reason
 
 
+def test_reviewer_requires_nonempty_canonical_workspace_allowlist(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    config = _docker_config(tmp_path, Path("/srv/runs"))
+    config["terminal"]["docker_cwd_allowed_roots"] = []
+
+    result = preflight_workspace_for_profile(
+        "security-reviewer", workspace, profile_config=config,
+        runtime_probe=lambda **_: None,
+    )
+
+    assert result.available is False
+    assert "non-empty" in result.reason
+
+
 def test_reviewer_mutating_tool_surface_is_rejected(tmp_path: Path) -> None:
     workspace = tmp_path / "runs" / "repo"
     workspace.mkdir(parents=True)
@@ -157,11 +172,11 @@ def test_all_reviewers_unavailable_route_to_capable_fallback(tmp_path: Path) -> 
 
     def capability(profile: str, _workspace: Path) -> WorkspaceCapability:
         return WorkspaceCapability(
-            available=profile == "default",
+            available=profile == "fallback-reviewer",
             profile=profile,
             workspace=str(workspace),
-            reason="mount denied" if profile != "default" else "",
-            read_only=profile != "default",
+            reason="mount denied" if profile != "fallback-reviewer" else "",
+            read_only=True,
             device=workspace.stat().st_dev,
             inode=workspace.stat().st_ino,
         )
@@ -169,11 +184,13 @@ def test_all_reviewers_unavailable_route_to_capable_fallback(tmp_path: Path) -> 
     routed, failures = route_children_to_capable_profiles(
         children,
         workspace,
-        fallback_profile="default",
+        fallback_profile="fallback-reviewer",
         capability_fn=capability,
     )
 
-    assert [child["assignee"] for child in routed] == ["default", "default"]
+    assert [child["assignee"] for child in routed] == [
+        "fallback-reviewer", "fallback-reviewer"
+    ]
     assert {failure.profile for failure in failures} == {
         "functional-reviewer",
         "security-reviewer",
@@ -190,7 +207,7 @@ def test_partial_reviewer_availability_preserves_capable_assignment(tmp_path: Pa
 
     def capability(profile: str, _workspace: Path) -> WorkspaceCapability:
         return WorkspaceCapability(
-            available=profile in {"functional-reviewer", "default"},
+            available=profile in {"functional-reviewer", "fallback-reviewer"},
             profile=profile,
             workspace=str(workspace),
             reason="mount denied" if profile == "security-reviewer" else "",
@@ -202,13 +219,13 @@ def test_partial_reviewer_availability_preserves_capable_assignment(tmp_path: Pa
     routed, failures = route_children_to_capable_profiles(
         children,
         workspace,
-        fallback_profile="default",
+        fallback_profile="fallback-reviewer",
         capability_fn=capability,
     )
 
     assert [child["assignee"] for child in routed] == [
         "functional-reviewer",
-        "default",
+        "fallback-reviewer",
     ]
     assert len(failures) == 1
 

@@ -1419,6 +1419,7 @@ def _materialize_readonly_workspace(
     source: str,
     expected: dict[str, object],
     expected_git_sha: Optional[str] = None,
+    expected_content_sha256: Optional[str] = None,
     *,
     disposable: bool = False,
     provenance_deadline: Optional[float] = None,
@@ -1434,6 +1435,9 @@ def _materialize_readonly_workspace(
         expected_git_sha,
         provenance_deadline=provenance_deadline,
     )
+    if expected_content_sha256 is not None and content != expected_content_sha256:
+        _best_effort_close(archive)
+        raise ValueError("reviewer workspace content changed after dispatcher preflight")
     volume = (
         f"hermes-ro-{content[:16]}-{uuid.uuid4().hex[:8]}"
         if disposable
@@ -2584,12 +2588,14 @@ class DockerEnvironment(BaseEnvironment):
         persist_across_processes: bool = True,
         tmp_storage: str = "tmpfs",
         expected_git_sha: Optional[str] = None,
+        reviewer_mode: bool = False,
+        expected_content_sha256: Optional[str] = None,
     ):
         if cwd == "~":
             cwd = "/root"
         if not isinstance(tmp_storage, str) or tmp_storage not in {"tmpfs", "disk"}:
             raise ValueError("docker_tmp_storage must be exactly 'tmpfs' or 'disk'")
-        reviewer_mode = expected_git_sha is not None
+        reviewer_mode = bool(reviewer_mode or expected_git_sha is not None)
         if reviewer_mode:
             # Exact-SHA reviews need disposable scratch larger than the hardened
             # 512 MiB default. Make this a runtime invariant, not a model-reported
@@ -3114,6 +3120,8 @@ class DockerEnvironment(BaseEnvironment):
             run_exec=image_uses_s6_init,
             tmp_storage=tmp_storage,
         )
+        if reviewer_mode:
+            security_args.append("--read-only")
 
         logger.info(f"Docker volume_args: {volume_args}")
         # User-supplied extra docker run flags (docker_extra_args in config.yaml).
@@ -3218,6 +3226,7 @@ class DockerEnvironment(BaseEnvironment):
                 source,
                 expected,
                 expected_git_sha,
+                expected_content_sha256,
                 disposable=reviewer_mode,
                 provenance_deadline=reviewer_provenance_deadline,
             )

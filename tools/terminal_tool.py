@@ -1634,6 +1634,22 @@ def _expected_kanban_workspace_sha() -> Optional[str]:
     return value
 
 
+def _kanban_reviewer_isolation_required() -> bool:
+    """Return the dispatcher-owned reviewer runtime requirement."""
+    return os.environ.get("HERMES_KANBAN_REVIEWER_ISOLATION") == "1"
+
+
+def _expected_kanban_workspace_content_sha256() -> Optional[str]:
+    value = os.environ.get("HERMES_KANBAN_EXPECTED_WORKSPACE_CONTENT_SHA256")
+    if value is None:
+        return None
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError(
+            "HERMES_KANBAN_EXPECTED_WORKSPACE_CONTENT_SHA256 must be 64 lowercase hex characters"
+        )
+    return value
+
+
 def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                         ssh_config: dict = None, container_config: dict = None,
                         local_config: dict = None,
@@ -1668,8 +1684,25 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     docker_network = cc.get("docker_network", True)
 
     expected_workspace_sha = _expected_kanban_workspace_sha()
-    if expected_workspace_sha is not None and env_type != "docker":
-        raise ValueError("an assigned Kanban workspace SHA requires the docker terminal backend")
+    expected_workspace_content = _expected_kanban_workspace_content_sha256()
+    reviewer_isolation = _kanban_reviewer_isolation_required()
+    if (expected_workspace_sha is not None or reviewer_isolation) and env_type != "docker":
+        raise ValueError("an assigned Kanban reviewer requires the docker terminal backend")
+    if reviewer_isolation:
+        allowed_roots = cc.get("docker_cwd_allowed_roots")
+        if not isinstance(allowed_roots, list) or not allowed_roots:
+            raise ValueError(
+                "an assigned Kanban reviewer requires a non-empty Docker cwd allowlist"
+            )
+        # Reviewer isolation is a task contract, not a profile preference.
+        # Force every mutable/credential-bearing option off at environment
+        # creation so a changed or fallback profile cannot weaken preflight.
+        persistent = False
+        volumes = []
+        docker_forward_env = []
+        docker_env = {}
+        docker_extra_args = []
+        docker_network = False
 
     if env_type == "local":
         return _LocalEnvironment(cwd=cwd, timeout=timeout)
@@ -1688,18 +1721,32 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             persistent_filesystem=persistent, task_id=task_id,
             volumes=volumes,
             host_cwd=host_cwd,
-            auto_mount_cwd=cc.get("docker_mount_cwd_to_workspace", False),
-            cwd_mount_mode=cc.get("docker_cwd_mount_mode", "rw"),
+            auto_mount_cwd=(
+                True if reviewer_isolation
+                else cc.get("docker_mount_cwd_to_workspace", False)
+            ),
+            cwd_mount_mode=(
+                "ro" if reviewer_isolation
+                else cc.get("docker_cwd_mount_mode", "rw")
+            ),
             cwd_path_mappings=cc.get("docker_cwd_path_mappings", {}),
             cwd_allowed_roots=cc.get("docker_cwd_allowed_roots", []),
             forward_env=docker_forward_env,
             env=docker_env,
-            run_as_host_user=cc.get("docker_run_as_host_user", False),
+            run_as_host_user=(
+                False if reviewer_isolation
+                else cc.get("docker_run_as_host_user", False)
+            ),
             network=docker_network,
             extra_args=docker_extra_args,
             tmp_storage=cc.get("docker_tmp_storage", "tmpfs"),
             expected_git_sha=expected_workspace_sha,
-            persist_across_processes=cc.get("docker_persist_across_processes", True),
+            reviewer_mode=reviewer_isolation,
+            expected_content_sha256=expected_workspace_content,
+            persist_across_processes=(
+                False if reviewer_isolation
+                else cc.get("docker_persist_across_processes", True)
+            ),
         )
     
     elif env_type == "singularity":

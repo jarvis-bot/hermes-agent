@@ -57,9 +57,7 @@ def _patch_extra_body():
 
 
 def _patch_list_profiles(names: list[str]):
-    """Pretend the named profiles exist. The decomposer uses
-    profiles_mod.list_profiles() to build the roster + valid-set, and
-    profiles_mod.profile_exists() to resolve orchestrator/default."""
+    """Pretend the named profiles exist and can mount the test workspace."""
     from types import SimpleNamespace
     fake_profiles = [
         SimpleNamespace(
@@ -68,10 +66,27 @@ def _patch_list_profiles(names: list[str]):
         )
         for i, n in enumerate(names)
     ]
+
+    def route_capable(children, workspace, *, fallback_profile):
+        identity = Path(workspace).stat()
+        return [
+            dict(
+                child,
+                _workspace_device=identity.st_dev,
+                _workspace_inode=identity.st_ino,
+                requires_reviewer_isolation="reviewer" in str(child.get("assignee", "")),
+            )
+            for child in children
+        ], []
+
     return [
         patch("hermes_cli.profiles.list_profiles", return_value=fake_profiles),
         patch("hermes_cli.profiles.profile_exists", side_effect=lambda x: x in names),
         patch("hermes_cli.profiles.get_active_profile_name", return_value=names[0] if names else "default"),
+        patch(
+            "hermes_cli.kanban_decompose.route_children_to_capable_profiles",
+            side_effect=route_capable,
+        ),
     ]
 
 
@@ -227,6 +242,55 @@ def test_decompose_preflights_exact_workspace_and_reroutes_before_create(
     with kb.connect() as conn:
         children = [kb.get_task(conn, child_id) for child_id in outcome.child_ids]
     assert [child.assignee for child in children] == ["orchestrator", "orchestrator"]
+
+
+def test_decompose_materializes_scratch_workspace_before_graph_publication(
+    kanban_home
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="dynamic review", triage=True, assignee="orchestrator"
+        )
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "review",
+        "tasks": [
+            {"title": "quality", "body": "review", "assignee": "quality-reviewer", "parents": []},
+        ],
+    })
+    checked = []
+
+    def route(children, selected_workspace, *, fallback_profile):
+        workspace = Path(selected_workspace)
+        assert workspace.is_dir()
+        checked.append(workspace)
+        identity = workspace.stat()
+        return [dict(
+            children[0], _workspace_device=identity.st_dev,
+            _workspace_inode=identity.st_ino,
+            requires_reviewer_isolation=True,
+        )], []
+
+    patches = _patch_list_profiles(["orchestrator", "quality-reviewer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose.route_children_to_capable_profiles",
+            side_effect=route,
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is True
+    assert len(checked) == 1
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+        child = kb.get_task(conn, outcome.child_ids[0])
+    assert root is not None and root.workspace_path == str(checked[0])
+    assert child is not None and child.workspace_path == str(checked[0])
 
 
 def test_decompose_aborts_atomically_when_selected_and_fallback_cannot_mount(

@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -86,7 +87,7 @@ import threading
 import logging
 import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
@@ -123,7 +124,9 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {
+    "dependency", "needs_input", "capability", "workspace_capability", "transient"
+}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -4635,6 +4638,8 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_assignee: Optional[str] = None,
+    expected_workspace_path: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -4652,8 +4657,7 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        cur = conn.execute(
-            """
+        sql = """
             UPDATE tasks
                SET status        = 'running',
                    claim_lock    = ?,
@@ -4662,9 +4666,15 @@ def claim_review_task(
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
-            """,
-            (lock, expires, now, task_id),
-        )
+            """
+        params: list[Any] = [lock, expires, now, task_id]
+        if expected_assignee is not None:
+            sql += " AND assignee = ?"
+            params.append(expected_assignee)
+        if expected_workspace_path is not None:
+            sql += " AND workspace_path = ?"
+            params.append(expected_workspace_path)
+        cur = conn.execute(sql, tuple(params))
         if cur.rowcount != 1:
             return None
         trow = conn.execute(
@@ -8548,6 +8558,7 @@ def recover_workspace_capability_tasks(
     *,
     fallback_profile: Optional[str],
     capability_fn,
+    prepared_workspace_preflights: Optional[dict[tuple[str, str], dict[str, Any]]] = None,
 ) -> int:
     """Recover tasks blocked specifically by workspace capability failures.
 
@@ -8560,12 +8571,16 @@ def recover_workspace_capability_tasks(
     Capability probes intentionally run outside SQLite write transactions: a
     real Docker canary can take seconds, while the final CAS mutation is tiny.
     Repeated calls are idempotent because only ``status='blocked'`` rows with
-    ``block_kind='capability'`` participate.
+    ``block_kind='workspace_capability'`` participate.
     """
+    from hermes_cli.kanban_workspace_preflight import (
+        profile_uses_restricted_reviewer_runtime,
+        workspace_capability_matches,
+    )
     rows = conn.execute(
         "SELECT id, assignee, workspace_path, requires_reviewer_isolation "
         "FROM tasks "
-        "WHERE status = 'blocked' AND block_kind = 'capability' "
+        "WHERE status = 'blocked' AND block_kind = 'workspace_capability' "
         "AND workspace_path IS NOT NULL AND workspace_path != '' "
         "ORDER BY created_at ASC"
     ).fetchall()
@@ -8576,9 +8591,11 @@ def recover_workspace_capability_tasks(
         selected = (selected_raw or "").strip()
         workspace_raw = row["workspace_path"]
         workspace = Path(workspace_raw)
+        prepared = (prepared_workspace_preflights or {}).get((row["id"], "blocked"))
         try:
             selected_capability = (
-                capability_fn(selected, workspace) if selected else None
+                prepared.get("selected") if prepared is not None
+                else (capability_fn(selected, workspace) if selected else None)
             )
         except Exception as exc:
             _log.warning(
@@ -8593,7 +8610,10 @@ def recover_workspace_capability_tasks(
         )
         if target is None and fallback:
             try:
-                fallback_capability = capability_fn(fallback, workspace)
+                fallback_capability = (
+                    prepared.get("fallback") if prepared is not None
+                    else capability_fn(fallback, workspace)
+                )
             except Exception as exc:
                 _log.warning(
                     "kanban workspace recovery: fallback probe failed for %s: %s",
@@ -8601,14 +8621,18 @@ def recover_workspace_capability_tasks(
                 )
                 fallback_capability = None
             if fallback_capability and fallback_capability.available:
-                target = fallback
-                target_capability = fallback_capability
+                reviewer_isolation_required = (
+                    bool(row["requires_reviewer_isolation"])
+                    or profile_uses_restricted_reviewer_runtime(selected)
+                )
+                if not reviewer_isolation_required or (
+                    fallback_capability.read_only
+                    and profile_uses_restricted_reviewer_runtime(fallback)
+                ):
+                    target = fallback
+                    target_capability = fallback_capability
         if target is None or target_capability is None:
             continue
-        from hermes_cli.kanban_workspace_preflight import (
-            profile_uses_restricted_reviewer_runtime,
-            workspace_capability_matches,
-        )
         if not workspace_capability_matches(target_capability, workspace):
             continue
         requires_reviewer_isolation = bool(row["requires_reviewer_isolation"])
@@ -8639,7 +8663,7 @@ def recover_workspace_capability_tasks(
                 "requires_reviewer_isolation = ?, block_kind = NULL, "
                 "block_recurrences = 0 "
                 "WHERE id = ? AND status = 'blocked' "
-                "AND block_kind = 'capability' AND assignee IS ? "
+                "AND block_kind = 'workspace_capability' AND assignee IS ? "
                 "AND workspace_path = ?",
                 (
                     target,
@@ -8671,6 +8695,215 @@ def recover_workspace_capability_tasks(
             )
             recovered += 1
     return recovered
+
+
+_WORKSPACE_PREFLIGHT_TASK_LIMIT = 8
+_WORKSPACE_PREFLIGHT_WORKERS = 4
+
+
+def _release_stale_workspace_claim(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    return_status: str,
+    workspace: str,
+) -> None:
+    """Release a claim when its preflight identity no longer names the path."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL WHERE id = ? AND status = 'running' AND claim_lock IS ?",
+            (return_status, task.id, task.claim_lock),
+        )
+        if cur.rowcount == 1:
+            run_id = _end_run(
+                conn, task.id, outcome="workspace_changed", status="workspace_changed",
+                error="workspace filesystem object changed at final spawn boundary",
+            )
+            _append_event(
+                conn, task.id, "workspace_preflight_stale",
+                {"workspace": workspace}, run_id=run_id,
+            )
+
+
+def _materialize_dispatch_workspace_candidates(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str],
+    max_spawn: Optional[int],
+    max_in_progress: Optional[int],
+    max_in_progress_per_profile: Optional[int],
+    default_assignee: Optional[str],
+) -> dict[tuple[str, str], Task]:
+    """Apply cheap gates, then materialize exact candidate workspaces.
+
+    The caller holds the board lock only for this filesystem/DB preparation;
+    Docker probes run later, after the lock is released.
+    """
+    limit = _WORKSPACE_PREFLIGHT_TASK_LIMIT
+    if isinstance(max_spawn, int) and max_spawn > 0:
+        limit = min(limit, max_spawn)
+    running = int(conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+    ).fetchone()[0])
+    spawn_slots = limit
+    for cap in (max_spawn, max_in_progress):
+        if isinstance(cap, int) and cap >= 0:
+            spawn_slots = min(spawn_slots, max(0, cap - running))
+    per_profile_cap = (
+        max_in_progress_per_profile
+        if isinstance(max_in_progress_per_profile, int)
+        and max_in_progress_per_profile > 0
+        else None
+    )
+    per_profile_running = {
+        row["assignee"]: int(row["n"])
+        for row in conn.execute(
+            "SELECT assignee, COUNT(*) AS n FROM tasks WHERE status = 'running' "
+            "AND assignee IS NOT NULL GROUP BY assignee"
+        )
+    }
+    fallback = (default_assignee or "").strip() or None
+    rows = conn.execute(
+        "SELECT id, status, assignee FROM tasks WHERE claim_lock IS NULL AND ("
+        "status IN ('ready', 'review') OR "
+        "(status = 'blocked' AND block_kind = 'workspace_capability')) "
+        "ORDER BY priority DESC, created_at ASC"
+    ).fetchall()
+    snapshots: dict[tuple[str, str], Task] = {}
+    candidate_profile_exists: Any = None
+    try:
+        from hermes_cli.profiles import profile_exists as candidate_profile_exists
+    except Exception:
+        pass
+    for row in rows:
+        if len(snapshots) >= limit:
+            break
+        effective_assignee = row["assignee"] or fallback
+        if not effective_assignee:
+            continue
+        if (
+            candidate_profile_exists is not None
+            and not candidate_profile_exists(str(effective_assignee))
+        ):
+            continue
+        if row["status"] in {"ready", "review"}:
+            if spawn_slots <= 0:
+                continue
+            assignee = str(effective_assignee)
+            if (
+                per_profile_cap is not None
+                and per_profile_running.get(assignee, 0) >= per_profile_cap
+            ):
+                continue
+            if check_respawn_guard(conn, row["id"]):
+                continue
+        task = get_task(conn, row["id"])
+        if task is None or task.status != row["status"]:
+            continue
+        try:
+            resolved_branch = task.branch_name
+            if (
+                task.workspace_path
+                and (task.workspace_kind != "worktree" or task.branch_name)
+            ):
+                workspace = Path(task.workspace_path).resolve(strict=True)
+                resolved_branch = task.branch_name
+            elif task.workspace_kind == "worktree":
+                workspace, resolved_branch = _resolve_worktree_workspace(task, board=board)
+                workspace = Path(workspace).resolve(strict=True)
+            else:
+                workspace = Path(resolve_workspace(task, board=board)).resolve(strict=True)
+        except Exception as exc:
+            _log.warning(
+                "kanban workspace preparation failed for task %s: %s", task.id, exc
+            )
+            continue
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET workspace_path = ?, branch_name = COALESCE(?, branch_name) "
+                "WHERE id = ? AND status = ? AND claim_lock IS NULL "
+                "AND assignee IS ? AND workspace_path IS ?",
+                (
+                    str(workspace), resolved_branch, task.id, task.status,
+                    task.assignee, task.workspace_path,
+                ),
+            )
+        if cur.rowcount != 1:
+            continue
+        refreshed = get_task(conn, task.id)
+        if refreshed is not None:
+            if not refreshed.assignee:
+                refreshed = replace(refreshed, assignee=str(effective_assignee))
+            snapshots[(task.id, task.status)] = refreshed
+            if task.status in {"ready", "review"}:
+                spawn_slots -= 1
+                per_profile_running[str(effective_assignee)] = (
+                    per_profile_running.get(str(effective_assignee), 0) + 1
+                )
+
+    return snapshots
+
+
+def _probe_dispatch_workspace_candidates(
+    snapshots: dict[tuple[str, str], Task],
+    *,
+    fallback_profile: Optional[str],
+    capability_fn,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Run bounded/cached probes without holding the board dispatch lock."""
+
+    default_probe = capability_fn is None
+    if default_probe:
+        from hermes_cli.kanban_workspace_preflight import (
+            cached_preflight_workspace_for_profile as capability_fn,
+        )
+    assert capability_fn is not None
+    requests: dict[tuple[str, str], tuple[str, Path]] = {}
+    fallback = (fallback_profile or "").strip()
+    for key, task in snapshots.items():
+        workspace = Path(task.workspace_path or "")
+        requests[(f"{key[0]}:{key[1]}", str(task.assignee))] = (
+            str(task.assignee), workspace
+        )
+        if fallback and fallback != task.assignee:
+            requests[(f"{key[0]}:{key[1]}", fallback)] = (fallback, workspace)
+
+    capabilities: dict[tuple[str, str], Any] = {}
+    if default_probe:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(_WORKSPACE_PREFLIGHT_WORKERS, max(1, len(requests)))
+        ) as pool:
+            future_keys = {
+                pool.submit(capability_fn, profile, workspace): key
+                for key, (profile, workspace) in requests.items()
+            }
+            for future, key in ((future, key) for future, key in future_keys.items()):
+                try:
+                    capabilities[key] = future.result()
+                except Exception as exc:
+                    _log.warning("kanban workspace probe failed for %s: %s", key[0], exc)
+                    capabilities[key] = None
+    else:
+        # Injected probes are a long-standing synchronous test/extension seam;
+        # do not silently move caller-owned state (such as SQLite handles) to a
+        # worker thread. They still execute outside the board dispatch lock.
+        for key, (profile, workspace) in requests.items():
+            try:
+                capabilities[key] = capability_fn(profile, workspace)
+            except Exception as exc:
+                _log.warning("kanban workspace probe failed for %s: %s", key[0], exc)
+                capabilities[key] = None
+
+    prepared: dict[tuple[str, str], dict[str, Any]] = {}
+    for key, task in snapshots.items():
+        prefix = f"{key[0]}:{key[1]}"
+        prepared[key] = {
+            "task": task,
+            "selected": capabilities.get((prefix, str(task.assignee))),
+            "fallback": capabilities.get((prefix, fallback)) if fallback else None,
+        }
+    return prepared
 
 
 def dispatch_once(
@@ -8706,9 +8939,43 @@ def dispatch_once(
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
-        # Path resolution should never fail, but if it somehow does we
-        # must not lose the tick — fall through to an unguarded dispatch
-        # rather than dropping work.
+        db_path = None
+
+    snapshots: dict[tuple[str, str], Task] = {}
+    if not dry_run:
+        if db_path is None:
+            snapshots = _materialize_dispatch_workspace_candidates(
+                conn,
+                board=board,
+                max_spawn=max_spawn,
+                max_in_progress=max_in_progress,
+                max_in_progress_per_profile=max_in_progress_per_profile,
+                default_assignee=default_assignee,
+            )
+        else:
+            # Hold the board lock for exact workspace allocation and its CAS,
+            # then release it before any potentially slow Docker canary.
+            with _dispatch_tick_lock(db_path) as held:
+                if not held:
+                    return DispatchResult(skipped_locked=True)
+                snapshots = _materialize_dispatch_workspace_candidates(
+                    conn,
+                    board=board,
+                    max_spawn=max_spawn,
+                    max_in_progress=max_in_progress,
+                    max_in_progress_per_profile=max_in_progress_per_profile,
+                    default_assignee=default_assignee,
+                )
+    prepared_preflights = (
+        {}
+        if dry_run
+        else _probe_dispatch_workspace_candidates(
+            snapshots,
+            fallback_profile=default_assignee,
+            capability_fn=workspace_capability_fn,
+        )
+    )
+    def run_locked() -> DispatchResult:
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
@@ -8722,24 +8989,15 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             workspace_capability_fn=workspace_capability_fn,
+            prepared_workspace_preflights=prepared_preflights,
         )
+
+    if db_path is None:
+        return run_locked()
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             return DispatchResult(skipped_locked=True)
-        result = _dispatch_once_locked(
-            conn,
-            spawn_fn=spawn_fn,
-            ttl_seconds=ttl_seconds,
-            dry_run=dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=failure_limit,
-            stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
-            workspace_capability_fn=workspace_capability_fn,
-        )
+        result = run_locked()
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
         _maybe_checkpoint_wal(conn, db_path)
@@ -8760,6 +9018,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     workspace_capability_fn=None,
+    prepared_workspace_preflights: Optional[dict[tuple[str, str], dict[str, Any]]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -8820,15 +9079,13 @@ def _dispatch_once_locked(
         profile_uses_restricted_reviewer_runtime,
         workspace_capability_matches,
     )
-    if workspace_capability_fn is None:
-        from hermes_cli.kanban_workspace_preflight import (
-            preflight_workspace_for_profile as workspace_capability_fn,
-        )
+    prepared_workspace_preflights = prepared_workspace_preflights or {}
     if not dry_run:
         recover_workspace_capability_tasks(
             conn,
             fallback_profile=default_assignee,
             capability_fn=workspace_capability_fn,
+            prepared_workspace_preflights=prepared_workspace_preflights,
         )
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
@@ -8980,40 +9237,55 @@ def _dispatch_once_locked(
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
             continue
+        # Per-profile concurrency is a cheap gate and must precede capability
+        # lookup: capped tasks are intentionally absent from the bounded probe
+        # set but still need their established diagnostic result.
+        if _per_profile_cap is not None:
+            current = _per_profile_running.get(row_assignee, 0)
+            if current >= _per_profile_cap:
+                result.skipped_per_profile_capped.append(
+                    (row["id"], row_assignee, current)
+                )
+                continue
         # Profile existence is not a runtime capability check.  For tasks with
         # an already allocated workspace, probe the exact path before claim so
         # a Docker mount failure cannot consume a run or strand a dependency
         # graph.  A capable configured fallback becomes the durable owner;
         # when no runtime is capable the row stays ready and unclaimed for a
         # later tick/config repair.
-        task_for_preflight = get_task(conn, row["id"])
-        if task_for_preflight and task_for_preflight.workspace_path:
+        prepared = prepared_workspace_preflights.get((row["id"], "ready"))
+        if not dry_run and prepared is None:
+            # A task promoted after the bounded preparation phase waits for the
+            # next tick; it is never claimed without an exact-path preflight.
+            continue
+        prepared_data = prepared or {}
+        task_for_preflight = (
+            prepared_data.get("task") if prepared is not None else get_task(conn, row["id"])
+        )
+        effective_capability = None
+        if not dry_run and task_for_preflight and task_for_preflight.workspace_path:
             workspace_for_preflight = Path(task_for_preflight.workspace_path)
-            try:
-                selected_capability = workspace_capability_fn(
-                    row_assignee, workspace_for_preflight
-                )
-            except Exception as exc:
-                _log.warning(
-                    "kanban dispatch: workspace preflight raised for task %s: %s",
-                    row["id"], exc,
-                )
-                selected_capability = None
+            selected_capability = prepared_data.get("selected")
             effective_capability = selected_capability
             if not selected_capability or not selected_capability.available:
-                fallback_capability = None
-                if _default_assignee and _default_assignee != row_assignee:
-                    try:
-                        fallback_capability = workspace_capability_fn(
-                            _default_assignee, workspace_for_preflight
+                fallback_capability = prepared_data.get("fallback")
+                reviewer_isolation_required = (
+                    bool(task_for_preflight.requires_reviewer_isolation)
+                    or profile_uses_restricted_reviewer_runtime(row_assignee)
+                )
+                if (
+                    not fallback_capability
+                    or not fallback_capability.available
+                    or (
+                        reviewer_isolation_required
+                        and not (
+                            fallback_capability.read_only
+                            and profile_uses_restricted_reviewer_runtime(
+                                str(_default_assignee)
+                            )
                         )
-                    except Exception as exc:
-                        _log.warning(
-                            "kanban dispatch: fallback workspace preflight raised "
-                            "for task %s: %s",
-                            row["id"], exc,
-                        )
-                if not fallback_capability or not fallback_capability.available:
+                    )
+                ):
                     continue
                 previous_assignee = row_assignee
                 row_assignee = str(_default_assignee)
@@ -9078,19 +9350,7 @@ def _dispatch_once_locked(
                 task_for_preflight = get_task(conn, row["id"])
                 if task_for_preflight is None:
                     continue
-        # Per-profile concurrency cap (#21582): even if there's global
-        # headroom, refuse to spawn for an assignee that's already at
-        # its in-flight cap. Prevents one profile's local model / API
-        # quota / browser pool from being overwhelmed by a fan-out
-        # while the global max_in_progress / max_spawn caps still allow
-        # work on OTHER profiles.
-        if _per_profile_cap is not None:
-            current = _per_profile_running.get(row_assignee, 0)
-            if current >= _per_profile_cap:
-                result.skipped_per_profile_capped.append(
-                    (row["id"], row_assignee, current)
-                )
-                continue
+
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -9122,6 +9382,8 @@ def _dispatch_once_locked(
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
+            continue
+        if effective_capability is None:
             continue
         claimed = claim_task(
             conn,
@@ -9195,18 +9457,28 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        if not workspace_capability_matches(effective_capability, str(workspace)):
+            _release_stale_workspace_claim(
+                conn,
+                claimed,
+                return_status="ready",
+                workspace=str(workspace),
+            )
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
+            # Introspect the callable and pass optional invariants when supported.
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                spawn_kwargs = {}
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    spawn_kwargs["board"] = board
+                if "workspace_capability" in sig.parameters:
+                    spawn_kwargs["workspace_capability"] = effective_capability
+                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
@@ -9262,10 +9534,49 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        prepared = prepared_workspace_preflights.get((row["id"], "review"))
+        if not dry_run and prepared is None:
+            continue
+        review_task = prepared.get("task") if prepared is not None else None
+        review_capability = prepared.get("selected") if prepared is not None else None
+        if not dry_run:
+            if (
+                review_task is None
+                or not review_task.workspace_path
+                or review_capability is None
+                or not workspace_capability_matches(
+                    review_capability, review_task.workspace_path
+                )
+            ):
+                continue
+            if (
+                profile_uses_restricted_reviewer_runtime(str(row["assignee"]))
+                and not review_task.requires_reviewer_isolation
+            ):
+                with write_txn(conn):
+                    cur = conn.execute(
+                        "UPDATE tasks SET requires_reviewer_isolation = 1 "
+                        "WHERE id = ? AND status = 'review' AND claim_lock IS NULL "
+                        "AND assignee = ? AND workspace_path = ?",
+                        (row["id"], row["assignee"], review_task.workspace_path),
+                    )
+                if cur.rowcount != 1:
+                    continue
+                review_task = get_task(conn, row["id"])
+                if review_task is None:
+                    continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        assert review_task is not None
+        assert review_capability is not None
+        claimed = claim_review_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            expected_assignee=str(row["assignee"]),
+            expected_workspace_path=review_task.workspace_path,
+        )
         if claimed is None:
             continue
         try:
@@ -9287,6 +9598,14 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        if not workspace_capability_matches(review_capability, str(workspace)):
+            _release_stale_workspace_claim(
+                conn,
+                claimed,
+                return_status="review",
+                workspace=str(workspace),
+            )
+            continue
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory
         # kanban lifecycle is already injected into every worker's system
@@ -9298,10 +9617,12 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                spawn_kwargs = {}
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    spawn_kwargs["board"] = board
+                if "workspace_capability" in sig.parameters:
+                    spawn_kwargs["workspace_capability"] = review_capability
+                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
@@ -9585,6 +9906,7 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
+    workspace_capability=None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -9597,6 +9919,13 @@ def _default_spawn(
     ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
     vars all resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
+
+    The dev/inode capability is a compare-and-swap integrity boundary against
+    ordinary concurrent board changes, not a kernel security boundary against a
+    hostile process with the same host UID. Reviewer command execution closes
+    that stronger boundary by copying the attested tree into a private Docker
+    volume and running with a read-only root filesystem, no network, credentials,
+    persistent state, or host-writable workspace mount.
     """
     import subprocess
     if not task.assignee:
@@ -9607,6 +9936,7 @@ def _default_spawn(
     profile_arg = normalize_profile_name(task.assignee)
     from hermes_cli.kanban_workspace_preflight import (
         profile_uses_restricted_reviewer_runtime,
+        workspace_capability_matches,
     )
     reviewer_runtime = (
         task.requires_reviewer_isolation
@@ -9663,6 +9993,11 @@ def _default_spawn(
     env.pop("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", None)
     if task.expected_workspace_sha:
         env["HERMES_KANBAN_EXPECTED_WORKSPACE_SHA"] = task.expected_workspace_sha
+    env.pop("HERMES_KANBAN_EXPECTED_WORKSPACE_CONTENT_SHA256", None)
+    if workspace_capability is not None and workspace_capability.content_sha256:
+        env["HERMES_KANBAN_EXPECTED_WORKSPACE_CONTENT_SHA256"] = (
+            workspace_capability.content_sha256
+        )
     if task.expected_workspace_sha or reviewer_runtime:
         # Exact-SHA reviewers consume candidate-controlled repository content.
         # Read-only reviewer profiles have the same trust boundary even when
@@ -9670,6 +10005,13 @@ def _default_spawn(
         # plugins, MCP startup, and shell hooks without ignoring the trusted
         # reviewer profile's Docker/provider config.
         env["HERMES_SAFE_MODE"] = "1"
+    if reviewer_runtime:
+        # This dispatcher-owned marker is consumed by terminal_tool to make the
+        # reviewer posture a runtime invariant.  It cannot be weakened by the
+        # fallback profile's ordinary terminal defaults.
+        env["HERMES_KANBAN_REVIEWER_ISOLATION"] = "1"
+    else:
+        env.pop("HERMES_KANBAN_REVIEWER_ISOLATION", None)
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
@@ -9778,6 +10120,13 @@ def _default_spawn(
     log_path = log_dir / f"{task.id}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
+
+    # Last check owned by the production process boundary. Custom spawn
+    # callbacks remain inside the trusted dispatcher extension boundary.
+    if workspace_capability is not None and not workspace_capability_matches(
+        workspace_capability, workspace
+    ):
+        raise RuntimeError("workspace filesystem object changed at spawn boundary")
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")

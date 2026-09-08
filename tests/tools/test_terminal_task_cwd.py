@@ -3,6 +3,7 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 import tools.terminal_tool as terminal_tool
 
 
@@ -13,6 +14,51 @@ def _minimal_terminal_config(cwd="/default"):
         "timeout": 60,
         "lifetime_seconds": 3600,
     }
+
+
+def test_reviewer_runtime_marker_rejects_local_backend(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_REVIEWER_ISOLATION", "1")
+    with pytest.raises(ValueError, match="requires the docker terminal backend"):
+        terminal_tool._create_environment("local", "unused", "/tmp", 60)
+
+
+def test_reviewer_runtime_marker_forces_disposable_credential_free_docker(
+    monkeypatch, tmp_path
+):
+    captured = {}
+    monkeypatch.setenv("HERMES_KANBAN_REVIEWER_ISOLATION", "1")
+    monkeypatch.setattr(terminal_tool, "_maybe_reap_docker_orphans", lambda _cc: None)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_DockerEnvironment",
+        lambda **kwargs: captured.update(kwargs) or SimpleNamespace(),
+    )
+    terminal_tool._create_environment(
+        "docker", "python:3.11", "/workspace", 60,
+        host_cwd=str(tmp_path),
+        container_config={
+            "container_persistent": True,
+            "docker_network": True,
+            "docker_volumes": ["secret:/secret"],
+            "docker_forward_env": ["TOKEN"],
+            "docker_env": {"TOKEN": "secret"},
+            "docker_extra_args": ["--privileged"],
+            "docker_persist_across_processes": True,
+            "docker_mount_cwd_to_workspace": False,
+            "docker_cwd_mount_mode": "rw",
+            "docker_cwd_allowed_roots": [str(tmp_path)],
+        },
+    )
+    assert captured["reviewer_mode"] is True
+    assert captured["persistent_filesystem"] is False
+    assert captured["persist_across_processes"] is False
+    assert captured["network"] is False
+    assert captured["volumes"] == []
+    assert captured["forward_env"] == []
+    assert captured["env"] == {}
+    assert captured["extra_args"] == []
+    assert captured["auto_mount_cwd"] is True
+    assert captured["cwd_mount_mode"] == "ro"
 
 
 def test_foreground_command_uses_registered_task_cwd_for_existing_environment(monkeypatch):
