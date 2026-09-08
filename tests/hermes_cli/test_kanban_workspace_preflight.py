@@ -3,14 +3,18 @@ from __future__ import annotations
 from pathlib import Path
 import os
 import subprocess
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from hermes_cli.kanban_workspace_preflight import (
     WorkspaceCapability,
+    _profile_config,
     _runtime_mount_probe,
     preflight_workspace_for_profile,
+    profile_uses_restricted_reviewer_runtime,
     route_children_to_capable_profiles,
 )
 
@@ -32,6 +36,45 @@ def _docker_config(root: Path, host_root: Path) -> dict:
         },
         "toolsets": ["hermes-cli"],
     }
+
+
+def test_effective_profile_config_honors_managed_overlay_and_env_expansion(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / ".hermes"
+    profile_home = home / "profiles" / "plain-worker"
+    managed = tmp_path / "managed"
+    profile_home.mkdir(parents=True)
+    managed.mkdir()
+    (profile_home / "config.yaml").write_text(
+        "terminal:\n  backend: local\n  docker_mount_cwd_to_workspace: false\n",
+        encoding="utf-8",
+    )
+    (managed / "config.yaml").write_text(
+        "terminal:\n"
+        "  reviewer_mode: true\n"
+        "  backend: docker\n"
+        "  docker_mount_cwd_to_workspace: true\n"
+        "  docker_cwd_mount_mode: ro\n"
+        "  docker_cwd_allowed_roots: ['${REVIEW_ROOT}']\n"
+        "  docker_network: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    monkeypatch.setenv("REVIEW_ROOT", str(tmp_path))
+    from hermes_cli import managed_scope
+    managed_scope.invalidate_managed_cache()
+
+    config = _profile_config("plain-worker")
+
+    assert config["terminal"]["backend"] == "docker"
+    assert config["terminal"]["docker_mount_cwd_to_workspace"] is True
+    assert config["terminal"]["docker_cwd_mount_mode"] == "ro"
+    assert config["terminal"]["docker_cwd_allowed_roots"] == [str(tmp_path)]
+    assert profile_uses_restricted_reviewer_runtime(
+        "plain-worker", profile_config=config
+    ) is True
 
 
 def test_dynamic_workspace_is_translated_and_probed_read_only(tmp_path: Path) -> None:
@@ -338,6 +381,84 @@ def test_runtime_probe_supports_ordinary_writable_networked_docker_profile(
     assert "--network=none" not in command
     assert f"{source}:/workspace:rw" in command
     assert "--read-only" not in command
+
+
+def test_reviewer_preflight_enforces_workspace_file_bounds_before_probe(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (workspace / "candidate.txt").write_text("candidate", encoding="utf-8")
+    called = False
+
+    def probe(**_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("tools.environments.docker._MAX_REVIEW_WORKSPACE_NODES", 0)
+    result = preflight_workspace_for_profile(
+        "quality-reviewer", workspace,
+        profile_config=_docker_config(tmp_path, Path("/srv")),
+        runtime_probe=probe,
+    )
+
+    assert result.available is False
+    assert "node limit" in result.reason
+    assert called is False
+
+
+def test_cached_preflight_deduplicates_before_expensive_probe_and_publishes_fresh_ttl(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from hermes_cli import kanban_workspace_preflight as module
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    identity = workspace.stat()
+    capability = WorkspaceCapability(
+        True, "quality-reviewer", str(workspace.resolve()), read_only=True,
+        device=identity.st_dev, inode=identity.st_ino,
+    )
+    module._probe_cache.clear()
+    module._probe_inflight.clear()
+    monkeypatch.setattr(module, "_profile_config", lambda _profile: {"terminal": {}})
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def expensive(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        assert release.wait(2)
+        return capability
+
+    monkeypatch.setattr(module, "preflight_workspace_for_profile", expensive)
+    results = []
+    threads = [
+        threading.Thread(
+            target=lambda: results.append(
+                module.cached_preflight_workspace_for_profile(
+                    "quality-reviewer", workspace
+                )
+            )
+        )
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    assert entered.wait(2)
+    time.sleep(0.05)
+    release.set()
+    for thread in threads:
+        thread.join(2)
+    published_at = time.monotonic()
+
+    assert calls == 1
+    assert results == [capability, capability]
+    assert module._probe_cache
+    expiry = next(iter(module._probe_cache.values()))[0]
+    assert expiry >= published_at + module._PROBE_CACHE_TTL_SECONDS - 0.5
 
 
 @pytest.mark.skipif(

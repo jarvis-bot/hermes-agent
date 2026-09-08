@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -30,6 +31,7 @@ def _capability(workspace: Path, available: set[str]):
             read_only="reviewer" in profile,
             device=candidate.stat().st_dev,
             inode=candidate.stat().st_ino,
+            reviewer_isolated="reviewer" in profile,
         )
 
     return check
@@ -240,6 +242,7 @@ def test_scratch_workspace_is_materialized_then_preflighted_before_claim(
             return WorkspaceCapability(
                 True, profile, str(candidate), read_only=True,
                 device=identity.st_dev, inode=identity.st_ino,
+                reviewer_isolated=True,
             )
 
         result = kb.dispatch_once(
@@ -273,6 +276,7 @@ def test_review_column_materializes_and_preflights_before_claim(
             return WorkspaceCapability(
                 True, profile, str(candidate), read_only=True,
                 device=identity.st_dev, inode=identity.st_ino,
+                reviewer_isolated=True,
             )
 
         result = kb.dispatch_once(
@@ -286,6 +290,138 @@ def test_review_column_materializes_and_preflights_before_claim(
     assert calls[0][2] == "review"
     assert result.spawned == [(task_id, "quality-reviewer", str(calls[0][1]))]
     assert task is not None and task.status == "running"
+
+
+@pytest.mark.parametrize("assignee", [None, "unavailable-reviewer"])
+def test_review_column_uses_capable_default_fallback_with_cas(
+    kanban_home, tmp_path, monkeypatch, assignee
+):
+    workspace = tmp_path / "review-fallback"
+    workspace.mkdir()
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    spawned = []
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="review fallback", assignee=assignee,
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+        conn.commit()
+
+        result = kb.dispatch_once(
+            conn,
+            default_assignee="fallback-reviewer",
+            workspace_capability_fn=_capability(workspace, {"fallback-reviewer"}),
+            spawn_fn=lambda task, path: spawned.append(
+                (task.assignee, task.requires_reviewer_isolation, path)
+            ) or 1234,
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert result.spawned == [(task_id, "fallback-reviewer", str(workspace.resolve()))]
+    assert spawned == [("fallback-reviewer", True, str(workspace.resolve()))]
+    assert task is not None
+    assert task.assignee == "fallback-reviewer"
+    assert task.requires_reviewer_isolation is True
+    assert task.status == "running"
+
+
+def test_review_column_ordinary_assignee_cannot_spawn_unrestricted(
+    kanban_home, tmp_path, monkeypatch
+):
+    workspace = tmp_path / "ordinary-in-review"
+    workspace.mkdir()
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    observed = []
+
+    def capability(profile: str, candidate: Path) -> WorkspaceCapability:
+        identity = candidate.stat()
+        return WorkspaceCapability(
+            True, profile, str(candidate), read_only=profile == "fallback-reviewer",
+            device=identity.st_dev, inode=identity.st_ino,
+            reviewer_isolated=profile == "fallback-reviewer",
+        )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="candidate content", assignee="coder",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+        conn.commit()
+        result = kb.dispatch_once(
+            conn,
+            default_assignee="fallback-reviewer",
+            workspace_capability_fn=capability,
+            spawn_fn=lambda task, _path: observed.append(
+                (task.assignee, task.requires_reviewer_isolation)
+            ) or 1234,
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert result.spawned
+    assert observed == [("fallback-reviewer", True)]
+    assert task is not None and task.requires_reviewer_isolation is True
+
+
+def test_linked_worktree_review_dispatches_from_standalone_runtime_snapshot(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    linked = tmp_path / "linked"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "candidate.txt").write_text("exact candidate\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "candidate"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-qb", "review/test", str(linked)],
+        check=True,
+    )
+    commit = subprocess.run(
+        ["git", "-C", str(linked), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    observed = []
+
+    def runtime_capability(profile: str, candidate: Path) -> WorkspaceCapability:
+        from tools.environments.docker import _path_identity
+        identity = _path_identity(str(candidate), content_digest=True)
+        assert (candidate / ".git").is_dir()
+        assert identity["git_ref"] == commit
+        stat_result = candidate.stat()
+        return WorkspaceCapability(
+            True, profile, str(candidate), read_only=True,
+            device=stat_result.st_dev, inode=stat_result.st_ino,
+            content_sha256=str(identity["mounted_content_sha256"]),
+            reviewer_isolated=True,
+        )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="linked review", assignee="quality-reviewer",
+            workspace_kind="worktree", workspace_path=str(linked),
+            branch_name="review/test",
+        )
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+        conn.commit()
+        result = kb.dispatch_once(
+            conn, workspace_capability_fn=runtime_capability,
+            spawn_fn=lambda task, path, **_: observed.append((task, path)) or 1234,
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert result.spawned
+    assert task is not None
+    assert task.workspace_kind == "dir"
+    assert task.expected_workspace_sha == commit
+    assert task.requires_reviewer_isolation is True
+    assert Path(task.workspace_path or "") != linked
+    assert (Path(task.workspace_path or "") / ".git").is_dir()
+    assert observed[0][1] == task.workspace_path
 
 
 def test_slow_workspace_probe_runs_outside_dispatch_lock(
@@ -319,6 +455,7 @@ def test_slow_workspace_probe_runs_outside_dispatch_lock(
             return WorkspaceCapability(
                 True, profile, str(candidate), read_only=True,
                 device=identity.st_dev, inode=identity.st_ino,
+                reviewer_isolated=True,
             )
 
         result = kb.dispatch_once(

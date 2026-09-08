@@ -32,9 +32,11 @@ class WorkspaceCapability:
     device: Optional[int] = None
     inode: Optional[int] = None
     content_sha256: Optional[str] = None
+    reviewer_isolated: bool = False
 
 
 _PROBE_CACHE_TTL_SECONDS = 30.0
+_PROBE_DEADLINE_SECONDS = 30.0
 _PROBE_CACHE_MAX_ENTRIES = 256
 _probe_cache_lock = threading.Lock()
 _probe_cache: dict[tuple[object, ...], tuple[float, WorkspaceCapability]] = {}
@@ -83,19 +85,28 @@ _MUTATING_TOOLSETS = {
 
 
 def _profile_config(profile: str) -> dict:
-    import yaml
+    """Load the authoritative effective configuration for one profile.
 
-    from hermes_cli.profiles import resolve_profile_env
+    This is the single policy source used by preflight, cache identity,
+    classification, and worker spawn.  ``load_config`` supplies defaults,
+    environment expansion, managed overlays, and path-keyed profile caching.
+    """
+    from hermes_cli.profiles import profile_exists, resolve_profile_env
 
-    home = Path(resolve_profile_env(profile))
-    config_path = home / "config.yaml"
-    if not config_path.is_file():
-        return {}
-    with config_path.open("r", encoding="utf-8") as handle:
-        loaded = yaml.safe_load(handle) or {}
-    if not isinstance(loaded, dict):
+    if not profile_exists(profile):
+        raise FileNotFoundError(f"profile {profile!r} does not exist")
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.config import load_config
+
+    profile_home = resolve_profile_env(profile)
+    token = set_hermes_home_override(profile_home)
+    try:
+        config = load_config()
+    finally:
+        reset_hermes_home_override(token)
+    if not isinstance(config, dict):
         raise ValueError(f"profile {profile!r} config is not an object")
-    return loaded
+    return config
 
 
 def _is_reviewer_profile(profile: str, terminal: dict) -> bool:
@@ -237,6 +248,7 @@ def preflight_workspace_for_profile(
     *,
     profile_config: Optional[dict] = None,
     runtime_probe: Callable[..., None] = _runtime_mount_probe,
+    deadline: Optional[float] = None,
 ) -> WorkspaceCapability:
     """Prove that *profile* can safely access this exact workspace.
 
@@ -244,7 +256,11 @@ def preflight_workspace_for_profile(
     route to a known-safe owner without creating or claiming a doomed task.
     """
     requested = Path(workspace).expanduser()
+    if deadline is None:
+        deadline = time.monotonic() + _PROBE_DEADLINE_SECONDS
     try:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("workspace preflight deadline exceeded")
         canonical = requested.resolve(strict=True)
         if not canonical.is_dir():
             raise ValueError("workspace is not a directory")
@@ -282,6 +298,7 @@ def preflight_workspace_for_profile(
             raise ValueError("Docker profile does not mount the assigned workspace")
 
         from tools.environments.docker import (
+            _enforce_reviewer_workspace_bounds,
             _readonly_tree_digest,
             _resolve_cwd_mount_source,
         )
@@ -295,6 +312,13 @@ def preflight_workspace_for_profile(
         if not stat.S_ISDIR(source_before.st_mode):
             raise ValueError("Docker workspace source is not a stable directory")
         read_only = terminal.get("docker_cwd_mount_mode", "rw") == "ro"
+        if reviewer:
+            _enforce_reviewer_workspace_bounds(
+                Path(canonical_source), deadline=deadline
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("workspace preflight deadline exceeded")
         runtime_probe(
             docker_source=docker_source,
             image=terminal.get("docker_image")
@@ -302,6 +326,7 @@ def preflight_workspace_for_profile(
             expected_inode=source_before.st_ino,
             read_only=read_only,
             network_enabled=bool(terminal.get("docker_network", True)),
+            timeout=max(1, int(remaining)),
         )
         source_after = os.stat(canonical_source, follow_symlinks=False)
         if (source_after.st_dev, source_after.st_ino) != (
@@ -310,7 +335,9 @@ def preflight_workspace_for_profile(
         ):
             raise ValueError("workspace filesystem object changed during preflight")
         content_sha256 = (
-            _readonly_tree_digest(Path(canonical_source), include_root_mode=False)
+            _readonly_tree_digest(
+                Path(canonical_source), include_root_mode=False, deadline=deadline
+            )
             if reviewer
             else None
         )
@@ -329,6 +356,7 @@ def preflight_workspace_for_profile(
             device=source_final.st_dev,
             inode=source_final.st_ino,
             content_sha256=content_sha256,
+            reviewer_isolated=reviewer,
         )
     except Exception as exc:
         return WorkspaceCapability(
@@ -342,34 +370,32 @@ def preflight_workspace_for_profile(
 def cached_preflight_workspace_for_profile(
     profile: str, workspace: str | Path
 ) -> WorkspaceCapability:
-    """Run/cache a bounded probe by profile, workspace object, and config bytes."""
+    """Run/cache one deadline-bounded probe, deduplicating before tree traversal."""
     requested = Path(workspace).expanduser()
+    deadline = time.monotonic() + _PROBE_DEADLINE_SECONDS
     try:
         canonical = requested.resolve(strict=True)
         identity = os.stat(canonical, follow_symlinks=False)
         config = _profile_config(profile)
-        terminal = config.get("terminal") if isinstance(config, dict) else {}
-        if not isinstance(terminal, dict):
-            terminal = {}
-        if _is_reviewer_profile(profile, terminal):
-            from tools.environments.docker import _readonly_tree_metadata_digest
-
-            workspace_identity = _readonly_tree_metadata_digest(canonical)
-        else:
-            workspace_identity = identity.st_mtime_ns
         config_identity = hashlib.sha256(
             json.dumps(config, sort_keys=True, separators=(",", ":"), default=str).encode()
         ).hexdigest()
+        # This intentionally cheap key enters in-flight dedupe before any
+        # candidate-controlled recursive walk. Runtime authentication compares
+        # the published content digest, so a same-inode in-place mutation during
+        # the short TTL fails closed rather than consuming stale bytes.
         key = (
             profile, str(canonical), identity.st_dev, identity.st_ino,
-            workspace_identity, config_identity,
+            identity.st_mtime_ns, identity.st_ctime_ns, config_identity,
         )
-    except Exception:
-        # The ordinary implementation returns structured failure diagnostics;
-        # let it do so rather than making cache-key construction authoritative.
-        return preflight_workspace_for_profile(profile, requested)
-    now = time.monotonic()
+    except Exception as exc:
+        return WorkspaceCapability(
+            False, profile, str(requested),
+            reason=f"workspace preflight setup failed: {exc}",
+        )
+
     with _probe_cache_lock:
+        now = time.monotonic()
         cached = _probe_cache.get(key)
         if cached is not None and cached[0] > now:
             return cached[1]
@@ -380,21 +406,35 @@ def cached_preflight_workspace_for_profile(
             _probe_inflight[key] = wait_for
     assert wait_for is not None
     if not owner:
-        # A competing tick already scheduled this exact expensive canary. Wait
-        # outside both the cache mutex and board lock, then consume its result.
-        wait_for.wait(timeout=35)
+        remaining = max(0.0, deadline - time.monotonic())
+        if not wait_for.wait(timeout=remaining):
+            return WorkspaceCapability(
+                False, profile, str(canonical),
+                reason="workspace preflight deadline exceeded while waiting for identical probe",
+            )
         with _probe_cache_lock:
             cached = _probe_cache.get(key)
             if cached is not None and cached[0] > time.monotonic():
                 return cached[1]
-        # The owner timed out or failed before publishing; this caller becomes
-        # a bounded retry rather than trusting stale/absent evidence.
-    result = preflight_workspace_for_profile(profile, canonical, profile_config=config)
+        return WorkspaceCapability(
+            False, profile, str(canonical),
+            reason="identical workspace preflight completed without published evidence",
+        )
+
+    try:
+        result = preflight_workspace_for_profile(
+            profile, canonical, profile_config=config, deadline=deadline
+        )
+    except Exception as exc:
+        result = WorkspaceCapability(
+            False, profile, str(canonical), reason=f"workspace preflight failed: {exc}"
+        )
     with _probe_cache_lock:
         if len(_probe_cache) >= _PROBE_CACHE_MAX_ENTRIES:
             oldest = min(_probe_cache, key=lambda item: _probe_cache[item][0])
             _probe_cache.pop(oldest, None)
-        _probe_cache[key] = (now + _PROBE_CACHE_TTL_SECONDS, result)
+        # TTL starts when evidence is published, not before a slow canary.
+        _probe_cache[key] = (time.monotonic() + _PROBE_CACHE_TTL_SECONDS, result)
         completed = _probe_inflight.pop(key, None)
         if completed is not None:
             completed.set()

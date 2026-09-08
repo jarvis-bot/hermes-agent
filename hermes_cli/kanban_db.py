@@ -83,6 +83,7 @@ import stat
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import logging
 import time
@@ -6467,41 +6468,33 @@ def decompose_triage_task(
         root_ws_path = root_row["workspace_path"]
         root_expected_sha = root_row["expected_workspace_sha"]
 
-        # Bind decomposition to the filesystem objects proved by the runtime
-        # canaries, not merely to pathname strings. All preflighted children
-        # inherit this same root object; any missing/mismatched attestation
-        # aborts before the first child row is inserted.
-        attestations = [
-            (child.get("_workspace_device"), child.get("_workspace_inode"))
-            for child in children
-            if "_workspace_device" in child and "_workspace_inode" in child
-        ]
-        if expected_workspace_path is not None and len(attestations) != len(children):
-            raise ValueError("workspace capability attestation is required")
-        unique_attestations = set(attestations)
-        if unique_attestations:
-            if len(unique_attestations) != 1 or root_ws_path is None:
-                raise ValueError("inconsistent workspace filesystem attestation")
-            expected_device, expected_inode = next(iter(unique_attestations))
-            if expected_device is None or expected_inode is None:
-                raise ValueError("incomplete workspace filesystem attestation")
-            try:
-                current_workspace = os.stat(root_ws_path, follow_symlinks=False)
-            except OSError as exc:
-                raise ValueError("workspace disappeared after preflight") from exc
-            if (
-                not stat.S_ISDIR(current_workspace.st_mode)
-                or (current_workspace.st_dev, current_workspace.st_ino)
-                != (expected_device, expected_inode)
-            ):
-                raise ValueError("workspace filesystem object changed after preflight")
+        # Bind every child to the exact filesystem object proved by its runtime
+        # canary. Worktree children have distinct paths/inodes; sharing the root
+        # attestation would authenticate the wrong checkout.
+        if expected_workspace_path is not None:
+            for child in children:
+                expected_device = child.get("_workspace_device")
+                expected_inode = child.get("_workspace_inode")
+                child_path = child.get("workspace_path") or root_ws_path
+                if expected_device is None or expected_inode is None or not child_path:
+                    raise ValueError("workspace capability attestation is required")
+                try:
+                    current_workspace = os.stat(child_path, follow_symlinks=False)
+                except OSError as exc:
+                    raise ValueError("workspace disappeared after preflight") from exc
+                if (
+                    not stat.S_ISDIR(current_workspace.st_mode)
+                    or (current_workspace.st_dev, current_workspace.st_ino)
+                    != (expected_device, expected_inode)
+                ):
+                    raise ValueError("workspace filesystem object changed after preflight")
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
         # sees a coherent state, and recompute_ready() at the end
         # promotes parent-free children to 'ready'.
         for idx, child in enumerate(children):
-            new_id = _new_task_id()
+            new_id = str(child.get("_id") or _new_task_id())
             title = child["title"].strip()
             body = child.get("body")
             assignee = _canonical_assignee(child.get("assignee"))
@@ -6529,9 +6522,9 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, expected_workspace_sha, requires_reviewer_isolation, "
+                " workspace_path, branch_name, expected_workspace_sha, requires_reviewer_isolation, "
                 " tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -6539,6 +6532,7 @@ def decompose_triage_task(
                     assignee,
                     child_ws_kind,
                     child_ws_path,
+                    child.get("branch_name"),
                     (
                         root_expected_sha
                         if child_ws_kind == root_ws_kind
@@ -6954,6 +6948,83 @@ def _resolve_worktree_workspace(
         )
     _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name
+
+
+def _materialize_immutable_review_snapshot(
+    task: Task, workspace: Path, *, board: Optional[str] = None
+) -> tuple[Path, Optional[str]]:
+    """Turn a linked worktree into a standalone exact-commit review checkout."""
+    git_entry = workspace / ".git"
+    if not git_entry.is_file():
+        return workspace, task.expected_workspace_sha
+
+    deadline = time.monotonic() + 60.0
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+    def run_git(args: list[str], *, cwd: Optional[Path] = None) -> str:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("immutable reviewer snapshot deadline exceeded")
+        result = subprocess.run(
+            ["git", *args], cwd=str(cwd) if cwd else None,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=max(1, int(remaining)), check=False, env=env,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()[:500]
+            raise RuntimeError(f"immutable reviewer snapshot git failure: {detail}")
+        return result.stdout.strip()
+
+    commit = run_git(["-C", str(workspace), "rev-parse", "--verify", "HEAD^{commit}"])
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise RuntimeError("immutable reviewer snapshot resolved an invalid commit")
+    target_root = workspaces_root(board=board) / ".review-snapshots"
+    target_root.mkdir(parents=True, exist_ok=True)
+    target = target_root / f"{task.id}-{commit[:12]}"
+    if target.exists():
+        from tools.environments.docker import _path_identity
+        existing = _path_identity(
+            str(target), content_digest=True, deadline=deadline
+        )
+        if existing.get("git_ref") != commit:
+            raise RuntimeError("existing immutable reviewer snapshot has wrong provenance")
+        return target, commit
+
+    staging = Path(tempfile.mkdtemp(prefix=f".{task.id}-", dir=target_root))
+    try:
+        run_git(["init", "--quiet", str(staging)])
+        source_url = workspace.resolve(strict=True).as_uri()
+        run_git([
+            "-C", str(staging), "-c", "protocol.file.allow=always",
+            "fetch", "--quiet", "--no-tags", "--depth=1", source_url, commit,
+        ])
+        run_git([
+            "-C", str(staging), "-c", f"core.hooksPath={os.devnull}",
+            "checkout", "--quiet", "--detach", commit,
+        ])
+        from tools.environments.docker import (
+            _enforce_reviewer_workspace_bounds,
+            _path_identity,
+        )
+        _enforce_reviewer_workspace_bounds(staging, deadline=deadline)
+        snapshot_identity = _path_identity(
+            str(staging), content_digest=True, deadline=deadline
+        )
+        if snapshot_identity.get("git_ref") != commit:
+            raise RuntimeError("immutable reviewer snapshot provenance mismatch")
+        try:
+            staging.rename(target)
+        except FileExistsError:
+            pass
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+    return target, commit
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
@@ -8573,10 +8644,7 @@ def recover_workspace_capability_tasks(
     Repeated calls are idempotent because only ``status='blocked'`` rows with
     ``block_kind='workspace_capability'`` participate.
     """
-    from hermes_cli.kanban_workspace_preflight import (
-        profile_uses_restricted_reviewer_runtime,
-        workspace_capability_matches,
-    )
+    from hermes_cli.kanban_workspace_preflight import workspace_capability_matches
     rows = conn.execute(
         "SELECT id, assignee, workspace_path, requires_reviewer_isolation "
         "FROM tasks "
@@ -8623,11 +8691,14 @@ def recover_workspace_capability_tasks(
             if fallback_capability and fallback_capability.available:
                 reviewer_isolation_required = (
                     bool(row["requires_reviewer_isolation"])
-                    or profile_uses_restricted_reviewer_runtime(selected)
+                    or bool(
+                        selected_capability
+                        and selected_capability.reviewer_isolated
+                    )
                 )
                 if not reviewer_isolation_required or (
                     fallback_capability.read_only
-                    and profile_uses_restricted_reviewer_runtime(fallback)
+                    and fallback_capability.reviewer_isolated
                 ):
                     target = fallback
                     target_capability = fallback_capability
@@ -8635,12 +8706,11 @@ def recover_workspace_capability_tasks(
             continue
         if not workspace_capability_matches(target_capability, workspace):
             continue
-        requires_reviewer_isolation = bool(row["requires_reviewer_isolation"])
-        if (
-            profile_uses_restricted_reviewer_runtime(selected)
-            or profile_uses_restricted_reviewer_runtime(target)
-        ):
-            requires_reviewer_isolation = True
+        requires_reviewer_isolation = (
+            bool(row["requires_reviewer_isolation"])
+            or bool(selected_capability and selected_capability.reviewer_isolated)
+            or target_capability.reviewer_isolated
+        )
 
         with write_txn(conn):
             # Re-check the filesystem identity at the owning mutation boundary;
@@ -8803,6 +8873,8 @@ def _materialize_dispatch_workspace_candidates(
             continue
         try:
             resolved_branch = task.branch_name
+            resolved_kind = task.workspace_kind
+            resolved_expected_sha = task.expected_workspace_sha
             if (
                 task.workspace_path
                 and (task.workspace_kind != "worktree" or task.branch_name)
@@ -8814,6 +8886,14 @@ def _materialize_dispatch_workspace_candidates(
                 workspace = Path(workspace).resolve(strict=True)
             else:
                 workspace = Path(resolve_workspace(task, board=board)).resolve(strict=True)
+            if task.status == "review":
+                workspace, snapshot_sha = _materialize_immutable_review_snapshot(
+                    task, workspace, board=board
+                )
+                if snapshot_sha is not None:
+                    resolved_kind = "dir"
+                    resolved_branch = None
+                    resolved_expected_sha = snapshot_sha
         except Exception as exc:
             _log.warning(
                 "kanban workspace preparation failed for task %s: %s", task.id, exc
@@ -8821,11 +8901,13 @@ def _materialize_dispatch_workspace_candidates(
             continue
         with write_txn(conn):
             cur = conn.execute(
-                "UPDATE tasks SET workspace_path = ?, branch_name = COALESCE(?, branch_name) "
+                "UPDATE tasks SET workspace_path = ?, branch_name = ?, "
+                "workspace_kind = ?, expected_workspace_sha = ? "
                 "WHERE id = ? AND status = ? AND claim_lock IS NULL "
                 "AND assignee IS ? AND workspace_path IS ?",
                 (
-                    str(workspace), resolved_branch, task.id, task.status,
+                    str(workspace), resolved_branch, resolved_kind,
+                    resolved_expected_sha, task.id, task.status,
                     task.assignee, task.workspace_path,
                 ),
             )
@@ -9075,10 +9157,7 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
-    from hermes_cli.kanban_workspace_preflight import (
-        profile_uses_restricted_reviewer_runtime,
-        workspace_capability_matches,
-    )
+    from hermes_cli.kanban_workspace_preflight import workspace_capability_matches
     prepared_workspace_preflights = prepared_workspace_preflights or {}
     if not dry_run:
         recover_workspace_capability_tasks(
@@ -9271,7 +9350,10 @@ def _dispatch_once_locked(
                 fallback_capability = prepared_data.get("fallback")
                 reviewer_isolation_required = (
                     bool(task_for_preflight.requires_reviewer_isolation)
-                    or profile_uses_restricted_reviewer_runtime(row_assignee)
+                    or bool(
+                        selected_capability
+                        and selected_capability.reviewer_isolated
+                    )
                 )
                 if (
                     not fallback_capability
@@ -9280,9 +9362,7 @@ def _dispatch_once_locked(
                         reviewer_isolation_required
                         and not (
                             fallback_capability.read_only
-                            and profile_uses_restricted_reviewer_runtime(
-                                str(_default_assignee)
-                            )
+                            and fallback_capability.reviewer_isolated
                         )
                     )
                 ):
@@ -9302,8 +9382,9 @@ def _dispatch_once_locked(
                             "AND assignee = ? AND workspace_path = ?",
                             (
                                 row_assignee,
-                                1 if profile_uses_restricted_reviewer_runtime(
-                                    previous_assignee
+                                1 if bool(
+                                    selected_capability
+                                    and selected_capability.reviewer_isolated
                                 ) else 0,
                                 row["id"],
                                 previous_assignee,
@@ -9331,7 +9412,7 @@ def _dispatch_once_locked(
                 continue
             if (
                 not dry_run
-                and profile_uses_restricted_reviewer_runtime(row_assignee)
+                and effective_capability.reviewer_isolated
                 and not task_for_preflight.requires_reviewer_isolation
             ):
                 with write_txn(conn):
@@ -9524,21 +9605,55 @@ def _dispatch_once_locked(
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
-        if not row["assignee"]:
-            result.skipped_unassigned.append(row["id"])
+        row_assignee = row["assignee"]
+        prepared = prepared_workspace_preflights.get((row["id"], "review"))
+        if not dry_run and prepared is None:
             continue
+        prepared_data = prepared or {}
+        review_task = prepared_data.get("task")
+        review_capability = prepared_data.get("selected")
+
+        # Review-column content is reviewer-controlled regardless of the mutable
+        # assignee label.  Select only a read-only reviewer runtime, and persist
+        # both fallback ownership and the isolation invariant in one CAS before
+        # claim.  For an unassigned snapshot, preparation already probes the
+        # configured default as its selected profile.
+        selected_isolated = bool(
+            row_assignee
+            and review_capability
+            and review_capability.available
+            and review_capability.read_only
+            and review_capability.reviewer_isolated
+        )
+        target_assignee = str(row_assignee) if selected_isolated else None
+        if not selected_isolated:
+            fallback_capability = prepared_data.get("fallback")
+            if not row_assignee and review_capability is not None:
+                fallback_capability = review_capability
+            if not (
+                _default_assignee
+                and _default_assignee_resolved
+                and fallback_capability
+                and fallback_capability.available
+                and fallback_capability.read_only
+                and fallback_capability.reviewer_isolated
+            ):
+                if not row_assignee:
+                    result.skipped_unassigned.append(row["id"])
+                else:
+                    result.skipped_nonspawnable.append(row["id"])
+                continue
+            target_assignee = _default_assignee
+            review_capability = fallback_capability
+
+        assert target_assignee is not None
         try:
             from hermes_cli.profiles import profile_exists
         except Exception:
             profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if profile_exists is not None and not profile_exists(target_assignee):
             result.skipped_nonspawnable.append(row["id"])
             continue
-        prepared = prepared_workspace_preflights.get((row["id"], "review"))
-        if not dry_run and prepared is None:
-            continue
-        review_task = prepared.get("task") if prepared is not None else None
-        review_capability = prepared.get("selected") if prepared is not None else None
         if not dry_run:
             if (
                 review_task is None
@@ -9549,24 +9664,33 @@ def _dispatch_once_locked(
                 )
             ):
                 continue
-            if (
-                profile_uses_restricted_reviewer_runtime(str(row["assignee"]))
-                and not review_task.requires_reviewer_isolation
-            ):
-                with write_txn(conn):
-                    cur = conn.execute(
-                        "UPDATE tasks SET requires_reviewer_isolation = 1 "
-                        "WHERE id = ? AND status = 'review' AND claim_lock IS NULL "
-                        "AND assignee = ? AND workspace_path = ?",
-                        (row["id"], row["assignee"], review_task.workspace_path),
+            with write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET assignee = ?, requires_reviewer_isolation = 1 "
+                    "WHERE id = ? AND status = 'review' AND claim_lock IS NULL "
+                    "AND assignee IS ? AND workspace_path = ?",
+                    (target_assignee, row["id"], row_assignee, review_task.workspace_path),
+                )
+                if cur.rowcount == 1 and target_assignee != row_assignee:
+                    _append_event(
+                        conn, row["id"], "workspace_reassigned",
+                        {
+                            "previous_assignee": row_assignee,
+                            "assignee": target_assignee,
+                            "workspace": review_task.workspace_path,
+                            "reason": getattr(
+                                prepared_data.get("selected"), "reason",
+                                "reviewer isolation required",
+                            ),
+                        },
                     )
-                if cur.rowcount != 1:
-                    continue
-                review_task = get_task(conn, row["id"])
-                if review_task is None:
-                    continue
+            if cur.rowcount != 1:
+                continue
+            review_task = get_task(conn, row["id"])
+            if review_task is None:
+                continue
         if dry_run:
-            result.spawned.append((row["id"], row["assignee"], ""))
+            result.spawned.append((row["id"], target_assignee, ""))
             continue
         assert review_task is not None
         assert review_capability is not None
@@ -9574,7 +9698,7 @@ def _dispatch_once_locked(
             conn,
             row["id"],
             ttl_seconds=ttl_seconds,
-            expected_assignee=str(row["assignee"]),
+            expected_assignee=target_assignee,
             expected_workspace_path=review_task.workspace_path,
         )
         if claimed is None:
@@ -9867,7 +9991,9 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
-def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
+def _resolve_worker_cli_toolsets(
+    hermes_home: Optional[str], *, profile_config: Optional[dict] = None
+) -> Optional[list[str]]:
     """Return the assigned profile's effective CLI toolsets for a worker.
 
     Dispatcher-spawned workers are launched from a long-lived gateway process,
@@ -9887,7 +10013,7 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
 
         token = set_hermes_home_override(hermes_home)
         try:
-            cfg = load_config()
+            cfg = profile_config if profile_config is not None else load_config()
             toolsets = sorted(_get_platform_tools(cfg, "cli"))
         finally:
             reset_hermes_home_override(token)
@@ -9935,12 +10061,22 @@ def _default_spawn(
 
     profile_arg = normalize_profile_name(task.assignee)
     from hermes_cli.kanban_workspace_preflight import (
+        _profile_config,
         profile_uses_restricted_reviewer_runtime,
         workspace_capability_matches,
     )
+    try:
+        effective_profile_config = _profile_config(profile_arg)
+    except Exception:
+        # Name-based defense remains fail closed for broken/missing reviewer
+        # profiles; real dispatch preparation has already required a successful
+        # effective-config preflight before reaching this boundary.
+        effective_profile_config = None
     reviewer_runtime = (
         task.requires_reviewer_isolation
-        or profile_uses_restricted_reviewer_runtime(profile_arg)
+        or profile_uses_restricted_reviewer_runtime(
+            profile_arg, profile_config=effective_profile_config
+        )
     )
 
     prompt = f"work kanban task {task.id}"
@@ -10096,7 +10232,9 @@ def _default_spawn(
     worker_toolsets = (
         ["terminal", "kanban"]
         if task.expected_workspace_sha or reviewer_runtime
-        else _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+        else _resolve_worker_cli_toolsets(
+            env.get("HERMES_HOME"), profile_config=effective_profile_config
+        )
     )
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])

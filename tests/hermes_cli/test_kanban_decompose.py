@@ -8,6 +8,7 @@ and the assignee-fallback logic.
 from __future__ import annotations
 
 import json as jsonlib
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -291,6 +292,66 @@ def test_decompose_materializes_scratch_workspace_before_graph_publication(
         child = kb.get_task(conn, outcome.child_ids[0])
     assert root is not None and root.workspace_path == str(checked[0])
     assert child is not None and child.workspace_path == str(checked[0])
+
+
+def test_worktree_decomposition_materializes_and_attests_each_child_before_publish(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "base.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="fan out", triage=True, assignee="orchestrator",
+            workspace_kind="worktree", workspace_path=str(repo),
+        )
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "tasks": [
+            {"title": "one", "body": "work", "assignee": "engineer", "parents": []},
+            {"title": "two", "body": "review", "assignee": "quality-reviewer", "parents": [0]},
+        ],
+    })
+    checked = []
+
+    def route(children, selected_workspace, *, fallback_profile):
+        workspace = Path(selected_workspace).resolve(strict=True)
+        assert (workspace / ".git").is_file()
+        checked.append(workspace)
+        identity = workspace.stat()
+        return [dict(
+            children[0], _workspace_device=identity.st_dev,
+            _workspace_inode=identity.st_ino,
+            requires_reviewer_isolation="reviewer" in children[0]["assignee"],
+        )], []
+
+    patches = _patch_list_profiles(["orchestrator", "engineer", "quality-reviewer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose.route_children_to_capable_profiles",
+            side_effect=route,
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is True
+    assert len(checked) == 2 and len(set(checked)) == 2
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+        children = [kb.get_task(conn, child_id) for child_id in outcome.child_ids]
+    assert root is not None
+    assert all(child is not None and child.workspace_path for child in children)
+    assert {Path(child.workspace_path) for child in children} == set(checked)
+    assert all(Path(child.workspace_path) != Path(root.workspace_path) for child in children)
 
 
 def test_decompose_aborts_atomically_when_selected_and_fallback_cannot_mount(

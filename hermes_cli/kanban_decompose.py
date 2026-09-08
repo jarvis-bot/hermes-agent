@@ -40,7 +40,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
@@ -462,13 +462,49 @@ def decompose_task(
             task_id, False, f"workspace materialization failed: {exc}"
         )
 
+    unavailable = []
+    # Worktree children need their own durable checkout before graph publication.
+    # Allocate stable child IDs now, materialize each exact path from the root's
+    # repository anchor, then preflight that final object (not the root checkout).
+    if task.workspace_kind == "worktree":
+        materialized_children: list[dict] = []
+        try:
+            for child in children:
+                child_id = kb._new_task_id()
+                branch = f"wt/{child_id}"
+                child_task = replace(
+                    task,
+                    id=child_id,
+                    workspace_path=str(materialized),
+                    branch_name=branch,
+                    status="todo",
+                    assignee=str(child.get("assignee") or orchestrator),
+                )
+                child_workspace, resolved_branch = kb._resolve_worktree_workspace(child_task)
+                item = dict(child)
+                item.update({
+                    "_id": child_id,
+                    "workspace_kind": "worktree",
+                    "workspace_path": str(child_workspace.resolve(strict=True)),
+                    "branch_name": resolved_branch,
+                })
+                routed, failures = route_children_to_capable_profiles(
+                    [item], child_workspace, fallback_profile=orchestrator
+                )
+                materialized_children.extend(routed)
+                unavailable.extend(failures)
+            children = materialized_children
+        except Exception as exc:
+            return DecomposeOutcome(
+                task_id, False, f"child workspace materialization/preflight failed: {exc}"
+            )
     # A profile's presence in the roster proves only that its configuration
     # directory exists.  Before publishing any child cards, prove that each
     # selected runtime can access this task's exact workspace.  Incapable
     # assignments are routed to the orchestrator (the durable owner of the
     # root); if that owner is also unavailable, abort before the atomic DB
     # mutation so no doomed cards or parent dependencies are created.
-    if task.workspace_path:
+    if task.workspace_path and task.workspace_kind != "worktree":
         try:
             children, unavailable = route_children_to_capable_profiles(
                 children,
