@@ -13,17 +13,23 @@ import json
 import os
 import sqlite3
 import stat
-import subprocess
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, cast
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.workspace_digest import canonical_logical_workspace_digest
 
 PRODUCER_KIND = "host-no-agent"
 SUPPORTED_ACTION = "resume_iteration_budget"
 SUPPORTED_BLOCK_KIND = "needs_input"
+CANDIDATE_DIGEST_DEADLINE_SECONDS = 600.0
+MAX_CANDIDATE_NODES = 50_000
+MAX_CANDIDATE_FILES = 40_000
+MAX_CANDIDATE_FILE_BYTES = 256 * 1024 * 1024
+MAX_CANDIDATE_TOTAL_BYTES = 512 * 1024 * 1024
+MAX_CONSUME_BATCH = 8
 
 
 @dataclass(frozen=True)
@@ -39,6 +45,7 @@ class ResumeRequestSpec:
     expected_candidate_fingerprint: str
     expected_block_kind: str
     expected_block_reason_sha256: str
+    expected_workspace_kind: str = "dir"
 
 
 @dataclass(frozen=True)
@@ -51,6 +58,8 @@ class ResumePolicy:
     sha: str
     candidate_fingerprint: str
     block_reason_sha256: str
+    workspace_kind: str = "dir"
+    bind_legacy_metadata: bool = False
 
 
 @dataclass(frozen=True)
@@ -59,6 +68,17 @@ class ResumeRequest:
     state: str
     result_code: Optional[str] = None
     detail: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class AcceptedDispatchBinding:
+    request_id: str
+    accepted_event_version: int
+    workspace_path: str
+    workspace_kind: str
+    branch: str
+    sha: str
+    candidate_fingerprint: str
 
 
 def _canonical_spec(spec: ResumeRequestSpec) -> bytes:
@@ -109,6 +129,8 @@ def _append_verified_request(
     """Persist a request already authenticated by :func:`ingest_resume_outbox`."""
     if spec.action != SUPPORTED_ACTION:
         raise ValueError(f"unsupported resume action: {spec.action}")
+    if spec.expected_workspace_kind != "dir":
+        raise ValueError("resume requests support only authenticated dir workspaces")
     request_id = request_identity(spec)
     now = int(time.time())
     # Deliberately does not use kb.write_txn: this is not a task/board mutation,
@@ -168,6 +190,7 @@ def _spec_from_policy(policy: ResumePolicy, state_version: int) -> ResumeRequest
         expected_candidate_fingerprint=policy.candidate_fingerprint,
         expected_block_kind=SUPPORTED_BLOCK_KIND,
         expected_block_reason_sha256=policy.block_reason_sha256,
+        expected_workspace_kind=policy.workspace_kind,
     )
 
 
@@ -307,48 +330,33 @@ def latest_resume_request_read_only(db_path: Path, task_id: str) -> Optional[dic
         return dict(row) if row is not None else None
 
 
-def _git(repo: Path, *args: str) -> bytes:
-    return subprocess.check_output(
-        ["git", "-C", str(repo), *args], stderr=subprocess.DEVNULL, timeout=30
-    )
+def candidate_fingerprint(
+    workspace: Path, expected_sha: str, *, deadline: Optional[float] = None
+) -> str:
+    """Authenticate logical candidate bytes without interpreting candidate Git data.
 
-
-def candidate_fingerprint(workspace: Path, expected_sha: str) -> str:
-    """Hash HEAD, branch, tracked diff, and bounded untracked bytes deterministically."""
-    repo = workspace.resolve()
-    head = _git(repo, "rev-parse", "HEAD").strip().decode("ascii")
-    if head != expected_sha:
-        raise ValueError("workspace HEAD does not match expected SHA")
-    branch = _git(repo, "symbolic-ref", "--short", "HEAD").strip()
-    diff = _git(repo, "diff", "--binary", "--full-index", expected_sha, "--")
-    untracked = [
-        p
-        for p in _git(repo, "ls-files", "--others", "--exclude-standard", "-z").split(
-            b"\0"
-        )
-        if p
-    ]
-    digest = hashlib.sha256()
-    for label, payload in (
-        (b"head", head.encode()),
-        (b"branch", branch),
-        (b"diff", diff),
+    ``expected_sha`` is an identity supplied by trusted board/project policy.  It is
+    validated here but deliberately never resolved through the candidate's ``.git``;
+    the separately policy-pinned logical digest authenticates the actual bytes.
+    """
+    if not isinstance(expected_sha, str) or len(expected_sha) != 40 or any(
+        character not in "0123456789abcdef" for character in expected_sha
     ):
-        digest.update(len(label).to_bytes(4, "big") + label)
-        digest.update(len(payload).to_bytes(8, "big") + payload)
-    total = 0
-    for raw in sorted(untracked):
-        rel = raw.decode("utf-8", "surrogateescape")
-        path = repo / rel
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("candidate contains unsupported untracked object")
-        data = path.read_bytes()
-        total += len(data)
-        if total > 32 * 1024 * 1024:
-            raise ValueError("untracked candidate exceeds 32 MiB fingerprint budget")
-        digest.update(len(raw).to_bytes(4, "big") + raw)
-        digest.update(len(data).to_bytes(8, "big") + data)
-    return "sha256:" + digest.hexdigest()
+        raise ValueError("expected workspace SHA must be 40 lowercase hex characters")
+    return "sha256:" + canonical_logical_workspace_digest(
+        workspace,
+        deadline=(
+            deadline
+            if deadline is not None
+            else time.monotonic() + CANDIDATE_DIGEST_DEADLINE_SECONDS
+        ),
+        max_nodes=MAX_CANDIDATE_NODES,
+        max_files=MAX_CANDIDATE_FILES,
+        max_file_bytes=MAX_CANDIDATE_FILE_BYTES,
+        max_total_bytes=MAX_CANDIDATE_TOTAL_BYTES,
+        allow_symlinks=True,
+        require_single_link=False,
+    )
 
 
 def _matching_policy(
@@ -381,20 +389,94 @@ def _reject(
     return ResumeRequest(row["request_id"], "rejected", code, detail[:500])
 
 
+def _task_validation_snapshot(
+    conn: sqlite3.Connection, task_id: str
+) -> tuple[Optional[dict], int, str]:
+    task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    version = int(
+        conn.execute(
+            "SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+    )
+    run = conn.execute(
+        "SELECT summary FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    reason = str(run["summary"] or "") if run is not None else ""
+    return (dict(task) if task is not None else None), version, reason
+
+
+def _validation_failure(
+    row: sqlite3.Row,
+    task: Optional[dict],
+    version: int,
+    reason: str,
+    *,
+    board: str,
+    policy: Optional[ResumePolicy],
+) -> Optional[tuple[str, str]]:
+    if policy is None:
+        return "policy_mismatch", "request is not in the fixed gateway allowlist"
+    if task is None:
+        return "missing_task", "task no longer exists"
+    reason_hash = "sha256:" + hashlib.sha256(reason.encode("utf-8")).hexdigest()
+    metadata_matches = (
+        task["branch_name"] == row["expected_branch"]
+        and task["expected_workspace_sha"] == row["expected_sha"]
+    )
+    legacy_shape = (
+        policy.bind_legacy_metadata
+        and policy.workspace_kind == "dir"
+        and task["workspace_kind"] == "dir"
+        and task["branch_name"] is None
+        and task["expected_workspace_sha"] is None
+    )
+    checks = (
+        (row["board_slug"] == board, "board_mismatch", "request belongs to another board"),
+        (row["action"] == SUPPORTED_ACTION, "unsupported_action", "action is not recoverable"),
+        (
+            row["expected_block_kind"] == SUPPORTED_BLOCK_KIND
+            and task["block_kind"] == SUPPORTED_BLOCK_KIND,
+            "unsupported_block_kind",
+            "block kind requires human handling",
+        ),
+        (reason_hash == row["expected_block_reason_sha256"], "stale_block_reason", "block reason changed"),
+        (task["status"] == row["expected_status"] == "blocked", "stale_status", "task status changed"),
+        (
+            str(Path(task["workspace_path"] or "").resolve()) == row["expected_workspace_path"],
+            "stale_path",
+            "workspace path changed",
+        ),
+        (task["workspace_kind"] == policy.workspace_kind, "stale_workspace_kind", "workspace kind changed"),
+        (
+            metadata_matches or legacy_shape,
+            "stale_provenance",
+            "task branch/SHA provenance changed",
+        ),
+        (
+            task["claim_lock"] is None
+            and task["worker_pid"] is None
+            and task["current_run_id"] is None,
+            "active_worker",
+            "task has a live claim or run",
+        ),
+        (int(version) == int(row["expected_state_version"]), "stale_version", "task event version changed"),
+    )
+    return next(((code, detail) for ok, code, detail in checks if not ok), None)
+
+
 def consume_resume_requests(
     conn: sqlite3.Connection,
     *,
     board: str,
     gateway_profile: str,
     policies: Iterable[ResumePolicy],
-    lease_seconds: int = 60,
+    lease_seconds: int = 610,
+    batch_size: int = 8,
+    validation_seconds: float = CANDIDATE_DIGEST_DEADLINE_SECONDS,
 ) -> list[ResumeRequest]:
-    """Lease, validate and atomically accept/reject pending requests.
-
-    The accepted transition and terminal request state share one IMMEDIATE
-    transaction. A process death before commit rolls both back; after commit a
-    restart sees a ready task and terminal request, so normal dispatch resumes it once.
-    """
+    """Lease a bounded batch, authenticate outside the writer lock, then CAS."""
     if (
         _is_delegated_child()
         or gateway_profile != "default"
@@ -404,164 +486,136 @@ def consume_resume_requests(
             "only the mutation-authorized default gateway may consume resume requests"
         )
     now = int(time.time())
-    owner = f"default:{os.getpid()}"
-    results: list[ResumeRequest] = []
+    owner = f"default:{os.getpid()}:{time.monotonic_ns()}"
     policy_list = tuple(policies)
+    leased: list[sqlite3.Row] = []
+    limit = max(1, min(int(batch_size), MAX_CONSUME_BATCH))
     with kb.write_txn(conn):
-        rows = conn.execute(
-            "SELECT * FROM kanban_resume_requests WHERE state='pending' "
-            "OR (state='leased' AND lease_expires < ?) ORDER BY created_at, request_id",
-            (now,),
+        candidates = conn.execute(
+            "SELECT request_id FROM kanban_resume_requests WHERE state='pending' "
+            "OR (state='leased' AND lease_expires < ?) "
+            "ORDER BY created_at, request_id LIMIT ?",
+            (now, limit),
         ).fetchall()
-        for initial in rows:
-            cur = conn.execute(
+        for candidate in candidates:
+            updated = conn.execute(
                 "UPDATE kanban_resume_requests SET state='leased', lease_owner=?, "
                 "lease_expires=?, fence=fence+1 WHERE request_id=? AND "
                 "(state='pending' OR (state='leased' AND lease_expires < ?))",
-                (owner, now + max(1, int(lease_seconds)), initial["request_id"], now),
+                (owner, now + max(1, int(lease_seconds)), candidate["request_id"], now),
             )
-            if cur.rowcount != 1:
-                continue
-            row = conn.execute(
-                "SELECT * FROM kanban_resume_requests WHERE request_id=?",
-                (initial["request_id"],),
-            ).fetchone()
-            policy = _matching_policy(row, policy_list)
-            task = conn.execute(
-                "SELECT * FROM tasks WHERE id=?", (row["task_id"],)
-            ).fetchone()
-            if policy is None:
-                results.append(
-                    _reject(
-                        conn,
-                        row,
-                        "policy_mismatch",
-                        "request is not in the fixed gateway allowlist",
-                        now,
-                    )
+            if updated.rowcount == 1:
+                leased.append(
+                    conn.execute(
+                        "SELECT * FROM kanban_resume_requests WHERE request_id=?",
+                        (candidate["request_id"],),
+                    ).fetchone()
                 )
-                continue
-            if task is None:
-                results.append(
-                    _reject(conn, row, "missing_task", "task no longer exists", now)
+
+    validations = []
+    deadline = time.monotonic() + max(0.001, float(validation_seconds))
+    for row in leased:
+        policy = _matching_policy(row, policy_list)
+        task, version, reason = _task_validation_snapshot(conn, row["task_id"])
+        failure = _validation_failure(
+            row, task, version, reason, board=board, policy=policy
+        )
+        if failure is None:
+            try:
+                actual_fp = candidate_fingerprint(
+                    Path(row["expected_workspace_path"]),
+                    row["expected_sha"],
+                    deadline=deadline,
                 )
-                continue
-            run = conn.execute(
-                "SELECT summary FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
-                "ORDER BY id DESC LIMIT 1",
-                (row["task_id"],),
+            except Exception as exc:
+                failure = ("candidate_unreadable", str(exc))
+            else:
+                if actual_fp != row["expected_candidate_fingerprint"]:
+                    failure = ("stale_fingerprint", "candidate bytes changed")
+        validations.append((row, policy, task, version, reason, failure))
+
+    results: list[ResumeRequest] = []
+    for row, policy, task, version, reason, failure in validations:
+        finished = int(time.time())
+        with kb.write_txn(conn):
+            lease = conn.execute(
+                "SELECT * FROM kanban_resume_requests WHERE request_id=? "
+                "AND state='leased' AND lease_owner=? AND fence=? AND lease_expires>=?",
+                (row["request_id"], owner, row["fence"], finished),
             ).fetchone()
-            reason = str(run["summary"] or "") if run is not None else ""
-            actual_reason_hash = (
-                "sha256:" + hashlib.sha256(reason.encode("utf-8")).hexdigest()
-            )
-            checks = (
-                (
-                    row["board_slug"] == board,
-                    "board_mismatch",
-                    "request belongs to a different board",
-                ),
-                (
-                    row["action"] == SUPPORTED_ACTION,
-                    "unsupported_action",
-                    "action is not recoverable",
-                ),
-                (
-                    row["expected_block_kind"] == SUPPORTED_BLOCK_KIND
-                    and task["block_kind"] == SUPPORTED_BLOCK_KIND,
-                    "unsupported_block_kind",
-                    "block kind requires human handling",
-                ),
-                (
-                    actual_reason_hash == row["expected_block_reason_sha256"],
-                    "stale_block_reason",
-                    "block reason changed",
-                ),
-                (
-                    task["status"] == row["expected_status"] == "blocked",
-                    "stale_status",
-                    "task status changed",
-                ),
-                (
-                    str(Path(task["workspace_path"] or "").resolve())
-                    == row["expected_workspace_path"],
-                    "stale_path",
-                    "workspace path changed",
-                ),
-                (
-                    task["branch_name"] == row["expected_branch"],
-                    "stale_branch",
-                    "task branch changed",
-                ),
-                (
-                    task["expected_workspace_sha"] == row["expected_sha"],
-                    "stale_sha",
-                    "expected SHA changed",
-                ),
-                (
-                    task["claim_lock"] is None
-                    and task["worker_pid"] is None
-                    and task["current_run_id"] is None,
-                    "active_worker",
-                    "task has a live claim or run",
-                ),
-            )
-            failed = next(
-                ((code, detail) for ok, code, detail in checks if not ok), None
-            )
-            version = conn.execute(
-                "SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?",
-                (row["task_id"],),
-            ).fetchone()[0]
-            if failed is None and int(version) != int(row["expected_state_version"]):
-                failed = ("stale_version", "task event version changed")
-            if failed is None:
-                try:
-                    branch = (
-                        _git(
-                            Path(row["expected_workspace_path"]),
-                            "symbolic-ref",
-                            "--short",
-                            "HEAD",
-                        )
-                        .strip()
-                        .decode()
-                    )
-                    actual_fp = candidate_fingerprint(
-                        Path(row["expected_workspace_path"]), row["expected_sha"]
-                    )
-                except Exception as exc:
-                    failed = ("candidate_unreadable", str(exc))
-                else:
-                    if branch != row["expected_branch"]:
-                        failed = ("stale_branch", "workspace branch changed")
-                    elif actual_fp != row["expected_candidate_fingerprint"]:
-                        failed = ("stale_fingerprint", "candidate bytes changed")
-            if failed is not None:
-                results.append(_reject(conn, row, failed[0], failed[1], now))
+            if lease is None:
                 continue
+            current_task, current_version, current_reason = _task_validation_snapshot(
+                conn, row["task_id"]
+            )
+            if (
+                current_task != task
+                or current_version != version
+                or current_reason != reason
+                or _matching_policy(lease, policy_list) != policy
+            ):
+                failure = (
+                    "cas_failed",
+                    "task, request, or policy changed during validation",
+                )
+            if failure is not None:
+                results.append(_reject(conn, lease, failure[0], failure[1], finished))
+                continue
+            assert task is not None and policy is not None
             updated = conn.execute(
-                "UPDATE tasks SET status='ready' WHERE id=? AND status='blocked' "
-                "AND block_kind=? AND claim_lock IS NULL AND worker_pid IS NULL AND current_run_id IS NULL",
-                (row["task_id"], SUPPORTED_BLOCK_KIND),
+                "UPDATE tasks SET status='ready', branch_name=?, expected_workspace_sha=? "
+                "WHERE id=? AND status='blocked' AND block_kind=? "
+                "AND workspace_kind=? AND workspace_path=? AND branch_name IS ? "
+                "AND expected_workspace_sha IS ? AND claim_lock IS NULL "
+                "AND worker_pid IS NULL AND current_run_id IS NULL",
+                (
+                    row["expected_branch"],
+                    row["expected_sha"],
+                    row["task_id"],
+                    SUPPORTED_BLOCK_KIND,
+                    policy.workspace_kind,
+                    task["workspace_path"],
+                    task["branch_name"],
+                    task["expected_workspace_sha"],
+                ),
             )
             if updated.rowcount != 1:
                 results.append(
-                    _reject(conn, row, "cas_failed", "task changed during consume", now)
+                    _reject(conn, lease, "cas_failed", "task changed during consume", finished)
                 )
                 continue
             kb._append_event(
                 conn,
                 row["task_id"],
                 "resume_request_accepted",
-                {"request_id": row["request_id"], "action": row["action"]},
+                {
+                    "request_id": row["request_id"],
+                    "action": row["action"],
+                    "legacy_metadata_bound": bool(
+                        task["branch_name"] is None
+                        and task["expected_workspace_sha"] is None
+                    ),
+                },
             )
-            conn.execute(
+            accepted_version = int(
+                conn.execute(
+                    "SELECT MAX(id) FROM task_events WHERE task_id=?", (row["task_id"],)
+                ).fetchone()[0]
+            )
+            cur = conn.execute(
                 "UPDATE kanban_resume_requests SET state='accepted', result_code='accepted', "
-                "detail='validated; task made ready for default dispatcher', finished_at=?, "
-                "lease_owner=NULL, lease_expires=NULL WHERE request_id=? AND state='leased' AND lease_owner=?",
-                (now, row["request_id"], owner),
+                "detail=?, finished_at=?, lease_owner=NULL, lease_expires=NULL "
+                "WHERE request_id=? AND state='leased' AND lease_owner=? AND fence=?",
+                (
+                    f"validated; accepted task event {accepted_version}",
+                    finished,
+                    row["request_id"],
+                    owner,
+                    row["fence"],
+                ),
             )
+            if cur.rowcount != 1:
+                raise RuntimeError("resume request lease CAS failed after task transition")
             results.append(
                 ResumeRequest(row["request_id"], "accepted", "accepted", "validated")
             )
@@ -569,53 +623,100 @@ def consume_resume_requests(
 
 
 def revalidate_accepted_request_before_dispatch(
-    conn: sqlite3.Connection, task_id: str
-) -> bool:
-    """Recheck an accepted candidate immediately before the ordinary claim.
-
-    Returns ``True`` for tasks unrelated to resume requests. On a stale accepted
-    request, atomically re-blocks the still-unclaimed task and records a failed
-    terminal outcome so no worker observes unreviewed bytes.
-    """
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    task_snapshot: object = None,
+    workspace_capability: object = None,
+) -> bool | AcceptedDispatchBinding:
+    """Authenticate and bind an accepted request to the exact prepared task."""
     row = conn.execute(
         "SELECT * FROM kanban_resume_requests WHERE task_id=? AND state='accepted' "
+        "AND result_code='accepted' "
         "ORDER BY finished_at DESC, request_id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if row is None:
         return True
-    failure: Optional[tuple[str, str]] = None
-    task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
-    if task is None or task["status"] != "ready" or task["claim_lock"] is not None:
+    task_row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if task_row is None or task_row["status"] != "ready" or task_row["claim_lock"] is not None:
         return False
-    try:
-        branch = (
-            _git(
-                Path(row["expected_workspace_path"]), "symbolic-ref", "--short", "HEAD"
-            )
-            .strip()
-            .decode()
-        )
-        actual = candidate_fingerprint(
-            Path(row["expected_workspace_path"]), row["expected_sha"]
-        )
-    except Exception as exc:
-        failure = ("dispatch_candidate_unreadable", str(exc))
+    task = dict(task_row)
+    event = conn.execute(
+        "SELECT id, kind, payload FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    failure: Optional[tuple[str, str]] = None
+    expected_path = row["expected_workspace_path"]
+    actual_path = str(Path(task["workspace_path"] or "").resolve())
+    if actual_path != expected_path:
+        failure = ("dispatch_stale_path", "task workspace path changed after acceptance")
+    elif task["workspace_kind"] != "dir":
+        failure = ("dispatch_stale_workspace_kind", "task workspace kind changed after acceptance")
+    elif task["branch_name"] != row["expected_branch"]:
+        failure = ("dispatch_stale_branch", "task branch changed after acceptance")
+    elif task["expected_workspace_sha"] != row["expected_sha"]:
+        failure = ("dispatch_stale_sha", "task expected SHA changed after acceptance")
+    elif event is None or event["kind"] != "resume_request_accepted":
+        failure = ("dispatch_stale_version", "task state changed after acceptance")
     else:
-        if branch != row["expected_branch"]:
-            failure = (
-                "dispatch_stale_branch",
-                "workspace branch changed before dispatch",
-            )
-        elif actual != row["expected_candidate_fingerprint"]:
-            failure = (
-                "dispatch_stale_fingerprint",
-                "candidate bytes changed before dispatch",
-            )
+        try:
+            payload = json.loads(event["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if payload.get("request_id") != row["request_id"]:
+            failure = ("dispatch_stale_version", "accepted request is not the latest task state")
+    if failure is None and task_snapshot is not None:
+        for attr, expected in (
+            ("workspace_path", task["workspace_path"]),
+            ("workspace_kind", task["workspace_kind"]),
+            ("branch_name", task["branch_name"]),
+            ("expected_workspace_sha", task["expected_workspace_sha"]),
+            ("status", task["status"]),
+        ):
+            if getattr(task_snapshot, attr, None) != expected:
+                failure = ("dispatch_stale_preflight", "prepared task snapshot changed")
+                break
+    if failure is None and workspace_capability is not None:
+        from hermes_cli.kanban_workspace_preflight import workspace_capability_matches
+
+        if not workspace_capability_matches(workspace_capability, expected_path):
+            failure = ("dispatch_stale_capability", "prepared workspace capability changed")
+        elif (
+            getattr(workspace_capability, "content_sha256", None) is not None
+            and "sha256:" + workspace_capability.content_sha256
+            != row["expected_candidate_fingerprint"]
+        ):
+            failure = ("dispatch_stale_capability", "prepared capability authenticated different bytes")
     if failure is None:
-        return True
+        try:
+            actual = candidate_fingerprint(Path(expected_path), row["expected_sha"])
+        except Exception as exc:
+            failure = ("dispatch_candidate_unreadable", str(exc))
+        else:
+            if actual != row["expected_candidate_fingerprint"]:
+                failure = ("dispatch_stale_fingerprint", "candidate bytes changed before dispatch")
+    if failure is None:
+        assert event is not None
+        return AcceptedDispatchBinding(
+            request_id=row["request_id"],
+            accepted_event_version=int(event["id"]),
+            workspace_path=expected_path,
+            workspace_kind="dir",
+            branch=row["expected_branch"],
+            sha=row["expected_sha"],
+            candidate_fingerprint=row["expected_candidate_fingerprint"],
+        )
+
     now = int(time.time())
     with kb.write_txn(conn):
+        current = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        current_request = conn.execute(
+            "SELECT state FROM kanban_resume_requests WHERE request_id=?",
+            (row["request_id"],),
+        ).fetchone()
+        if current is None or dict(current) != task or current_request is None or current_request["state"] != "accepted":
+            return False
         updated = conn.execute(
             "UPDATE tasks SET status='blocked', block_kind='needs_input' "
             "WHERE id=? AND status='ready' AND claim_lock IS NULL",
@@ -637,6 +738,145 @@ def revalidate_accepted_request_before_dispatch(
     return False
 
 
+def validate_claimed_resume_dispatch(
+    conn: sqlite3.Connection,
+    task: object,
+    binding: AcceptedDispatchBinding,
+    workspace_capability: object,
+) -> bool:
+    """Fail closed if accepted bytes or capability drift after claim, before spawn."""
+    failure: Optional[tuple[str, str]] = None
+    try:
+        from hermes_cli.kanban_workspace_preflight import workspace_capability_matches
+
+        if not workspace_capability_matches(workspace_capability, binding.workspace_path):
+            failure = (
+                "dispatch_stale_capability",
+                "workspace capability changed after claim",
+            )
+        elif (
+            candidate_fingerprint(Path(binding.workspace_path), binding.sha)
+            != binding.candidate_fingerprint
+        ):
+            failure = (
+                "dispatch_stale_fingerprint",
+                "candidate bytes changed after claim",
+            )
+    except Exception as exc:
+        failure = ("dispatch_candidate_unreadable", str(exc))
+    if failure is None:
+        return True
+    now = int(time.time())
+    task_id = str(getattr(task, "id"))
+    claim_lock = getattr(task, "claim_lock")
+    run_id = getattr(task, "current_run_id")
+    with kb.write_txn(conn):
+        updated = conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='needs_input', "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, current_run_id=NULL "
+            "WHERE id=? AND status='running' AND claim_lock=? AND workspace_path=? "
+            "AND workspace_kind=? AND branch_name=? AND expected_workspace_sha=?",
+            (
+                task_id,
+                claim_lock,
+                binding.workspace_path,
+                binding.workspace_kind,
+                binding.branch,
+                binding.sha,
+            ),
+        )
+        if updated.rowcount != 1:
+            return False
+        if run_id is not None:
+            conn.execute(
+                "UPDATE task_runs SET status='workspace_changed', outcome='workspace_changed', "
+                "summary=?, ended_at=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+                "WHERE id=? AND task_id=? AND ended_at IS NULL",
+                (failure[1][:500], now, run_id, task_id),
+            )
+        conn.execute(
+            "UPDATE kanban_resume_requests SET state='rejected', result_code=?, detail=?, "
+            "finished_at=? WHERE request_id=? AND state='accepted'",
+            (failure[0], failure[1][:500], now, binding.request_id),
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            "resume_request_dispatch_rejected",
+            {"request_id": binding.request_id, "code": failure[0]},
+            run_id=run_id,
+        )
+    return False
+
+
+def finalize_resume_dispatch_spawned(
+    conn: sqlite3.Connection, binding: AcceptedDispatchBinding
+) -> None:
+    """Fence the exact accepted request immediately before crossing into spawn."""
+    with kb.write_txn(conn):
+        updated = conn.execute(
+            "UPDATE kanban_resume_requests SET result_code='dispatched', "
+            "detail='accepted candidate bound to dispatcher spawn attempt' "
+            "WHERE request_id=? AND state='accepted' AND result_code='accepted'",
+            (binding.request_id,),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError("accepted resume request changed before spawn finalization")
+
+
+def rearm_resume_dispatch_after_spawn_failure(
+    conn: sqlite3.Connection, task_id: str, binding: AcceptedDispatchBinding
+) -> None:
+    """Re-arm a pre-exec failure so a retry must authenticate the request again."""
+    with kb.write_txn(conn):
+        task = conn.execute(
+            "SELECT status, claim_lock, current_run_id, workspace_path, workspace_kind, "
+            "branch_name, expected_workspace_sha FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        request = conn.execute(
+            "SELECT state, result_code FROM kanban_resume_requests WHERE request_id=?",
+            (binding.request_id,),
+        ).fetchone()
+        if request is None or request["state"] != "accepted":
+            return
+        retryable = bool(
+            task is not None
+            and task["status"] == "ready"
+            and task["claim_lock"] is None
+            and task["current_run_id"] is None
+            and task["workspace_path"] == binding.workspace_path
+            and task["workspace_kind"] == binding.workspace_kind
+            and task["branch_name"] == binding.branch
+            and task["expected_workspace_sha"] == binding.sha
+        )
+        if retryable:
+            conn.execute(
+                "UPDATE kanban_resume_requests SET result_code='accepted', "
+                "detail='pre-exec failure; candidate must be revalidated' "
+                "WHERE request_id=? AND state='accepted'",
+                (binding.request_id,),
+            )
+            kb._append_event(
+                conn,
+                task_id,
+                "resume_request_accepted",
+                {
+                    "request_id": binding.request_id,
+                    "action": SUPPORTED_ACTION,
+                    "retry_after_spawn_failure": True,
+                },
+            )
+        else:
+            conn.execute(
+                "UPDATE kanban_resume_requests SET state='rejected', "
+                "result_code='dispatch_spawn_failure', "
+                "detail='spawn failure was not safely retryable', finished_at=? "
+                "WHERE request_id=? AND state='accepted'",
+                (int(time.time()), binding.request_id),
+            )
+
+
 def policies_from_config(raw: object) -> list[ResumePolicy]:
     if not isinstance(raw, list):
         return []
@@ -656,6 +896,9 @@ def policies_from_config(raw: object) -> list[ResumePolicy]:
                     sha=str(item_map["sha"]),
                     candidate_fingerprint=str(item_map["candidate_fingerprint"]),
                     block_reason_sha256=str(item_map["block_reason_sha256"]),
+                    workspace_kind=str(item_map.get("workspace_kind", "dir")),
+                    bind_legacy_metadata=item_map.get("bind_legacy_metadata", False)
+                    is True,
                 )
             )
         except (KeyError, TypeError, ValueError):

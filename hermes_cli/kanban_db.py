@@ -3325,8 +3325,6 @@ def create_task(
         )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
-    if branch_name and workspace_kind != "worktree":
-        raise ValueError("branch_name is only valid for worktree workspaces")
     if expected_workspace_sha is not None:
         expected_workspace_sha = str(expected_workspace_sha).strip()
         if not re.fullmatch(r"[0-9a-f]{40}", expected_workspace_sha):
@@ -3335,6 +3333,12 @@ def create_task(
             )
         if workspace_kind != "dir":
             raise ValueError("expected_workspace_sha is only valid for dir workspaces")
+    if branch_name and workspace_kind not in {"worktree", "dir"}:
+        raise ValueError(
+            "branch_name is only valid for worktree or SHA-bound dir workspaces"
+        )
+    if branch_name and workspace_kind == "dir" and expected_workspace_sha is None:
+        raise ValueError("dir branch_name requires expected_workspace_sha")
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -4550,6 +4554,11 @@ def claim_task(
     expected_assignee: Optional[str] = None,
     expected_workspace_path: Optional[str] = None,
     expected_workspace_sha: object = _CLAIM_EXPECTATION_UNSET,
+    expected_workspace_kind: Optional[str] = None,
+    expected_branch_name: object = _CLAIM_EXPECTATION_UNSET,
+    accepted_resume_request_id: Optional[str] = None,
+    accepted_resume_event_version: Optional[int] = None,
+    accepted_candidate_fingerprint: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4567,9 +4576,13 @@ def claim_task(
             expected_assignee is not None
             or expected_workspace_path is not None
             or expected_workspace_sha is not _CLAIM_EXPECTATION_UNSET
+            or expected_workspace_kind is not None
+            or expected_branch_name is not _CLAIM_EXPECTATION_UNSET
+            or accepted_resume_request_id is not None
         ):
             observed = conn.execute(
-                "SELECT assignee, workspace_path, expected_workspace_sha FROM tasks "
+                "SELECT assignee, workspace_path, workspace_kind, branch_name, "
+                "expected_workspace_sha FROM tasks "
                 "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL",
                 (task_id,),
             ).fetchone()
@@ -4590,6 +4603,47 @@ def claim_task(
                 and observed["expected_workspace_sha"] != expected_workspace_sha
             ):
                 return None
+            if (
+                expected_workspace_kind is not None
+                and observed["workspace_kind"] != expected_workspace_kind
+            ):
+                return None
+            if (
+                expected_branch_name is not _CLAIM_EXPECTATION_UNSET
+                and observed["branch_name"] != expected_branch_name
+            ):
+                return None
+            if accepted_resume_request_id is not None:
+                request = conn.execute(
+                    "SELECT state, result_code, expected_workspace_path, expected_branch, "
+                    "expected_sha, expected_candidate_fingerprint "
+                    "FROM kanban_resume_requests WHERE request_id=? AND task_id=?",
+                    (accepted_resume_request_id, task_id),
+                ).fetchone()
+                event = conn.execute(
+                    "SELECT id, kind, payload FROM task_events WHERE task_id=? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                try:
+                    event_payload = json.loads(event["payload"] or "{}") if event else {}
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    event_payload = {}
+                if (
+                    request is None
+                    or request["state"] != "accepted"
+                    or request["result_code"] != "accepted"
+                    or request["expected_workspace_path"] != expected_workspace_path
+                    or request["expected_branch"] != expected_branch_name
+                    or request["expected_sha"] != expected_workspace_sha
+                    or request["expected_candidate_fingerprint"]
+                    != accepted_candidate_fingerprint
+                    or event is None
+                    or event["id"] != accepted_resume_event_version
+                    or event["kind"] != "resume_request_accepted"
+                    or event_payload.get("request_id") != accepted_resume_request_id
+                ):
+                    return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4655,9 +4709,16 @@ def claim_task(
         if expected_workspace_sha is not _CLAIM_EXPECTATION_UNSET:
             claim_sql += " AND expected_workspace_sha IS ?"
             claim_params.append(expected_workspace_sha)
+        if expected_workspace_kind is not None:
+            claim_sql += " AND workspace_kind = ?"
+            claim_params.append(expected_workspace_kind)
+        if expected_branch_name is not _CLAIM_EXPECTATION_UNSET:
+            claim_sql += " AND branch_name IS ?"
+            claim_params.append(expected_branch_name)
         cur = conn.execute(claim_sql, tuple(claim_params))
         if cur.rowcount != 1:
             return None
+
         # Look up the current task row so we can populate the run with
         # its assignee / step / runtime cap.
         trow = conn.execute(
@@ -9950,10 +10011,19 @@ def _dispatch_once_locked(
                 )
             continue
         from hermes_cli.kanban_resume_requests import (
+            finalize_resume_dispatch_spawned,
+            rearm_resume_dispatch_after_spawn_failure,
             revalidate_accepted_request_before_dispatch,
+            validate_claimed_resume_dispatch,
         )
 
-        if not revalidate_accepted_request_before_dispatch(conn, row["id"]):
+        resume_binding = revalidate_accepted_request_before_dispatch(
+            conn,
+            row["id"],
+            task_snapshot=task_for_preflight,
+            workspace_capability=effective_capability,
+        )
+        if not resume_binding:
             continue
         if effective_capability is None:
             continue
@@ -9975,6 +10045,27 @@ def _dispatch_once_locked(
                 preflight_expected_sha
                 if task_for_preflight and task_for_preflight.workspace_path
                 else _CLAIM_EXPECTATION_UNSET
+            ),
+            expected_workspace_kind=(
+                resume_binding.workspace_kind if resume_binding is not True else None
+            ),
+            expected_branch_name=(
+                resume_binding.branch
+                if resume_binding is not True
+                else _CLAIM_EXPECTATION_UNSET
+            ),
+            accepted_resume_request_id=(
+                resume_binding.request_id if resume_binding is not True else None
+            ),
+            accepted_resume_event_version=(
+                resume_binding.accepted_event_version
+                if resume_binding is not True
+                else None
+            ),
+            accepted_candidate_fingerprint=(
+                resume_binding.candidate_fingerprint
+                if resume_binding is not True
+                else None
             ),
         )
         if claimed is None:
@@ -10042,8 +10133,14 @@ def _dispatch_once_locked(
                 workspace=str(workspace),
             )
             continue
+        if resume_binding is not True and not validate_claimed_resume_dispatch(
+            conn, claimed, resume_binding, effective_capability
+        ):
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
+            if resume_binding is not True:
+                finalize_resume_dispatch_spawned(conn, resume_binding)
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
             # Introspect the callable and pass optional invariants when supported.
@@ -10083,6 +10180,10 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            if resume_binding is not True:
+                rearm_resume_dispatch_after_spawn_failure(
+                    conn, claimed.id, resume_binding
+                )
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after

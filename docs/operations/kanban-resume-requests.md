@@ -40,6 +40,10 @@ kanban:
       sha: <exact reviewed HEAD>
       candidate_fingerprint: <sha256:...>
       block_reason_sha256: <sha256:...>
+      workspace_kind: dir
+      # One-time opt-in only for legacy dir tasks whose branch/SHA are both NULL.
+      # The gateway authenticates the exact policy-pinned bytes before binding them.
+      bind_legacy_metadata: true
 ```
 
 Fill `docs/examples/cowbone-resume-observer.manifest.json` from the same reviewed
@@ -50,10 +54,20 @@ gateway after configuration; reviewer gateways never dispatch.
 ## Semantics
 
 Only `needs_input` / `resume_iteration_budget` is accepted. Policy, status, event
-version, blocker digest, workspace path, branch, expected SHA, candidate bytes, and
-absence of a live claim/run are revalidated. Acceptance and request terminalization
-share one SQLite transaction. Normal `claim_task` then creates a durable run/claim
-fence before launch; concurrent ticks yield one live claim and one launch intent.
+version, blocker digest, workspace path/kind, branch, expected SHA, canonical logical
+candidate bytes, and absence of a live claim/run are revalidated. Candidate `.git`
+configuration is never interpreted. A bounded request batch is leased in a short
+transaction, filesystem authentication runs outside the SQLite writer lock, and a
+final lease/task/policy CAS accepts or rejects it. Normal `claim_task` binds the
+accepted request, prepared capability, exact task metadata, and acceptance event to a
+durable run/claim before launch; concurrent ticks yield one live claim and launch.
+
+`bind_legacy_metadata` is an explicit one-time gateway policy for the historical
+`workspace_kind: dir` shape where both `branch_name` and `expected_workspace_sha` are
+missing. It is not a generic unblock: the exact `needs_input` reason digest and event
+version must still match. The trusted policy's branch and SHA are persisted atomically
+without changing workspace bytes. New dir tasks may carry a branch only when they also
+carry an authenticated expected SHA.
 
 This is not an exactly-once external-process guarantee. A confirmed live claim prevents
 concurrent launch; a failed pre-exec launch closes its run and can retry; a process that

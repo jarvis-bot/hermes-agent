@@ -6,6 +6,8 @@ import multiprocessing
 import os
 import sqlite3
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -42,10 +44,10 @@ def _blocked_task(tmp_path: Path, monkeypatch, *, kind: str = "needs_input"):
         assignee="reviewer",
         workspace_kind="dir",
         workspace_path=str(repo),
+        branch_name="main",
         expected_workspace_sha=sha,
         initial_status="running",
     )
-    conn.execute("UPDATE tasks SET branch_name='main' WHERE id=?", (task_id,))
     kb.block_task(conn, task_id, reason="iteration budget exhausted", kind=kind)
     snapshot = rr.inspect_task_read_only(kb.kanban_db_path(), task_id)
     return conn, task_id, repo, sha, snapshot
@@ -67,7 +69,7 @@ def _request(snapshot, repo: Path, sha: str, task_id: str):
     )
 
 
-def _policy(spec):
+def _policy(spec, *, bind_legacy_metadata: bool = False):
     return rr.ResumePolicy(
         board="default",
         task_id=spec.task_id,
@@ -77,6 +79,7 @@ def _policy(spec):
         sha=spec.expected_sha,
         candidate_fingerprint=spec.expected_candidate_fingerprint,
         block_reason_sha256=spec.expected_block_reason_sha256,
+        bind_legacy_metadata=bind_legacy_metadata,
     )
 
 
@@ -205,14 +208,18 @@ def _consume_exit_before_commit(db_path: str, policy, reached, proceed):
     os.environ.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
     conn = kb.connect(Path(db_path))
 
-    def stop_during_validation(*args):
+    def stop_during_validation(*args, **kwargs):
         reached.set()
         proceed.wait()
         os._exit(23)
 
     rr.candidate_fingerprint = stop_during_validation
     rr.consume_resume_requests(
-        conn, board="default", gateway_profile="default", policies=[policy]
+        conn,
+        board="default",
+        gateway_profile="default",
+        policies=[policy],
+        lease_seconds=1,
     )
 
 
@@ -290,8 +297,9 @@ def test_gateway_process_exit_before_consume_commit_rolls_back_for_replay(
             "SELECT state, fence FROM kanban_resume_requests WHERE request_id=?",
             (request.request_id,),
         ).fetchone()
-        assert tuple(row) == ("pending", 0)
+        assert tuple(row) == ("leased", 1)
         assert kb.get_task(restarted, task_id).status == "blocked"
+        time.sleep(2)
         assert (
             rr.consume_resume_requests(
                 restarted,
@@ -301,6 +309,10 @@ def test_gateway_process_exit_before_consume_commit_rolls_back_for_replay(
             )[0].state
             == "accepted"
         )
+        assert restarted.execute(
+            "SELECT fence FROM kanban_resume_requests WHERE request_id=?",
+            (request.request_id,),
+        ).fetchone()[0] == 2
 
 
 def test_two_consumer_dispatchers_emit_one_real_launch_intent(tmp_path, monkeypatch):
@@ -497,3 +509,296 @@ def test_request_failure_is_recorded_not_success(tmp_path, monkeypatch):
     assert row["result_code"] != "ok"
     assert row["finished_at"] is not None
     conn.close()
+
+
+def test_candidate_fingerprint_never_executes_candidate_git_configuration(
+    tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    sha = _make_repo(repo)
+    marker = tmp_path / "textconv-executed"
+    helper = tmp_path / "textconv"
+    helper.write_text(f"#!/bin/sh\ntouch {marker}\ncat \"$1\"\n", encoding="utf-8")
+    helper.chmod(0o755)
+    subprocess.run(
+        ["git", "config", "diff.evil.textconv", str(helper)], cwd=repo, check=True
+    )
+    (repo / ".gitattributes").write_text("candidate.txt diff=evil\n", encoding="utf-8")
+    (repo / "candidate.txt").write_text("dirty\n", encoding="utf-8")
+
+    first = rr.candidate_fingerprint(repo, sha)
+    second = rr.candidate_fingerprint(repo, sha)
+
+    assert first == second
+    assert not marker.exists()
+
+
+def test_candidate_fingerprint_rejects_sparse_file_before_reading(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    sha = _make_repo(repo)
+    huge = repo / "huge.bin"
+    with huge.open("wb") as handle:
+        handle.truncate(rr.MAX_CANDIDATE_FILE_BYTES + 1)
+
+    with pytest.raises(ValueError, match="file byte limit"):
+        rr.candidate_fingerprint(repo, sha)
+
+
+def test_candidate_fingerprint_hashes_symlink_text_without_following_it(tmp_path):
+    root = tmp_path / "candidate"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_text("secret-a", encoding="utf-8")
+    (root / "link").symlink_to(outside)
+    first = rr.candidate_fingerprint(root, "a" * 40)
+    outside.write_text("secret-b", encoding="utf-8")
+    assert rr.candidate_fingerprint(root, "a" * 40) == first
+    (root / "link").unlink()
+    (root / "link").symlink_to(tmp_path / "different")
+    assert rr.candidate_fingerprint(root, "a" * 40) != first
+
+
+def test_candidate_fingerprint_authenticates_hardlink_content(tmp_path):
+    root = tmp_path / "candidate"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_text("shared", encoding="utf-8")
+    os.link(outside, root / "hardlink")
+    first = rr.candidate_fingerprint(root, "a" * 40)
+    outside.write_text("changed", encoding="utf-8")
+    assert rr.candidate_fingerprint(root, "a" * 40) != first
+
+
+def test_candidate_fingerprint_rejects_mutation_during_stream(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    sha = _make_repo(repo)
+    candidate = repo / "large.bin"
+    candidate.write_bytes(b"x" * (2 * 1024 * 1024))
+    original_read = rr.os.read
+    mutated = False
+
+    def racing_read(fd, size):
+        nonlocal mutated
+        data = original_read(fd, min(size, 1024))
+        if data and not mutated:
+            mutated = True
+            candidate.write_bytes(b"y" * candidate.stat().st_size)
+        return data
+
+    monkeypatch.setattr(rr.os, "read", racing_read)
+    with pytest.raises(ValueError, match="changed during authentication"):
+        rr.candidate_fingerprint(repo, sha)
+
+
+def test_candidate_fingerprint_honors_end_to_end_deadline(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    sha = _make_repo(repo)
+    with pytest.raises(ValueError, match="deadline"):
+        rr.candidate_fingerprint(repo, sha, deadline=time.monotonic() - 1)
+
+
+def test_slow_validation_does_not_block_unrelated_writer(tmp_path, monkeypatch):
+    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
+    spec = _request(snap, repo, sha, task_id)
+    rr._append_verified_request(conn, spec)
+    reached = threading.Event()
+    proceed = threading.Event()
+    original = rr.candidate_fingerprint
+
+    def paused(*args, **kwargs):
+        reached.set()
+        assert proceed.wait(10)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(rr, "candidate_fingerprint", paused)
+
+    def consume():
+        with kb.connect(kb.kanban_db_path()) as other:
+            rr.consume_resume_requests(
+                other,
+                board="default",
+                gateway_profile="default",
+                policies=[_policy(spec)],
+            )
+
+    worker = threading.Thread(target=consume)
+    worker.start()
+    assert reached.wait(10)
+    started = time.monotonic()
+    kb.add_comment(conn, task_id, "operator", "writer remained available")
+    assert time.monotonic() - started < 1
+    proceed.set()
+    worker.join(10)
+    assert not worker.is_alive()
+
+
+def test_legacy_dir_metadata_binding_uses_trusted_policy_and_public_api(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    repo = tmp_path / "league-table"
+    sha = _make_repo(repo)
+    conn = kb.connect()
+    task_id = kb.create_task(
+        conn,
+        title="League Table legacy task",
+        assignee="reviewer",
+        workspace_kind="dir",
+        workspace_path=str(repo),
+        initial_status="running",
+    )
+    kb.block_task(
+        conn, task_id, reason="iteration budget exhausted", kind="needs_input"
+    )
+    snap = rr.inspect_task_read_only(kb.kanban_db_path(), task_id)
+    assert snap["branch"] is None and snap["expected_sha"] is None
+    spec = _request(snap, repo, sha, task_id)
+    rr._append_verified_request(conn, spec)
+
+    result = rr.consume_resume_requests(
+        conn,
+        board="default",
+        gateway_profile="default",
+        policies=[_policy(spec, bind_legacy_metadata=True)],
+    )
+
+    assert result[0].state == "accepted"
+    task = kb.get_task(conn, task_id)
+    assert task.status == "ready"
+    assert task.workspace_kind == "dir"
+    assert task.branch_name == "main"
+    assert task.expected_workspace_sha == sha
+
+
+def test_accepted_request_cannot_redirect_dispatch_from_workspace_a_to_b(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    conn, task_id, repo_a, sha_a, snap = _blocked_task(tmp_path, monkeypatch)
+    spec = _request(snap, repo_a, sha_a, task_id)
+    request = rr._append_verified_request(conn, spec)
+    assert rr.consume_resume_requests(
+        conn, board="default", gateway_profile="default", policies=[_policy(spec)]
+    )[0].state == "accepted"
+    repo_b = tmp_path / "repo-b"
+    sha_b = _make_repo(repo_b)
+    conn.execute(
+        "UPDATE tasks SET workspace_path=?, branch_name='main', expected_workspace_sha=? "
+        "WHERE id=?",
+        (str(repo_b), sha_b, task_id),
+    )
+    launched = []
+
+    def capable(profile, candidate):
+        info = candidate.stat()
+        return WorkspaceCapability(
+            True, profile, str(candidate), device=info.st_dev, inode=info.st_ino
+        )
+
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *_args, **_kwargs: launched.append(True) or 123,
+        workspace_capability_fn=capable,
+    )
+
+    assert result.spawned == []
+    assert launched == []
+    outcome = conn.execute(
+        "SELECT state, result_code FROM kanban_resume_requests WHERE request_id=?",
+        (request.request_id,),
+    ).fetchone()
+    assert tuple(outcome) == ("rejected", "dispatch_stale_path")
+
+
+def test_candidate_mutation_after_claim_is_reblocked_before_spawn(tmp_path, monkeypatch):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
+    spec = _request(snap, repo, sha, task_id)
+    request = rr._append_verified_request(conn, spec)
+    rr.consume_resume_requests(
+        conn, board="default", gateway_profile="default", policies=[_policy(spec)]
+    )
+
+    real_claim = kb.claim_task
+
+    def claim_then_mutate(*args, **kwargs):
+        claimed = real_claim(*args, **kwargs)
+        if claimed is not None:
+            (repo / "candidate.txt").write_text("changed after claim\n", encoding="utf-8")
+        return claimed
+
+    monkeypatch.setattr(kb, "claim_task", claim_then_mutate)
+    launches = []
+
+    def capable(profile, candidate):
+        info = candidate.stat()
+        return WorkspaceCapability(
+            True, profile, str(candidate), "", device=info.st_dev, inode=info.st_ino
+        )
+
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *args, **kwargs: launches.append((args, kwargs)) or 12345,
+        workspace_capability_fn=capable,
+    )
+
+    assert result.spawned == []
+    assert launches == []
+    assert kb.get_task(conn, task_id).status == "blocked"
+    outcome = conn.execute(
+        "SELECT state, result_code FROM kanban_resume_requests WHERE request_id=?",
+        (request.request_id,),
+    ).fetchone()
+    assert tuple(outcome) == ("rejected", "dispatch_stale_fingerprint")
+
+
+def test_consumer_leases_only_requested_bounded_batch(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    conn = kb.connect()
+    policies = []
+    for index in range(3):
+        repo = tmp_path / f"repo-{index}"
+        sha = _make_repo(repo)
+        task_id = kb.create_task(
+            conn,
+            title=f"bounded {index}",
+            assignee="reviewer",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            branch_name="main",
+            expected_workspace_sha=sha,
+            initial_status="running",
+        )
+        kb.block_task(conn, task_id, reason="iteration budget exhausted", kind="needs_input")
+        spec = _request(
+            rr.inspect_task_read_only(kb.kanban_db_path(), task_id), repo, sha, task_id
+        )
+        rr._append_verified_request(conn, spec)
+        policies.append(_policy(spec))
+
+    results = rr.consume_resume_requests(
+        conn,
+        board="default",
+        gateway_profile="default",
+        policies=policies,
+        batch_size=2,
+    )
+
+    assert len(results) == 2
+    assert conn.execute(
+        "SELECT COUNT(*) FROM kanban_resume_requests WHERE state='pending'"
+    ).fetchone()[0] == 1
+
+
+def test_dir_branch_requires_an_authenticated_sha(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    conn = kb.connect()
+    with pytest.raises(ValueError, match="requires expected_workspace_sha"):
+        kb.create_task(
+            conn,
+            title="unsafe dir metadata",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+            branch_name="main",
+        )

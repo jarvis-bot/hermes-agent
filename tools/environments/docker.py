@@ -24,6 +24,7 @@ import uuid
 from pathlib import Path
 from typing import IO, Optional
 
+from hermes_cli.workspace_digest import canonical_logical_workspace_digest
 from tools.environments.base import BaseEnvironment, _popen_bash
 from tools.environments.local import (
     _HERMES_PROVIDER_ENV_BLOCKLIST,
@@ -409,17 +410,16 @@ def _review_workspace_content_digest(
     root: Path, *, deadline: Optional[float] = None
 ) -> str:
     """Hash the logical review tree independently of reconstructed ``.git``."""
-    inventory = _bounded_tree_inventory(root, deadline=deadline)
-    logical_inventory = [
-        path
-        for path in inventory
-        if path == root or path.relative_to(root).parts[0] != ".git"
-    ]
-    return _readonly_tree_digest(
+    return canonical_logical_workspace_digest(
         root,
-        include_root_mode=False,
         deadline=deadline,
-        _inventory=logical_inventory,
+        max_nodes=_MAX_REVIEW_WORKSPACE_NODES,
+        max_files=_MAX_REVIEW_WORKSPACE_FILES,
+        max_file_bytes=_MAX_REVIEW_WORKSPACE_BYTES,
+        max_total_bytes=_MAX_REVIEW_WORKSPACE_BYTES,
+        allow_symlinks=True,
+        require_single_link=False,
+        exclude_git_metadata=True,
     )
 
 
