@@ -2171,6 +2171,11 @@ DEFAULT_CONFIG = {
         # Fixed, operator-reviewed allowlist for durable supervisor resume
         # requests. Empty by default: no request can be consumed accidentally.
         "resume_request_policies": [],
+        # Filesystem capability endpoint. It remains disabled until an absolute
+        # outbox and a dedicated producer UID (different from the gateway UID)
+        # are both configured.
+        "resume_request_outbox": "",
+        "resume_request_producer_uid": None,
         # Auto-block after this many consecutive non-success attempts for the
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.

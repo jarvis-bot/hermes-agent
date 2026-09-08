@@ -1227,8 +1227,21 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
-                # Observer requests are consumed by this sole authenticated
-                # dispatcher immediately before its ordinary claim pass.
+                # Files are authenticated by a dedicated producer UID before
+                # they enter the database. With either setting absent the
+                # endpoint is disabled (the release-safe default).
+                _outbox = str(kanban_cfg.get("resume_request_outbox", "") or "").strip()
+                _producer_uid = kanban_cfg.get("resume_request_producer_uid")
+                if _outbox and _producer_uid is not None:
+                    _resume_requests.ingest_resume_outbox(
+                        conn,
+                        board=slug,
+                        outbox_dir=Path(_outbox),
+                        producer_uid=int(_producer_uid),
+                        policies=_resume_policies,
+                    )
+                # Acceptance is a durable handoff to the ordinary claim path;
+                # request consumption never starts a process itself.
                 _request_results = _resume_requests.consume_resume_requests(
                     conn,
                     board=slug,

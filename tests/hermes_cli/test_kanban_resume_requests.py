@@ -12,6 +12,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_resume_requests as rr
+from hermes_cli.kanban_workspace_preflight import WorkspaceCapability
 
 
 def _make_repo(path: Path) -> str:
@@ -79,30 +80,125 @@ def _policy(spec):
     )
 
 
-def _append_worker(db_path: str, spec, barrier, queue):
-    os.environ.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
-    os.environ[rr.TRUSTED_PRODUCER_ENV] = rr.TRUSTED_PRODUCER
-    conn = kb.connect(Path(db_path))
-    barrier.wait()
-    try:
-        queue.put(
-            rr.append_resume_request(
-                conn, spec, producer=rr.TRUSTED_PRODUCER
-            ).request_id
+def test_outbox_rejects_same_uid_and_forged_environment(tmp_path, monkeypatch):
+    """Append authority is a distinct OS identity, never an env/caller flag."""
+    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
+    spec = _request(snap, repo, sha, task_id)
+    outbox = tmp_path / "outbox"
+    outbox.mkdir(mode=0o730)
+    request_file = outbox / "request.json"
+    request_file.write_text(
+        json.dumps({"policy_index": 0, "state_version": snap["state_version"]}) + "\n",
+        encoding="utf-8",
+    )
+    request_file.chmod(0o600)
+    monkeypatch.setenv("HERMES_KANBAN_RESUME_PRODUCER", "host-no-agent")
+
+    with pytest.raises(PermissionError, match="distinct producer UID"):
+        rr.ingest_resume_outbox(
+            conn,
+            board="default",
+            outbox_dir=outbox,
+            producer_uid=os.getuid(),
+            policies=[_policy(spec)],
         )
-    finally:
-        conn.close()
+    assert (
+        conn.execute("SELECT COUNT(*) FROM kanban_resume_requests").fetchone()[0] == 0
+    )
 
 
-def _consume_then_exit(db_path: str, policy, committed, proceed):
-    os.environ.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
-    conn = kb.connect(Path(db_path))
-    rr.consume_resume_requests(
+def test_outbox_accepts_only_owned_fixed_policy_request(tmp_path, monkeypatch):
+    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
+    spec = _request(snap, repo, sha, task_id)
+    outbox = tmp_path / "outbox"
+    outbox.mkdir(mode=0o730)
+    request_file = outbox / "request.json"
+    request_file.write_text(
+        json.dumps({"policy_index": 0, "state_version": snap["state_version"]}) + "\n",
+        encoding="utf-8",
+    )
+    request_file.chmod(0o600)
+    gateway_uid = os.getuid() + 1
+    monkeypatch.setattr(rr.os, "getuid", lambda: gateway_uid)
+
+    policy = _policy(spec)
+    producer_uid = request_file.stat().st_uid
+    requests = rr.ingest_resume_outbox(
+        conn,
+        board="default",
+        outbox_dir=outbox,
+        producer_uid=producer_uid,
+        policies=[policy],
+    )
+    assert len(requests) == 1
+    assert requests[0].state == "pending"
+    assert request_file.exists()  # durable retry witness until terminal state
+    conn.close()  # gateway dies after durable append, before consume
+    conn = kb.connect()  # restarted gateway replays the same outbox witness
+    replayed = rr.ingest_resume_outbox(
+        conn,
+        board="default",
+        outbox_dir=outbox,
+        producer_uid=producer_uid,
+        policies=[policy],
+    )
+    assert len(replayed) == 1 and replayed[0].request_id == requests[0].request_id
+    consumed = rr.consume_resume_requests(
         conn, board="default", gateway_profile="default", policies=[policy]
     )
-    committed.set()
-    proceed.wait()
-    os._exit(17)
+    assert consumed[0].state == "accepted"
+    assert (
+        rr.ingest_resume_outbox(
+            conn,
+            board="default",
+            outbox_dir=outbox,
+            producer_uid=producer_uid,
+            policies=[policy],
+        )[0].state
+        == "accepted"
+    )
+    assert not request_file.exists()
+    conn.close()
+
+
+def test_outbox_rejects_symlink_endpoint_and_negative_policy_index(
+    tmp_path, monkeypatch
+):
+    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
+    policy = _policy(_request(snap, repo, sha, task_id))
+    real = tmp_path / "real"
+    real.mkdir(mode=0o730)
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+    request_file = real / "request.json"
+    request_file.write_text(
+        json.dumps({"policy_index": -1, "state_version": snap["state_version"]}) + "\n",
+        encoding="utf-8",
+    )
+    request_file.chmod(0o600)
+    gateway_uid = os.getuid() + 1
+    monkeypatch.setattr(rr.os, "getuid", lambda: gateway_uid)
+    with pytest.raises(PermissionError, match="symlink"):
+        rr.ingest_resume_outbox(
+            conn,
+            board="default",
+            outbox_dir=linked,
+            producer_uid=request_file.stat().st_uid,
+            policies=[policy],
+        )
+    assert (
+        rr.ingest_resume_outbox(
+            conn,
+            board="default",
+            outbox_dir=real,
+            producer_uid=request_file.stat().st_uid,
+            policies=[policy],
+        )
+        == []
+    )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM kanban_resume_requests").fetchone()[0] == 0
+    )
 
 
 def _consume_exit_before_commit(db_path: str, policy, reached, proceed):
@@ -120,150 +216,38 @@ def _consume_exit_before_commit(db_path: str, policy, reached, proceed):
     )
 
 
-def test_append_is_trusted_but_direct_child_mutation_remains_denied(
-    tmp_path, monkeypatch
-):
-    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
-    spec = _request(snap, repo, sha, task_id)
-    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
-    with pytest.raises(PermissionError, match="cannot mutate"):
-        kb.unblock_task(conn, task_id)
-    with pytest.raises(PermissionError, match="trusted host producer"):
-        rr.append_resume_request(conn, spec, producer="host-no-agent")
-    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT")
-    monkeypatch.setenv(rr.TRUSTED_PRODUCER_ENV, "host-no-agent")
-    request = rr.append_resume_request(conn, spec, producer="host-no-agent")
-    assert request.state == "pending"
-    conn.close()
+def _consumer_dispatcher(db_path: str, policy, barrier, launch_log: str):
+    os.environ.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+    conn = kb.connect(Path(db_path))
 
-
-def test_duplicate_requests_create_one_continuation_run(tmp_path, monkeypatch):
-    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
-    spec = _request(snap, repo, sha, task_id)
-    monkeypatch.setenv(rr.TRUSTED_PRODUCER_ENV, "host-no-agent")
-    first = rr.append_resume_request(conn, spec, producer="host-no-agent")
-    second = rr.append_resume_request(conn, spec, producer="host-no-agent")
-    assert first.request_id == second.request_id
-
-    accepted = rr.consume_resume_requests(
-        conn, board="default", gateway_profile="default", policies=[_policy(spec)]
-    )
-    assert [(r.request_id, r.state) for r in accepted] == [
-        (first.request_id, "accepted")
-    ]
-    first_claim = kb.claim_task(conn, task_id)
-    rr.consume_resume_requests(
-        conn, board="default", gateway_profile="default", policies=[_policy(spec)]
-    )
-    second_claim = kb.claim_task(conn, task_id)
-    assert first_claim is not None
-    assert second_claim is None
-    assert (
-        conn.execute(
-            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,)
-        ).fetchone()[0]
-        == 2
-    )
-    conn.close()
-
-
-def test_multiprocess_duplicate_append_has_one_durable_identity(tmp_path, monkeypatch):
-    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
-    spec = _request(snap, repo, sha, task_id)
-    conn.close()
-    ctx = multiprocessing.get_context("fork")
-    barrier = ctx.Barrier(3)
-    queue = ctx.Queue()
-    workers = [
-        ctx.Process(
-            target=_append_worker,
-            args=(str(kb.kanban_db_path()), spec, barrier, queue),
-        )
-        for _ in range(2)
-    ]
-    for worker in workers:
-        worker.start()
-    barrier.wait()
-    for worker in workers:
-        worker.join(20)
-        assert worker.exitcode == 0
-    ids = [queue.get(timeout=2), queue.get(timeout=2)]
-    assert ids[0] == ids[1] == rr.request_identity(spec)
-    with kb.connect() as check:
-        assert (
-            check.execute("SELECT COUNT(*) FROM kanban_resume_requests").fetchone()[0]
-            == 1
+    def capable(profile, candidate):
+        info = candidate.stat()
+        return WorkspaceCapability(
+            True, profile, str(candidate), "", device=info.st_dev, inode=info.st_ino
         )
 
-
-def test_crash_replay_before_and_after_atomic_consume(tmp_path, monkeypatch):
-    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
-    spec = _request(snap, repo, sha, task_id)
-    monkeypatch.setenv(rr.TRUSTED_PRODUCER_ENV, "host-no-agent")
-    request = rr.append_resume_request(conn, spec, producer="host-no-agent")
-    # Crash before consume: durable pending row remains replayable.
-    conn.close()
-    conn = kb.connect()
-    out = rr.consume_resume_requests(
-        conn, board="default", gateway_profile="default", policies=[_policy(spec)]
-    )
-    assert out[0].state == "accepted"
-    conn.close()
-    # Crash after commit: restart sees accepted request and ready task, never re-applies.
-    conn = kb.connect()
-    assert (
-        rr.consume_resume_requests(
-            conn, board="default", gateway_profile="default", policies=[_policy(spec)]
-        )
-        == []
-    )
-    assert kb.get_task(conn, task_id).status == "ready"
-    row = conn.execute(
-        "SELECT state, fence FROM kanban_resume_requests WHERE request_id=?",
-        (request.request_id,),
-    ).fetchone()
-    assert tuple(row) == ("accepted", 1)
-    conn.close()
-
-
-def test_gateway_process_exit_after_consume_commit_is_restart_safe(
-    tmp_path, monkeypatch
-):
-    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
-    spec = _request(snap, repo, sha, task_id)
-    monkeypatch.setenv(rr.TRUSTED_PRODUCER_ENV, "host-no-agent")
-    rr.append_resume_request(conn, spec, producer="host-no-agent")
-    conn.close()
-    ctx = multiprocessing.get_context("fork")
-    committed = ctx.Event()
-    proceed = ctx.Event()
-    worker = ctx.Process(
-        target=_consume_then_exit,
-        args=(str(kb.kanban_db_path()), _policy(spec), committed, proceed),
-    )
-    worker.start()
-    assert committed.wait(20)
-    proceed.set()
-    worker.join(20)
-    assert worker.exitcode == 17
-    with kb.connect() as restarted:
-        assert (
-            rr.consume_resume_requests(
-                restarted,
-                board="default",
-                gateway_profile="default",
-                policies=[_policy(spec)],
+    def launch(task, workspace, **kwargs):
+        fd = os.open(launch_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(
+                fd, f"{task.id}:{task.current_run_id}:{task.claim_lock}\n".encode()
             )
-            == []
-        )
-        assert kb.get_task(restarted, task_id).status == "ready"
+        finally:
+            os.close(fd)
+        return os.getpid()
+
+    barrier.wait()
+    rr.consume_resume_requests(
+        conn, board="default", gateway_profile="default", policies=[policy]
+    )
+    kb.dispatch_once(conn, spawn_fn=launch, workspace_capability_fn=capable)
+    conn.close()
 
 
 def test_candidate_is_revalidated_immediately_before_dispatch(tmp_path, monkeypatch):
     conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
     spec = _request(snap, repo, sha, task_id)
-    monkeypatch.setenv(rr.TRUSTED_PRODUCER_ENV, "host-no-agent")
-    request = rr.append_resume_request(conn, spec, producer="host-no-agent")
+    request = rr._append_verified_request(conn, spec)
     assert (
         rr.consume_resume_requests(
             conn, board="default", gateway_profile="default", policies=[_policy(spec)]
@@ -287,8 +271,7 @@ def test_gateway_process_exit_before_consume_commit_rolls_back_for_replay(
 ):
     conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
     spec = _request(snap, repo, sha, task_id)
-    monkeypatch.setenv(rr.TRUSTED_PRODUCER_ENV, "host-no-agent")
-    request = rr.append_resume_request(conn, spec, producer="host-no-agent")
+    request = rr._append_verified_request(conn, spec)
     conn.close()
     ctx = multiprocessing.get_context("fork")
     reached = ctx.Event()
@@ -320,6 +303,91 @@ def test_gateway_process_exit_before_consume_commit_rolls_back_for_replay(
         )
 
 
+def test_two_consumer_dispatchers_emit_one_real_launch_intent(tmp_path, monkeypatch):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
+    spec = _request(snap, repo, sha, task_id)
+    rr._append_verified_request(conn, spec)
+    conn.close()
+    launch_log = tmp_path / "launch.log"
+    ctx = multiprocessing.get_context("fork")
+    barrier = ctx.Barrier(3)
+    workers = [
+        ctx.Process(
+            target=_consumer_dispatcher,
+            args=(str(kb.kanban_db_path()), _policy(spec), barrier, str(launch_log)),
+        )
+        for _ in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    barrier.wait()
+    for worker in workers:
+        worker.join(30)
+        assert worker.exitcode == 0
+    intents = launch_log.read_text(encoding="utf-8").splitlines()
+    assert len(intents) == 1
+    with kb.connect() as check:
+        task = kb.get_task(check, task_id)
+        assert task.status == "running"
+        assert task.current_run_id is not None
+        assert task.claim_lock
+        assert (
+            check.execute(
+                "SELECT COUNT(*) FROM task_runs WHERE task_id=? AND status='running'",
+                (task_id,),
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_claim_before_launch_failure_is_fenced_then_retryable(tmp_path, monkeypatch):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
+    spec = _request(snap, repo, sha, task_id)
+    rr._append_verified_request(conn, spec)
+    rr.consume_resume_requests(
+        conn, board="default", gateway_profile="default", policies=[_policy(spec)]
+    )
+
+    def capable(profile, candidate):
+        info = candidate.stat()
+        return WorkspaceCapability(
+            True, profile, str(candidate), "", device=info.st_dev, inode=info.st_ino
+        )
+
+    first = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("pre-exec")
+        ),
+        workspace_capability_fn=capable,
+        failure_limit=2,
+    )
+    assert first.spawned == []
+    assert kb.get_task(conn, task_id).status == "ready"
+    ended = conn.execute(
+        "SELECT status, ended_at FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    assert ended["status"] == "spawn_failed"
+    assert ended["ended_at"] is not None
+
+    launched = []
+    second = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda task, _path, **_kwargs: (
+            launched.append(task.current_run_id) or 999999
+        ),
+        workspace_capability_fn=capable,
+        failure_limit=2,
+    )
+    assert len(second.spawned) == 1
+    assert len(launched) == 1
+    assert kb.get_task(conn, task_id).status == "running"
+    conn.close()
+
+
 @pytest.mark.parametrize(
     "field",
     ["status", "version", "block_reason", "path", "branch", "sha", "fingerprint"],
@@ -327,8 +395,7 @@ def test_gateway_process_exit_before_consume_commit_rolls_back_for_replay(
 def test_stale_expectations_reject_without_unblocking(tmp_path, monkeypatch, field):
     conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
     spec = _request(snap, repo, sha, task_id)
-    monkeypatch.setenv(rr.TRUSTED_PRODUCER_ENV, "host-no-agent")
-    rr.append_resume_request(conn, spec, producer="host-no-agent")
+    rr._append_verified_request(conn, spec)
     if field == "status":
         conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (task_id,))
     elif field == "version":
@@ -362,8 +429,7 @@ def test_stale_expectations_reject_without_unblocking(tmp_path, monkeypatch, fie
 def test_active_worker_and_unsupported_block_are_untouched(tmp_path, monkeypatch):
     conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
     spec = _request(snap, repo, sha, task_id)
-    monkeypatch.setenv(rr.TRUSTED_PRODUCER_ENV, "host-no-agent")
-    rr.append_resume_request(conn, spec, producer="host-no-agent")
+    rr._append_verified_request(conn, spec)
     conn.execute(
         "UPDATE tasks SET worker_pid=999, claim_lock='live' WHERE id=?", (task_id,)
     )
@@ -382,8 +448,7 @@ def test_active_worker_and_unsupported_block_are_untouched(tmp_path, monkeypatch
         **spec.__dict__,
         "expected_block_kind": "capability",
     })
-    monkeypatch.setenv(rr.TRUSTED_PRODUCER_ENV, "host-no-agent")
-    rr.append_resume_request(conn, spec, producer="host-no-agent")
+    rr._append_verified_request(conn, spec)
     result = rr.consume_resume_requests(
         conn, board="default", gateway_profile="default", policies=[_policy(spec)]
     )
@@ -395,8 +460,7 @@ def test_active_worker_and_unsupported_block_are_untouched(tmp_path, monkeypatch
 def test_only_actual_default_gateway_consumes(tmp_path, monkeypatch):
     conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
     spec = _request(snap, repo, sha, task_id)
-    monkeypatch.setenv(rr.TRUSTED_PRODUCER_ENV, "host-no-agent")
-    rr.append_resume_request(conn, spec, producer="host-no-agent")
+    rr._append_verified_request(conn, spec)
     monkeypatch.setattr(rr, "active_profile_name", lambda: "reviewer")
     with pytest.raises(PermissionError, match="default gateway"):
         rr.consume_resume_requests(
@@ -419,8 +483,7 @@ def test_only_actual_default_gateway_consumes(tmp_path, monkeypatch):
 def test_request_failure_is_recorded_not_success(tmp_path, monkeypatch):
     conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
     spec = _request(snap, repo, sha, task_id)
-    monkeypatch.setenv(rr.TRUSTED_PRODUCER_ENV, "host-no-agent")
-    request = rr.append_resume_request(conn, spec, producer="host-no-agent")
+    request = rr._append_verified_request(conn, spec)
     bad_policy = rr.ResumePolicy(**{**_policy(spec).__dict__, "sha": "f" * 40})
     result = rr.consume_resume_requests(
         conn, board="default", gateway_profile="default", policies=[bad_policy]

@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import time
 from dataclasses import asdict, dataclass
@@ -20,8 +21,7 @@ from typing import Any, Iterable, Optional, cast
 
 from hermes_cli import kanban_db as kb
 
-TRUSTED_PRODUCER_ENV = "HERMES_KANBAN_RESUME_PRODUCER"
-TRUSTED_PRODUCER = "host-no-agent"
+PRODUCER_KIND = "host-no-agent"
 SUPPORTED_ACTION = "resume_iteration_budget"
 SUPPORTED_BLOCK_KIND = "needs_input"
 
@@ -94,17 +94,6 @@ def _is_delegated_child() -> bool:
         return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
 
 
-def _trusted_producer(producer: str) -> None:
-    if (
-        _is_delegated_child()
-        or producer != TRUSTED_PRODUCER
-        or os.environ.get(TRUSTED_PRODUCER_ENV) != TRUSTED_PRODUCER
-    ):
-        raise PermissionError(
-            "resume requests require the trusted host producer context"
-        )
-
-
 def _request_from_row(row: sqlite3.Row) -> ResumeRequest:
     return ResumeRequest(
         request_id=str(row["request_id"]),
@@ -114,11 +103,10 @@ def _request_from_row(row: sqlite3.Row) -> ResumeRequest:
     )
 
 
-def append_resume_request(
-    conn: sqlite3.Connection, spec: ResumeRequestSpec, *, producer: str
+def _append_verified_request(
+    conn: sqlite3.Connection, spec: ResumeRequestSpec
 ) -> ResumeRequest:
-    """Append an immutable request, deduplicated by its canonical expectation set."""
-    _trusted_producer(producer)
+    """Persist a request already authenticated by :func:`ingest_resume_outbox`."""
     if spec.action != SUPPORTED_ACTION:
         raise ValueError(f"unsupported resume action: {spec.action}")
     request_id = request_identity(spec)
@@ -142,7 +130,7 @@ def append_resume_request(
                 spec.board,
                 spec.task_id,
                 spec.action,
-                producer,
+                PRODUCER_KIND,
                 spec.expected_status,
                 int(spec.expected_state_version),
                 str(Path(spec.expected_workspace_path).resolve()),
@@ -164,6 +152,111 @@ def append_resume_request(
             conn.execute("ROLLBACK")
         raise
     return _request_from_row(row)
+
+
+def _spec_from_policy(policy: ResumePolicy, state_version: int) -> ResumeRequestSpec:
+    """Build identity only from gateway policy plus the observer's event fence."""
+    return ResumeRequestSpec(
+        board=policy.board,
+        task_id=policy.task_id,
+        action=policy.action,
+        expected_status="blocked",
+        expected_state_version=state_version,
+        expected_workspace_path=policy.workspace_path,
+        expected_branch=policy.branch,
+        expected_sha=policy.sha,
+        expected_candidate_fingerprint=policy.candidate_fingerprint,
+        expected_block_kind=SUPPORTED_BLOCK_KIND,
+        expected_block_reason_sha256=policy.block_reason_sha256,
+    )
+
+
+def ingest_resume_outbox(
+    conn: sqlite3.Connection,
+    *,
+    board: str,
+    outbox_dir: Path,
+    producer_uid: int,
+    policies: Iterable[ResumePolicy],
+) -> list[ResumeRequest]:
+    """Authenticate fixed requests by filesystem ownership and ingest them.
+
+    The producer must be a dedicated OS identity, distinct from the gateway.
+    Files contain a policy index and observed event fence; authority-bearing
+    values come only from the gateway's operator-owned configuration.
+    """
+    if _is_delegated_child():
+        raise PermissionError("delegated children cannot ingest resume requests")
+    gateway_uid = os.getuid()
+    producer_uid = int(producer_uid)
+    if producer_uid < 0 or producer_uid == gateway_uid:
+        raise PermissionError("resume outbox requires a distinct producer UID")
+    configured_root = outbox_dir.expanduser()
+    if configured_root.is_symlink():
+        raise PermissionError("resume outbox must not be a symlink")
+    root = configured_root.resolve(strict=True)
+    root_info = root.stat(follow_symlinks=False)
+    if not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid not in {
+        0,
+        gateway_uid,
+        producer_uid,
+    }:
+        raise PermissionError("resume outbox has unsafe ownership")
+    if root_info.st_mode & stat.S_IWOTH:
+        raise PermissionError("resume outbox must not be world writable")
+    policy_list = tuple(policies)
+    results: list[ResumeRequest] = []
+    for path in sorted(root.glob("*.json")):
+        try:
+            before = path.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != producer_uid
+                or before.st_nlink != 1
+                or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                continue
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                current = os.fstat(fd)
+                if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
+                    raise PermissionError("resume request changed while opening")
+                payload = os.read(fd, 4097)
+            finally:
+                os.close(fd)
+            if len(payload) > 4096:
+                raise ValueError("resume request exceeds 4 KiB")
+            data = json.loads(payload)
+            if not isinstance(data, dict) or set(data) != {
+                "policy_index",
+                "state_version",
+            }:
+                raise ValueError("resume request has unexpected fields")
+            index = data["policy_index"]
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise ValueError("policy_index must be an integer")
+            state_version = data["state_version"]
+            if (
+                not isinstance(state_version, int)
+                or isinstance(state_version, bool)
+                or state_version < 0
+            ):
+                raise ValueError("state_version must be a non-negative integer")
+            if index < 0 or index >= len(policy_list):
+                raise ValueError("policy_index is outside the configured allowlist")
+            policy = policy_list[index]
+            if policy.board != board:
+                raise ValueError("request policy belongs to another board")
+            request = _append_verified_request(
+                conn, _spec_from_policy(policy, state_version)
+            )
+            results.append(request)
+            # Preserve the OS-authenticated witness across append→consume crashes.
+            if request.state != "pending":
+                path.unlink()
+        except (IndexError, KeyError, OSError, ValueError, json.JSONDecodeError):
+            continue
+    return results
 
 
 def inspect_task_read_only(db_path: Path, task_id: str) -> dict:

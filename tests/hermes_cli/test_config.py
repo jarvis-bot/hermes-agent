@@ -1425,6 +1425,9 @@ def test_default_config_kanban_block_not_dropped_by_duplicate_key():
     # From the second block:
     assert "dispatch_in_gateway" in kanban
     assert "auto_decompose" in kanban
+    assert kanban["resume_request_policies"] == []
+    assert kanban["resume_request_outbox"] == ""
+    assert kanban["resume_request_producer_uid"] is None
 
 
 def test_default_config_has_no_duplicate_top_level_keys():

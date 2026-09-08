@@ -76,6 +76,9 @@ def _load_manifest(path: Path) -> dict:
         "sha",
         "candidate_fingerprint",
         "state_file",
+        "outbox_dir",
+        "policy_index",
+        "producer_uid",
     }
     if not isinstance(data, dict) or set(data) != required:
         raise ValueError(
@@ -86,6 +89,9 @@ def _load_manifest(path: Path) -> dict:
 
 def run(manifest_path: Path) -> Optional[dict]:
     manifest = _load_manifest(manifest_path.resolve())
+    producer_uid = int(manifest["producer_uid"])
+    if not hasattr(os, "getuid") or os.getuid() != producer_uid:
+        raise PermissionError("observer must run as the dedicated producer UID")
     board = str(manifest["board"])
     if kb._normalize_board_slug(board) != board:
         raise ValueError("manifest board is not canonical")
@@ -107,17 +113,42 @@ def run(manifest_path: Path) -> Optional[dict]:
             expected_block_kind=rr.SUPPORTED_BLOCK_KIND,
             expected_block_reason_sha256=str(task["block_reason_sha256"]),
         )
-        os.environ[rr.TRUSTED_PRODUCER_ENV] = rr.TRUSTED_PRODUCER
-        # Writable open occurs only after the read-only eligibility check. The
-        # immutable manifest, not task text, supplies every action/path value.
-        with kb.connect_closing(db_path) as conn:
-            appended = rr.append_resume_request(
-                conn, spec, producer=rr.TRUSTED_PRODUCER
-            )
+        if (
+            rr.candidate_fingerprint(workspace, spec.expected_sha)
+            != spec.expected_candidate_fingerprint
+        ):
+            raise ValueError("candidate fingerprint differs from manifest")
+        outbox = Path(str(manifest["outbox_dir"])).expanduser().resolve(strict=True)
+        info = outbox.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode) or info.st_mode & stat.S_IWOTH:
+            raise PermissionError("observer outbox directory is unsafe")
+        policy_index = int(manifest["policy_index"])
+        target = outbox / f"resume-{policy_index}.json"
+        fd, tmp_name = tempfile.mkstemp(prefix=".resume-", dir=outbox)
+        try:
+            os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "policy_index": policy_index,
+                        "state_version": spec.expected_state_version,
+                    },
+                    handle,
+                    sort_keys=True,
+                )
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, target)
+        finally:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
         result = {
-            "request_id": appended.request_id,
-            "state": appended.state,
-            "result_code": appended.result_code,
+            "request_id": rr.request_identity(spec),
+            "state": "pending",
+            "result_code": None,
         }
     return transition_output(Path(str(manifest["state_file"])).resolve(), task, result)
 

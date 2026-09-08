@@ -93,6 +93,8 @@ def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:
         return None
     if st is None:
         return {}
+    if not isinstance(st, str) or not isinstance(sn, str):
+        return None
     return {"state_type": st, "state_name": sn}
 
 
@@ -1588,6 +1590,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
+    if task is None:  # create_task returning an unreadable id is an invariant breach
+        print(f"error: created task {task_id} could not be read back", file=sys.stderr)
+        return 1
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
