@@ -225,6 +225,9 @@ def _consume_exit_before_commit(db_path: str, policy, reached, proceed):
 
 def _consumer_dispatcher(db_path: str, policy, barrier, launch_log: str):
     os.environ.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+    import hermes_cli.profiles as profiles
+
+    profiles.profile_exists = lambda _profile: True
     conn = kb.connect(Path(db_path))
 
     def capable(profile, candidate):
@@ -247,7 +250,12 @@ def _consumer_dispatcher(db_path: str, policy, barrier, launch_log: str):
     rr.consume_resume_requests(
         conn, board="default", gateway_profile="default", policies=[policy]
     )
-    kb.dispatch_once(conn, spawn_fn=launch, workspace_capability_fn=capable)
+    kb.dispatch_once(
+        conn,
+        board="default",
+        spawn_fn=launch,
+        workspace_capability_fn=capable,
+    )
     conn.close()
 
 
@@ -368,15 +376,21 @@ def test_claim_before_launch_failure_is_fenced_then_retryable(tmp_path, monkeypa
             True, profile, str(candidate), "", device=info.st_dev, inode=info.st_ino
         )
 
+    launch_attempts = 0
+
+    def fail_before_exec(*_args, **_kwargs):
+        nonlocal launch_attempts
+        launch_attempts += 1
+        raise TypeError("pre-exec")
+
     first = kb.dispatch_once(
         conn,
-        spawn_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("pre-exec")
-        ),
+        spawn_fn=fail_before_exec,
         workspace_capability_fn=capable,
         failure_limit=2,
     )
     assert first.spawned == []
+    assert launch_attempts == 1
     assert kb.get_task(conn, task_id).status == "ready"
     ended = conn.execute(
         "SELECT status, ended_at FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
@@ -751,6 +765,261 @@ def test_candidate_mutation_after_claim_is_reblocked_before_spawn(tmp_path, monk
         (request.request_id,),
     ).fetchone()
     assert tuple(outcome) == ("rejected", "dispatch_stale_fingerprint")
+
+
+@pytest.mark.parametrize(
+    ("drift", "expected_code"),
+    [
+        ("path", "dispatch_stale_path"),
+        ("kind", "dispatch_stale_workspace_kind"),
+        ("branch", "dispatch_stale_branch"),
+        ("sha", "dispatch_stale_sha"),
+        ("version", "dispatch_stale_version"),
+        ("accepted_event", "dispatch_stale_version"),
+        ("request_state", "dispatch_stale_request"),
+        ("request_lease", "dispatch_stale_request"),
+        ("policy", "dispatch_stale_request"),
+    ],
+)
+def test_task_provenance_mutation_after_real_claim_never_launches(
+    tmp_path, monkeypatch, drift, expected_code
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
+    spec = _request(snap, repo, sha, task_id)
+    request = rr._append_verified_request(conn, spec)
+    rr.consume_resume_requests(
+        conn, board="default", gateway_profile="default", policies=[_policy(spec)]
+    )
+    real_claim = kb.claim_task
+
+    def claim_then_mutate(*args, **kwargs):
+        claimed = real_claim(*args, **kwargs)
+        if claimed is None:
+            return None
+        if drift == "path":
+            conn.execute(
+                "UPDATE tasks SET workspace_path=? WHERE id=?",
+                (str(tmp_path / "other"), task_id),
+            )
+        elif drift == "kind":
+            conn.execute("UPDATE tasks SET workspace_kind='scratch' WHERE id=?", (task_id,))
+        elif drift == "branch":
+            conn.execute("UPDATE tasks SET branch_name='other' WHERE id=?", (task_id,))
+        elif drift == "sha":
+            conn.execute(
+                "UPDATE tasks SET expected_workspace_sha=? WHERE id=?",
+                ("b" * 40, task_id),
+            )
+        elif drift == "version":
+            kb._append_event(conn, task_id, "commented", {"race": True})
+        elif drift == "accepted_event":
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=(SELECT MAX(id) FROM task_events "
+                "WHERE task_id=? AND kind='resume_request_accepted')",
+                ('{"request_id":"tampered"}', task_id),
+            )
+        elif drift == "request_state":
+            conn.execute(
+                "UPDATE kanban_resume_requests SET result_code='superseded' "
+                "WHERE request_id=?",
+                (request.request_id,),
+            )
+        elif drift == "request_lease":
+            conn.execute(
+                "UPDATE kanban_resume_requests SET lease_owner='attacker', "
+                "lease_expires=? WHERE request_id=?",
+                (int(time.time()) + 60, request.request_id),
+            )
+        elif drift == "policy":
+            conn.execute(
+                "UPDATE kanban_resume_requests SET expected_block_reason_sha256=? "
+                "WHERE request_id=?",
+                ("b" * 64, request.request_id),
+            )
+        return claimed
+
+    monkeypatch.setattr(kb, "claim_task", claim_then_mutate)
+    launches = []
+
+    def capable(profile, candidate):
+        info = candidate.stat()
+        return WorkspaceCapability(
+            True,
+            profile,
+            str(candidate),
+            "",
+            device=info.st_dev,
+            inode=info.st_ino,
+            content_sha256=spec.expected_candidate_fingerprint.removeprefix("sha256:"),
+        )
+
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *args, **kwargs: launches.append((args, kwargs)) or 12345,
+        workspace_capability_fn=capable,
+    )
+
+    assert result.spawned == []
+    assert launches == []
+    task = kb.get_task(conn, task_id)
+    assert task.status == "blocked"
+    assert task.claim_lock is None
+    assert task.current_run_id is None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_runs WHERE task_id=? AND status='running'",
+        (task_id,),
+    ).fetchone()[0] == 0
+    outcome = conn.execute(
+        "SELECT state, result_code FROM kanban_resume_requests WHERE request_id=?",
+        (request.request_id,),
+    ).fetchone()
+    assert tuple(outcome) == ("rejected", expected_code)
+
+
+def test_task_provenance_mutation_at_final_spawn_fence_never_launches(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
+    spec = _request(snap, repo, sha, task_id)
+    request = rr._append_verified_request(conn, spec)
+    rr.consume_resume_requests(
+        conn, board="default", gateway_profile="default", policies=[_policy(spec)]
+    )
+    real_finalize = rr.finalize_resume_dispatch_spawned
+
+    def mutate_then_finalize(connection, binding, *args, **kwargs):
+        connection.execute(
+            "UPDATE tasks SET expected_workspace_sha=? WHERE id=?",
+            ("b" * 40, task_id),
+        )
+        return real_finalize(connection, binding, *args, **kwargs)
+
+    monkeypatch.setattr(rr, "finalize_resume_dispatch_spawned", mutate_then_finalize)
+    launches = []
+
+    def capable(profile, candidate):
+        info = candidate.stat()
+        return WorkspaceCapability(
+            True,
+            profile,
+            str(candidate),
+            "",
+            device=info.st_dev,
+            inode=info.st_ino,
+            content_sha256=spec.expected_candidate_fingerprint.removeprefix("sha256:"),
+        )
+
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *args, **kwargs: launches.append((args, kwargs)) or 12345,
+        workspace_capability_fn=capable,
+    )
+
+    assert result.spawned == []
+    assert launches == []
+    task = kb.get_task(conn, task_id)
+    assert task.status == "blocked"
+    assert task.claim_lock is None
+    assert task.current_run_id is None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_runs WHERE task_id=? AND status='running'",
+        (task_id,),
+    ).fetchone()[0] == 0
+    outcome = conn.execute(
+        "SELECT state, result_code FROM kanban_resume_requests WHERE request_id=?",
+        (request.request_id,),
+    ).fetchone()
+    assert tuple(outcome) == ("rejected", "dispatch_stale_sha")
+
+
+@pytest.mark.parametrize("winner_drift", ["claim", "run"])
+def test_post_claim_race_loser_cleanup_preserves_unrelated_winner(
+    tmp_path, monkeypatch, winner_drift
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
+    spec = _request(snap, repo, sha, task_id)
+    request = rr._append_verified_request(conn, spec)
+    rr.consume_resume_requests(
+        conn, board="default", gateway_profile="default", policies=[_policy(spec)]
+    )
+    real_claim = kb.claim_task
+    winner_lock = "unrelated-winner"
+    winner_run_id = None
+    loser_run_id = None
+
+    def claim_then_install_winner(*args, **kwargs):
+        nonlocal winner_run_id, loser_run_id
+        claimed = real_claim(*args, **kwargs)
+        assert claimed is not None
+        loser_run_id = claimed.current_run_id
+        if winner_drift == "claim":
+            winner_run_id = loser_run_id
+            conn.execute(
+                "UPDATE tasks SET claim_lock=? WHERE id=?",
+                (winner_lock, task_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET claim_lock=? WHERE id=?",
+                (winner_lock, winner_run_id),
+            )
+        else:
+            cursor = conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, claim_lock, "
+                "claim_expires, started_at) VALUES (?, 'reviewer', 'running', ?, ?, ?)",
+                (task_id, winner_lock, int(time.time()) + 60, int(time.time())),
+            )
+            winner_run_id = int(cursor.lastrowid)
+            conn.execute(
+                "UPDATE tasks SET claim_lock=?, current_run_id=? WHERE id=?",
+                (winner_lock, winner_run_id, task_id),
+            )
+        return claimed
+
+    monkeypatch.setattr(kb, "claim_task", claim_then_install_winner)
+    launches = []
+
+    def capable(profile, candidate):
+        info = candidate.stat()
+        return WorkspaceCapability(
+            True,
+            profile,
+            str(candidate),
+            device=info.st_dev,
+            inode=info.st_ino,
+            content_sha256=spec.expected_candidate_fingerprint.removeprefix("sha256:"),
+        )
+
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *args, **kwargs: launches.append((args, kwargs)) or 12345,
+        workspace_capability_fn=capable,
+    )
+
+    assert result.spawned == []
+    assert launches == []
+    task = kb.get_task(conn, task_id)
+    assert task.status == "running"
+    assert task.claim_lock == winner_lock
+    assert task.current_run_id == winner_run_id
+    winner = conn.execute(
+        "SELECT status, ended_at, claim_lock FROM task_runs WHERE id=?",
+        (winner_run_id,),
+    ).fetchone()
+    assert tuple(winner) == ("running", None, winner_lock)
+    if loser_run_id != winner_run_id:
+        loser = conn.execute(
+            "SELECT status, ended_at FROM task_runs WHERE id=?", (loser_run_id,)
+        ).fetchone()
+        assert loser["status"] == "workspace_changed"
+        assert loser["ended_at"] is not None
+    outcome = conn.execute(
+        "SELECT state, result_code FROM kanban_resume_requests WHERE request_id=?",
+        (request.request_id,),
+    ).fetchone()
+    assert tuple(outcome) == ("rejected", "dispatch_stale_claim")
 
 
 def test_consumer_leases_only_requested_bounded_batch(tmp_path, monkeypatch):

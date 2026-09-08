@@ -10120,8 +10120,12 @@ def _dispatch_once_locked(
                         run_id=run_id,
                     )
             continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
+        # Persist lazily resolved workspaces for ordinary dispatch.  An accepted
+        # resume binding already pins a concrete directory; rewriting it from the
+        # stale claimed object here would erase a post-claim provenance race before
+        # the final CAS can observe it.
+        if resume_binding is True:
+            set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
@@ -10139,22 +10143,35 @@ def _dispatch_once_locked(
             continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            if resume_binding is not True:
-                finalize_resume_dispatch_spawned(conn, resume_binding)
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
             # Introspect the callable and pass optional invariants when supported.
             import inspect
-            try:
-                sig = inspect.signature(_spawn)
+
+            def invoke_spawn() -> Optional[int]:
+                try:
+                    sig = inspect.signature(_spawn)
+                except (TypeError, ValueError):
+                    return _spawn(claimed, str(workspace))
                 spawn_kwargs = {}
                 if "board" in sig.parameters:
                     spawn_kwargs["board"] = board
                 if "workspace_capability" in sig.parameters:
                     spawn_kwargs["workspace_capability"] = effective_capability
-                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+                return _spawn(claimed, str(workspace), **spawn_kwargs)
+
+            if resume_binding is not True:
+                launched, pid = finalize_resume_dispatch_spawned(
+                    conn,
+                    resume_binding,
+                    claimed,
+                    effective_capability,
+                    invoke_spawn,
+                )
+                if not launched:
+                    continue
+            else:
+                pid = invoke_spawn()
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # NOTE: we intentionally do NOT reset consecutive_failures

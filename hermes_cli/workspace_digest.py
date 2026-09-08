@@ -84,36 +84,39 @@ def _inventory(
         directory, prefix = pending.pop()
         _check_deadline(deadline)
         with os.scandir(directory) as entries:
-            children = sorted(entries, key=lambda entry: os.fsencode(entry.name), reverse=True)
-        for entry in children:
-            _check_deadline(deadline)
-            if exclude_git_metadata and not prefix and entry.name == ".git":
-                continue
-            path = directory / entry.name
-            relative = f"{prefix}/{entry.name}" if prefix else entry.name
-            info = entry.stat(follow_symlinks=False)
-            node_count += 1
-            if node_count > max_nodes:
-                raise ValueError("workspace exceeds node limit")
-            if stat.S_ISLNK(info.st_mode):
-                if not allow_symlinks:
-                    raise ValueError("workspace symlink is not supported")
-            elif stat.S_ISDIR(info.st_mode):
-                pending.append((path, relative))
-            elif stat.S_ISREG(info.st_mode):
-                if require_single_link and info.st_nlink != 1:
-                    raise ValueError("workspace regular files must have a single link")
-                file_count += 1
-                if file_count > max_files:
-                    raise ValueError("workspace exceeds file limit")
-                if info.st_size > max_file_bytes:
-                    raise ValueError("workspace file byte limit exceeded")
-                total_bytes += info.st_size
-                if total_bytes > max_total_bytes:
-                    raise ValueError("workspace aggregate byte limit exceeded")
-            else:
-                raise ValueError("workspace contains unsupported filesystem node")
-            nodes.append(_Node(path, relative, info))
+            for entry in entries:
+                # ``scandir`` can itself be a slow or adversarial producer.  Check
+                # the shared deadline after every yielded entry and charge the node
+                # before retaining either its metadata or traversal path.  The
+                # context manager closes the iterator on every rejection path.
+                _check_deadline(deadline)
+                if exclude_git_metadata and not prefix and entry.name == ".git":
+                    continue
+                node_count += 1
+                if node_count > max_nodes:
+                    raise ValueError("workspace exceeds node limit")
+                path = directory / entry.name
+                relative = f"{prefix}/{entry.name}" if prefix else entry.name
+                info = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode):
+                    if not allow_symlinks:
+                        raise ValueError("workspace symlink is not supported")
+                elif stat.S_ISDIR(info.st_mode):
+                    pending.append((path, relative))
+                elif stat.S_ISREG(info.st_mode):
+                    if require_single_link and info.st_nlink != 1:
+                        raise ValueError("workspace regular files must have a single link")
+                    file_count += 1
+                    if file_count > max_files:
+                        raise ValueError("workspace exceeds file limit")
+                    if info.st_size > max_file_bytes:
+                        raise ValueError("workspace file byte limit exceeded")
+                    total_bytes += info.st_size
+                    if total_bytes > max_total_bytes:
+                        raise ValueError("workspace aggregate byte limit exceeded")
+                else:
+                    raise ValueError("workspace contains unsupported filesystem node")
+                nodes.append(_Node(path, relative, info))
     return sorted(nodes, key=lambda node: os.fsencode(node.relative))
 
 
