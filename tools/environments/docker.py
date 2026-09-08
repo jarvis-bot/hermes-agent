@@ -2628,6 +2628,55 @@ def _extra_args_override_network(extra_args: list[str]) -> bool:
     )
 
 
+def _validate_local_extra_args(extra_args: list[object] | None) -> list[str]:
+    """Reject unsafe raw Docker arguments without Docker or network access."""
+    validated: list[str] = []
+    for arg in (extra_args or []):
+        if not isinstance(arg, str):
+            logger.warning("Ignoring non-string docker_extra_args entry: %r", arg)
+            continue
+        validated.append(arg)
+    if _extra_args_have_host_security_file(validated):
+        raise ValueError(
+            "docker_extra_args host-backed security-opt files are unsupported "
+            "because their contents cannot be authenticated"
+        )
+    if any(arg == "--volumes-from" or arg.startswith("--volumes-from=") for arg in validated):
+        raise ValueError(
+            "docker_extra_args mounts /workspace or /tmp through an opaque donor with "
+            "--volumes-from; this cannot participate in container reuse isolation. "
+            "use docker_tmp_storage and explicit docker_volumes instead"
+        )
+    if _extra_args_mount_workspace(validated):
+        raise ValueError(
+            "docker_extra_args mounts /workspace or its subdirectories; this is not "
+            "allowed in raw arguments. use docker_volumes or "
+            "docker_mount_cwd_to_workspace so the mount participates in container reuse isolation"
+        )
+    if _extra_args_mount_tmp(validated):
+        raise ValueError(
+            "docker_extra_args cannot mount /tmp or its subdirectories; "
+            "use docker_tmp_storage to select the /tmp policy"
+        )
+    if _extra_args_have_host_bind(validated):
+        raise ValueError(
+            "docker_extra_args host bind sources are unsupported because raw mounts "
+            "cannot participate in policy authentication; use docker_volumes"
+        )
+    if _extra_args_override_network(validated):
+        raise ValueError(
+            "docker_extra_args cannot select a network mode; use terminal.docker_network "
+            "so network policy participates in reuse isolation"
+        )
+    collisions = _extra_args_reserved_label_collisions(validated)
+    if collisions:
+        raise ValueError(
+            "docker_extra_args cannot override reserved Hermes labels: "
+            + ", ".join(collisions)
+        )
+    return validated
+
+
 class DockerEnvironment(BaseEnvironment):
     """Hardened Docker container execution with resource limits and persistence.
 
@@ -2667,6 +2716,9 @@ class DockerEnvironment(BaseEnvironment):
         reviewer_mode: bool = False,
         expected_content_sha256: Optional[str] = None,
     ):
+        # Validate attacker-controlled syntax before availability/cgroup/image
+        # probes, any of which may inspect or pull the configured image.
+        validated_extra = _validate_local_extra_args(extra_args)
         if cwd == "~":
             cwd = "/root"
         if not isinstance(tmp_storage, str) or tmp_storage not in {"tmpfs", "disk"}:
@@ -2707,6 +2759,21 @@ class DockerEnvironment(BaseEnvironment):
                 raise ValueError(
                     "assigned reviewer workspaces cannot receive raw Docker arguments"
                 )
+        # Egress-proxy collisions are the only raw-argument checks that depend
+        # on derived local configuration. Resolve them before any Docker probe;
+        # a malformed policy must never cause an image pull as a side effect.
+        if not reviewer_mode:
+            _early_egress_env = _egress_proxy_args_for_docker()[1]
+            if _early_egress_env:
+                _early_collisions = _extra_args_egress_collisions(
+                    validated_extra, _critical_egress_env_names(_early_egress_env)
+                )
+                if _early_collisions and _egress_enforce_on_docker():
+                    raise RuntimeError(
+                        "docker_extra_args would override egress-proxy controls "
+                        f"{_early_collisions}; enforce_on_docker is enabled. Remove "
+                        "these args or disable enforce_on_docker to opt out of egress isolation."
+                    )
         self._container_id: Optional[str] = None
         self._labels: dict[str, str] = {}
         self._image: str = ""
@@ -3170,87 +3237,13 @@ class DockerEnvironment(BaseEnvironment):
                 # Fall back to the full cap set — without --user, an image's
                 # init may still need s6-setuidgid/gosu/su to drop privileges.
 
-        # Resolve the docker executable once so it works even when
-        # /usr/local/bin is not in PATH (common on macOS gateway/service).
-        self._docker_exe = find_docker() or "docker"
-        image_identity = _resolve_image_identity(self._docker_exe, image)
-        self._image_identity = image_identity
-
-        # s6-overlay images (e.g. hermes-agent:latest) already use /init as PID 1
-        # and exec /run/s6/basedir/bin/init during startup. For those images we
-        # must (a) skip Docker's --init (two competing PID-1 inits) and (b) mount
-        # /run with exec instead of noexec, or s6 stage0 dies with exit 126
-        # "Permission denied". Detected once here; defaults are kept on any
-        # inspection failure. See issue #34628.
-        image_uses_s6_init = _image_uses_init_entrypoint(
-            self._docker_exe, image_identity
-        )
-        if image_uses_s6_init:
-            logger.info(
-                "Docker: image %s uses /init (s6-overlay) as entrypoint — "
-                "skipping --init and mounting /run with exec.",
-                image,
-            )
-        security_args = _build_security_args(
-            run_as_host_user and bool(user_args),
-            run_exec=image_uses_s6_init,
-            tmp_storage=tmp_storage,
-        )
-        if reviewer_mode:
-            security_args.append("--read-only")
+        # Image resolution is intentionally deferred until every local raw-arg
+        # validation (including egress collisions below) has completed.
 
         logger.info(f"Docker volume_args: {volume_args}")
-        # User-supplied extra docker run flags (docker_extra_args in config.yaml).
-        # Appended last so they can override defaults if needed.
-        validated_extra = []
-        for arg in (extra_args or []):
-            if not isinstance(arg, str):
-                logger.warning("Ignoring non-string docker_extra_args entry: %r", arg)
-                continue
-            validated_extra.append(arg)
-        if _extra_args_have_host_security_file(validated_extra):
-            raise ValueError(
-                "docker_extra_args host-backed security-opt files are unsupported "
-                "because their contents cannot be authenticated"
-            )
-        if any(
-            arg == "--volumes-from" or arg.startswith("--volumes-from=")
-            for arg in validated_extra
-        ):
-            raise ValueError(
-                "docker_extra_args mounts /workspace or /tmp through an opaque "
-                "donor with --volumes-from; this cannot participate in container "
-                "reuse isolation. use docker_tmp_storage and explicit "
-                "docker_volumes instead"
-            )
-        if _extra_args_mount_workspace(validated_extra):
-            raise ValueError(
-                "docker_extra_args mounts /workspace or its subdirectories; "
-                "this is not allowed in raw arguments. "
-                "use docker_volumes or docker_mount_cwd_to_workspace so the mount "
-                "participates in container reuse isolation"
-            )
-        if _extra_args_mount_tmp(validated_extra):
-            raise ValueError(
-                "docker_extra_args cannot mount /tmp or its subdirectories; "
-                "use docker_tmp_storage to select the /tmp policy"
-            )
-        if _extra_args_have_host_bind(validated_extra):
-            raise ValueError(
-                "docker_extra_args host bind sources are unsupported because raw "
-                "mounts cannot participate in policy authentication; use docker_volumes"
-            )
-        if _extra_args_override_network(validated_extra):
-            raise ValueError(
-                "docker_extra_args cannot select a network mode; use "
-                "terminal.docker_network so network policy participates in reuse isolation"
-            )
-        reserved_label_collisions = _extra_args_reserved_label_collisions(validated_extra)
-        if reserved_label_collisions:
-            raise ValueError(
-                "docker_extra_args cannot override reserved Hermes labels: "
-                + ", ".join(reserved_label_collisions)
-            )
+        # Egress collisions depend on derived proxy names, but still run before
+        # image identity resolution below. All other raw-arg validation ran at
+        # function entry.
         if egress_env_overrides:
             _extra_collisions = _extra_args_egress_collisions(
                 validated_extra, _critical_egress_names,
@@ -3269,6 +3262,27 @@ class DockerEnvironment(BaseEnvironment):
                 logger.warning(
                     "%s  Extra Docker args may bypass egress isolation.", _msg,
                 )
+
+        # All local/syntactic/security validation is complete. Only now may an
+        # image probe resolve a mutable tag or pull missing bytes.
+        self._docker_exe = find_docker() or "docker"
+        image_identity = _resolve_image_identity(self._docker_exe, image)
+        self._image_identity = image_identity
+        image_uses_s6_init = _image_uses_init_entrypoint(
+            self._docker_exe, image_identity
+        )
+        if image_uses_s6_init:
+            logger.info(
+                "Docker: image %s uses /init (s6-overlay) as entrypoint — skipping "
+                "--init and mounting /run with exec.", image,
+            )
+        security_args = _build_security_args(
+            run_as_host_user and bool(user_args),
+            run_exec=image_uses_s6_init,
+            tmp_storage=tmp_storage,
+        )
+        if reviewer_mode:
+            security_args.append("--read-only")
 
         bind_source_identities = _volume_source_identities(
             volume_args,

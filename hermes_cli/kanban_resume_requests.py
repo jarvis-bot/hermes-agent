@@ -84,6 +84,20 @@ class AcceptedDispatchBinding:
     capability_identity: tuple[object, ...]
 
 
+@dataclass(frozen=True)
+class ResumeLaunchIntent:
+    intent_id: str
+    request_id: str
+    task_id: str
+    generation: int
+    run_id: int
+    claim_lock: str
+    expires_at: int
+
+
+LAUNCH_HANDSHAKE_GRACE_SECONDS = 60
+
+
 def _capability_identity(capability: object) -> tuple[object, ...]:
     """Freeze every prepared runtime/capability field consumed at spawn."""
     return tuple(
@@ -101,6 +115,13 @@ def _capability_identity(capability: object) -> tuple[object, ...]:
             "reviewer_isolated",
         )
     )
+
+
+def _current_workspace_capability(profile: str, workspace: str):
+    """Re-probe the worker runtime at the pre-exec authorization boundary."""
+    from hermes_cli.kanban_workspace_preflight import preflight_workspace_for_profile
+
+    return preflight_workspace_for_profile(profile, workspace)
 
 
 def _canonical_spec(spec: ResumeRequestSpec) -> bytes:
@@ -956,17 +977,16 @@ def finalize_resume_dispatch_spawned(
     binding: AcceptedDispatchBinding,
     task: object,
     workspace_capability: Any,
-    spawn: Callable[[], Optional[int]],
+    spawn: Callable[[ResumeLaunchIntent], Optional[int]],
 ) -> tuple[bool, Optional[int]]:
-    """Atomically fence the final control-plane snapshot through process launch.
+    """Commit a fenced launch intent, spawn lock-free, then reconcile.
 
-    The expensive candidate digest is computed by
-    :func:`validate_claimed_resume_dispatch` before this transaction.  This final
-    short write transaction re-reads every mutable database fence, records the
-    durable launch intent, and holds SQLite's writer lock until ``spawn`` returns.
-    Consequently no database provenance writer can fit between the final CAS and
-    process creation; ``_default_spawn`` receives the already-bound immutable task
-    and capability identities.
+    SQLite and process creation cannot be atomic.  The durable intent therefore
+    owns one launch generation before process creation.  Production children
+    receive that identity and must handshake against the current request, task,
+    event, policy, capability, path, branch, SHA, fingerprint, claim, and run
+    before task work.  A prepared/spawned generation is not retried until its
+    lease expires or its process is proven dead.
     """
     task_id = str(getattr(task, "id"))
     claim_lock = getattr(task, "claim_lock")
@@ -1094,16 +1114,318 @@ def finalize_resume_dispatch_spawned(
                 )
             return False, None
 
+        generation = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(generation), 0) + 1 FROM kanban_resume_launch_intents "
+                "WHERE request_id=?", (binding.request_id,),
+            ).fetchone()[0]
+        )
+        binding_payload = json.dumps(
+            {
+                "request_id": binding.request_id,
+                "task_id": task_id,
+                "accepted_event_version": binding.accepted_event_version,
+                "accepted_event_payload": binding.accepted_event_payload,
+                "workspace_path": binding.workspace_path,
+                "workspace_kind": binding.workspace_kind,
+                "branch": binding.branch,
+                "sha": binding.sha,
+                "candidate_fingerprint": binding.candidate_fingerprint,
+                "capability_identity": list(binding.capability_identity),
+                "assignee": getattr(task, "assignee"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        intent_id = "rli_" + hashlib.sha256(
+            f"{binding.request_id}\0{generation}\0{run_id}\0{claim_lock}\0".encode()
+            + binding_payload.encode()
+        ).hexdigest()[:32]
+        expires_at = max(
+            now + LAUNCH_HANDSHAKE_GRACE_SECONDS,
+            int(getattr(task, "claim_expires") or now),
+        )
+        conn.execute(
+            "INSERT INTO kanban_resume_launch_intents "
+            "(intent_id, request_id, task_id, generation, run_id, claim_lock, "
+            "accepted_event_version, binding_json, state, launcher_pid, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?)",
+            (
+                intent_id, binding.request_id, task_id, generation, int(run_id),
+                str(claim_lock), binding.accepted_event_version, binding_payload,
+                os.getpid(), now, expires_at,
+            ),
+        )
         updated = conn.execute(
-            "UPDATE kanban_resume_requests SET result_code='dispatched', "
-            "detail='accepted candidate bound to dispatcher spawn attempt' "
-            "WHERE request_id=? AND task_id=? AND state='accepted' "
+            "UPDATE kanban_resume_requests SET result_code='launch_intent', "
+            "detail=? WHERE request_id=? AND task_id=? AND state='accepted' "
             "AND result_code='accepted'",
-            (binding.request_id, task_id),
+            (f"durable launch intent {intent_id} generation {generation}", binding.request_id, task_id),
         )
         if updated.rowcount != 1:
-            raise RuntimeError("accepted resume request changed before spawn finalization")
-        return True, spawn()
+            raise RuntimeError("accepted resume request changed before launch intent commit")
+        intent = ResumeLaunchIntent(
+            intent_id, binding.request_id, task_id, generation, int(run_id),
+            str(claim_lock), expires_at,
+        )
+
+    # Deliberately outside every SQLite transaction.  The child-side handshake
+    # makes provenance drift after this commit fail closed before task work.
+    try:
+        pid = spawn(intent)
+    except BaseException:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_resume_launch_intents SET state='failed', finished_at=?, "
+                "detail='process creation raised before receipt' "
+                "WHERE intent_id=? AND generation=? AND state='prepared'",
+                (int(time.time()), intent.intent_id, intent.generation),
+            )
+        raise
+
+    with kb.write_txn(conn):
+        reconciled = conn.execute(
+            "UPDATE kanban_resume_launch_intents SET state=CASE WHEN state='handshaken' "
+            "THEN state ELSE 'spawned' END, worker_pid=COALESCE(worker_pid, ?), spawned_at=? "
+            "WHERE intent_id=? AND generation=? AND state IN ('prepared','handshaken')",
+            (pid, int(time.time()), intent.intent_id, intent.generation),
+        )
+        if reconciled.rowcount != 1:
+            raise RuntimeError("launch intent changed before spawn receipt reconciliation")
+        conn.execute(
+            "UPDATE kanban_resume_requests SET result_code='dispatched', detail=? "
+            "WHERE request_id=? AND state='accepted' AND result_code='launch_intent'",
+            (f"spawn reconciled for {intent.intent_id}", binding.request_id),
+        )
+    return True, pid
+
+
+def handshake_resume_launch_intent(
+    db_path: Path,
+    *,
+    intent_id: str,
+    generation: int,
+    task_id: str,
+    run_id: int,
+    claim_lock: str,
+    worker_pid: Optional[int] = None,
+) -> bool:
+    """Authorize a spawned worker before it executes any task-side effects."""
+    worker_pid = int(worker_pid or os.getpid())
+    with contextlib.closing(kb.connect(Path(db_path))) as conn:
+        row = conn.execute(
+            "SELECT * FROM kanban_resume_launch_intents WHERE intent_id=? AND generation=?",
+            (intent_id, generation),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            payload = json.loads(row["binding_json"])
+            observed_fingerprint = candidate_fingerprint(
+                Path(payload["workspace_path"]), payload["sha"]
+            )
+            observed_capability = _current_workspace_capability(
+                str(payload["assignee"]), str(payload["workspace_path"])
+            )
+        except Exception:
+            observed_fingerprint = None
+            observed_capability = None
+
+        now = int(time.time())
+        with kb.write_txn(conn):
+            intent = conn.execute(
+                "SELECT * FROM kanban_resume_launch_intents WHERE intent_id=? AND generation=?",
+                (intent_id, generation),
+            ).fetchone()
+            task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            request = conn.execute(
+                "SELECT * FROM kanban_resume_requests WHERE request_id=?",
+                (row["request_id"],),
+            ).fetchone()
+            run = conn.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
+            accepted = conn.execute(
+                "SELECT kind, payload FROM task_events WHERE id=? AND task_id=?",
+                (row["accepted_event_version"], task_id),
+            ).fetchone()
+            latest = conn.execute(
+                "SELECT id, run_id, kind, payload FROM task_events WHERE task_id=? "
+                "ORDER BY id DESC LIMIT 1", (task_id,),
+            ).fetchone()
+            current_generation = conn.execute(
+                "SELECT MAX(generation) FROM kanban_resume_launch_intents "
+                "WHERE request_id=?",
+                (row["request_id"],),
+            ).fetchone()[0]
+            try:
+                latest_payload = json.loads(latest["payload"] or "{}") if latest else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                latest_payload = {}
+            cap = payload.get("capability_identity") or []
+            valid = bool(
+                intent is not None
+                and int(intent["generation"]) == int(current_generation or -1)
+                and intent["state"] in {"prepared", "spawned", "handshaken"}
+                and int(intent["expires_at"]) >= now
+                and intent["task_id"] == task_id
+                and int(intent["run_id"]) == run_id
+                and intent["claim_lock"] == claim_lock
+                and payload.get("request_id") == intent["request_id"]
+                and payload.get("task_id") == task_id
+                and task is not None
+                and task["status"] == "running"
+                and task["claim_lock"] == claim_lock
+                and int(task["current_run_id"] or -1) == run_id
+                and task["assignee"] == payload.get("assignee")
+                and task["workspace_path"] == payload.get("workspace_path")
+                and task["workspace_kind"] == payload.get("workspace_kind")
+                and task["branch_name"] == payload.get("branch")
+                and task["expected_workspace_sha"] == payload.get("sha")
+                and request is not None
+                and request["state"] == "accepted"
+                and request["result_code"] in {"launch_intent", "dispatched"}
+                and run is not None
+                and run["task_id"] == task_id
+                and run["status"] == "running"
+                and run["claim_lock"] == claim_lock
+                and run["ended_at"] is None
+                and accepted is not None
+                and accepted["kind"] == "resume_request_accepted"
+                and str(accepted["payload"] or "") == payload.get("accepted_event_payload")
+                and latest is not None
+                and latest["kind"] in {"claimed", "spawned"}
+                and int(latest["run_id"] or -1) == run_id
+                and (
+                    latest["kind"] == "claimed"
+                    or int(latest_payload.get("pid", -1)) == worker_pid
+                )
+                and int(latest["id"]) > int(row["accepted_event_version"])
+                and observed_fingerprint == payload.get("candidate_fingerprint")
+                and observed_capability is not None
+                and _capability_identity(observed_capability) == tuple(cap)
+            )
+            if valid:
+                binding = AcceptedDispatchBinding(
+                    task_id=task_id,
+                    request_id=str(intent["request_id"]),
+                    accepted_event_version=int(row["accepted_event_version"]),
+                    accepted_event_payload=str(payload["accepted_event_payload"]),
+                    workspace_path=str(payload["workspace_path"]),
+                    workspace_kind=str(payload["workspace_kind"]),
+                    branch=str(payload["branch"]),
+                    sha=str(payload["sha"]),
+                    candidate_fingerprint=str(payload["candidate_fingerprint"]),
+                    capability_identity=tuple(cap),
+                )
+                valid = _request_row_matches_binding(request, binding)
+            if not valid:
+                conn.execute(
+                    "UPDATE kanban_resume_launch_intents SET state='rejected', finished_at=?, "
+                    "detail='worker startup handshake rejected stale provenance' "
+                    "WHERE intent_id=? AND generation=? AND state IN ('prepared','spawned')",
+                    (now, intent_id, generation),
+                )
+                return False
+            changed = conn.execute(
+                "UPDATE kanban_resume_launch_intents SET state='handshaken', worker_pid=?, "
+                "handshaken_at=? WHERE intent_id=? AND generation=? "
+                "AND state IN ('prepared','spawned','handshaken') "
+                "AND (worker_pid IS NULL OR worker_pid=?)",
+                (worker_pid, now, intent_id, generation, worker_pid),
+            )
+            if changed.rowcount != 1:
+                return False
+            conn.execute(
+                "UPDATE tasks SET worker_pid=? WHERE id=? AND status='running' "
+                "AND claim_lock=? AND current_run_id=?",
+                (worker_pid, task_id, claim_lock, run_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET worker_pid=? WHERE id=? AND task_id=? "
+                "AND status='running' AND claim_lock=? AND ended_at IS NULL",
+                (worker_pid, run_id, task_id, claim_lock),
+            )
+            return True
+
+
+def reconcile_resume_launch_intents(conn: sqlite3.Connection) -> int:
+    """Re-arm expired, unhandshaken intents after a coordinator restart.
+
+    A live recorded worker wins and is left alone.  Unknown children get the
+    full durable lease/grace window to handshake; only expiry permits replay.
+    """
+    now = int(time.time())
+    rows = conn.execute(
+        "SELECT * FROM kanban_resume_launch_intents WHERE state IN ('prepared','spawned') "
+        "AND expires_at <= ?", (now,),
+    ).fetchall()
+    recovered = 0
+    for row in rows:
+        pid = row["worker_pid"]
+        if pid and kb._pid_alive(int(pid)):
+            # A spawned process whose handshake/receipt race crossed the lease
+            # boundary remains the sole launch owner. Extend the exact claim
+            # generation before generic stale-claim reaping runs; task retry
+            # is allowed only after this PID is proven dead.
+            renewed_until = now + LAUNCH_HANDSHAKE_GRACE_SECONDS
+            with kb.write_txn(conn):
+                renewed = conn.execute(
+                    "UPDATE kanban_resume_launch_intents SET expires_at=?, "
+                    "detail='live launch owner renewed pending handshake' "
+                    "WHERE intent_id=? AND generation=? AND state='spawned' "
+                    "AND worker_pid=? AND expires_at <= ?",
+                    (renewed_until, row["intent_id"], row["generation"], pid, now),
+                )
+                if renewed.rowcount == 1:
+                    conn.execute(
+                        "UPDATE tasks SET claim_expires=? WHERE id=? AND status='running' "
+                        "AND claim_lock=? AND current_run_id=? AND worker_pid=?",
+                        (renewed_until, row["task_id"], row["claim_lock"], row["run_id"], pid),
+                    )
+                    conn.execute(
+                        "UPDATE task_runs SET claim_expires=? WHERE id=? AND task_id=? "
+                        "AND status='running' AND claim_lock=? AND worker_pid=? "
+                        "AND ended_at IS NULL",
+                        (renewed_until, row["run_id"], row["task_id"], row["claim_lock"], pid),
+                    )
+            continue
+        with kb.write_txn(conn):
+            changed = conn.execute(
+                "UPDATE kanban_resume_launch_intents SET state='expired', finished_at=?, "
+                "detail='launch lease expired without a live handshaken worker' "
+                "WHERE intent_id=? AND generation=? AND state IN ('prepared','spawned') "
+                "AND expires_at <= ?",
+                (now, row["intent_id"], row["generation"], now),
+            )
+            if changed.rowcount != 1:
+                continue
+            task_changed = conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
+                "worker_pid=NULL, current_run_id=NULL WHERE id=? AND status='running' "
+                "AND claim_lock=? AND current_run_id=?",
+                (row["task_id"], row["claim_lock"], row["run_id"]),
+            )
+            conn.execute(
+                "UPDATE task_runs SET status='reclaimed', outcome='reclaimed', ended_at=?, "
+                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                "summary=COALESCE(summary, 'launch intent expired before handshake') "
+                "WHERE id=? AND task_id=? AND claim_lock=? AND ended_at IS NULL",
+                (now, row["run_id"], row["task_id"], row["claim_lock"]),
+            )
+            if task_changed.rowcount == 1:
+                conn.execute(
+                    "UPDATE kanban_resume_requests SET result_code='accepted', "
+                    "detail='expired launch intent; candidate must be revalidated' "
+                    "WHERE request_id=? AND state='accepted' "
+                    "AND result_code IN ('launch_intent','dispatched')",
+                    (row["request_id"],),
+                )
+                kb._append_event(
+                    conn, row["task_id"], "resume_request_accepted",
+                    {"request_id": row["request_id"], "action": SUPPORTED_ACTION,
+                     "retry_after_launch_expiry": True},
+                )
+                recovered += 1
+    return recovered
 
 
 def rearm_resume_dispatch_after_spawn_failure(

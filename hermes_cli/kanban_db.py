@@ -1405,6 +1405,33 @@ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_resume_requests_state ON kanban_resume_requests(state, created_at);
+
+-- Durable external-process launch ownership.  The immutable binding payload is
+-- committed before Popen; the child must CAS this row during its startup
+-- handshake before it may execute task code.
+CREATE TABLE IF NOT EXISTS kanban_resume_launch_intents (
+    intent_id       TEXT PRIMARY KEY,
+    request_id      TEXT NOT NULL,
+    task_id         TEXT NOT NULL,
+    generation      INTEGER NOT NULL,
+    run_id          INTEGER NOT NULL,
+    claim_lock      TEXT NOT NULL,
+    accepted_event_version INTEGER NOT NULL,
+    binding_json    TEXT NOT NULL,
+    state           TEXT NOT NULL DEFAULT 'prepared',
+    launcher_pid    INTEGER NOT NULL,
+    worker_pid      INTEGER,
+    created_at      INTEGER NOT NULL,
+    expires_at      INTEGER NOT NULL,
+    spawned_at      INTEGER,
+    handshaken_at   INTEGER,
+    finished_at     INTEGER,
+    detail          TEXT,
+    UNIQUE(request_id, generation),
+    CHECK (state IN ('prepared', 'spawned', 'handshaken', 'failed', 'rejected', 'expired'))
+);
+CREATE INDEX IF NOT EXISTS idx_resume_launch_active
+    ON kanban_resume_launch_intents(task_id, state, expires_at);
 """
 
 
@@ -9521,7 +9548,12 @@ def dispatch_once(
 
     snapshots: dict[tuple[str, str], Task] = {}
     if not dry_run:
+        # Reconcile DB/process-gap rows before candidate materialization so an
+        # expired orphan can be revalidated and relaunched in this same tick.
+        from hermes_cli.kanban_resume_requests import reconcile_resume_launch_intents
+
         if db_path is None:
+            reconcile_resume_launch_intents(conn)
             snapshots = _materialize_dispatch_workspace_candidates(
                 conn,
                 board=board,
@@ -9536,6 +9568,7 @@ def dispatch_once(
             with _dispatch_tick_lock(db_path) as held:
                 if not held:
                     return DispatchResult(skipped_locked=True)
+                reconcile_resume_launch_intents(conn)
                 snapshots = _materialize_dispatch_workspace_candidates(
                     conn,
                     board=board,
@@ -9631,6 +9664,12 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    # Recover the DB/process gap before generic claim reaping.  This preserves
+    # the accepted provenance binding and only permits a new generation after
+    # the old launch lease has expired without a live worker.
+    from hermes_cli.kanban_resume_requests import reconcile_resume_launch_intents
+
+    reconcile_resume_launch_intents(conn)
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
@@ -10148,7 +10187,7 @@ def _dispatch_once_locked(
             # Introspect the callable and pass optional invariants when supported.
             import inspect
 
-            def invoke_spawn() -> Optional[int]:
+            def invoke_spawn(launch_intent=None) -> Optional[int]:
                 try:
                     sig = inspect.signature(_spawn)
                 except (TypeError, ValueError):
@@ -10158,6 +10197,8 @@ def _dispatch_once_locked(
                     spawn_kwargs["board"] = board
                 if "workspace_capability" in sig.parameters:
                     spawn_kwargs["workspace_capability"] = effective_capability
+                if "launch_intent" in sig.parameters:
+                    spawn_kwargs["launch_intent"] = launch_intent
                 return _spawn(claimed, str(workspace), **spawn_kwargs)
 
             if resume_binding is not True:
@@ -10658,6 +10699,7 @@ def _default_spawn(
     *,
     board: Optional[str] = None,
     workspace_capability=None,
+    launch_intent=None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -10777,6 +10819,9 @@ def _default_spawn(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    if launch_intent is not None:
+        env["HERMES_KANBAN_LAUNCH_INTENT_ID"] = launch_intent.intent_id
+        env["HERMES_KANBAN_LAUNCH_GENERATION"] = str(launch_intent.generation)
     # Goal-loop mode: the worker reads these and wraps its run in the
     # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
     # when enabled so non-goal tasks keep a clean env.
@@ -10874,6 +10919,12 @@ def _default_spawn(
         # turn, prints text, exits rc=0, and the dispatcher records a
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
+    if launch_intent is not None:
+        # The tiny launcher performs the durable DB handshake before importing
+        # or executing the task agent.  exec keeps the same PID recorded by
+        # Popen and by the intent row.
+        launcher = str(Path(__file__).resolve().with_name("kanban_worker_launcher.py"))
+        cmd = [sys.executable, launcher, "--", *cmd]
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and

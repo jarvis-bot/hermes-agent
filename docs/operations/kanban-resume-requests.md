@@ -69,10 +69,21 @@ version must still match. The trusted policy's branch and SHA are persisted atom
 without changing workspace bytes. New dir tasks may carry a branch only when they also
 carry an authenticated expected SHA.
 
-This is not an exactly-once external-process guarantee. A confirmed live claim prevents
-concurrent launch; a failed pre-exec launch closes its run and can retry; a process that
-may have launched is retried only after the existing liveness/lease reconciliation proves
-it dead or expired. Workers receive the durable run and claim identities.
+This is not an exactly-once database/process transaction: SQLite and `Popen` cannot
+commit atomically. Before process creation, the gateway commits one durable launch-intent
+generation bound to the exact request, policy, acceptance event, task path/kind/branch/SHA,
+candidate fingerprint, prepared capability, claim, and run. Process creation then runs
+outside every SQLite write transaction. The child receives the intent/generation/run/claim
+identity and enters a minimal pre-exec launcher; that launcher revalidates the durable
+intent and current provenance and handshakes its PID before loading the task agent. A
+failed or stale handshake exits without task side effects.
+
+The resulting contract is at most one live task-working child for a valid
+lease/generation. An unhandshaken intent is not replayed while its lease/grace window is
+valid. Restart reconciliation permits at-least-once retry only after the recorded worker
+is proven dead or the intent expires; a late child from an older generation then fails
+its claim/run handshake. A child that handshakes after `Popen` but before gateway receipt
+persistence owns the generation, so coordinator restart cannot duplicate it.
 
 `kanban list --read-only` and observer inspection skip initialization, migrations, and
 readiness recomputation. WAL tests keep a writer and WAL/SHM open, prove committed-WAL

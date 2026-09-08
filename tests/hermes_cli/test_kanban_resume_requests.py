@@ -14,6 +14,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_resume_requests as rr
+from hermes_cli import kanban_worker_launcher as worker_launcher
 from hermes_cli.kanban_workspace_preflight import WorkspaceCapability
 
 
@@ -223,7 +224,74 @@ def _consume_exit_before_commit(db_path: str, policy, reached, proceed):
     )
 
 
-def _consumer_dispatcher(db_path: str, policy, barrier, launch_log: str):
+def _dispatch_crash_after_handshake(
+    db_path: str, expected_fingerprint: str, worker_pid_file: str
+):
+    os.environ.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+    import hermes_cli.profiles as profiles
+
+    profiles.profile_exists = lambda _profile: True
+    conn = kb.connect(Path(db_path))
+
+    def capable(profile, candidate):
+        candidate = Path(candidate)
+        info = candidate.stat()
+        return WorkspaceCapability(
+            True, profile, str(candidate), "", device=info.st_dev, inode=info.st_ino,
+            content_sha256=expected_fingerprint.removeprefix("sha256:"),
+        )
+
+    rr._current_workspace_capability = capable
+
+    def spawn_then_crash(_task, _workspace, *, launch_intent):
+        release_file = worker_pid_file + ".release"
+        worker = subprocess.Popen(
+            ["/bin/sh", "-c", 'while [ ! -f "$1" ]; do sleep 0.1; done', "sh", release_file],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        if not rr.handshake_resume_launch_intent(
+            Path(db_path),
+            intent_id=launch_intent.intent_id,
+            generation=launch_intent.generation,
+            task_id=launch_intent.task_id,
+            run_id=launch_intent.run_id,
+            claim_lock=launch_intent.claim_lock,
+            worker_pid=worker.pid,
+        ):
+            worker.terminate()
+            os._exit(24)
+        Path(worker_pid_file).write_text(str(worker.pid), encoding="ascii")
+        os._exit(23)
+
+    kb.dispatch_once(conn, spawn_fn=spawn_then_crash, workspace_capability_fn=capable)
+
+
+def _dispatch_crash_after_intent(db_path: str, expected_fingerprint: str):
+    os.environ.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+    import hermes_cli.profiles as profiles
+
+    profiles.profile_exists = lambda _profile: True
+    conn = kb.connect(Path(db_path))
+
+    def capable(profile, candidate):
+        info = candidate.stat()
+        return WorkspaceCapability(
+            True, profile, str(candidate), "", device=info.st_dev, inode=info.st_ino,
+            content_sha256=expected_fingerprint.removeprefix("sha256:"),
+        )
+
+    def crash(*_args, **_kwargs):
+        os._exit(23)
+
+    kb.dispatch_once(conn, spawn_fn=crash, workspace_capability_fn=capable)
+
+
+def _consumer_dispatcher(
+    db_path: str, policy, start, launch_log: str, entered=None, release=None
+):
     os.environ.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
     import hermes_cli.profiles as profiles
 
@@ -244,9 +312,13 @@ def _consumer_dispatcher(db_path: str, policy, barrier, launch_log: str):
             )
         finally:
             os.close(fd)
+        if entered is not None:
+            entered.set()
+        if release is not None:
+            assert release.wait(20)
         return os.getpid()
 
-    barrier.wait()
+    assert start.wait(20)
     rr.consume_resume_requests(
         conn, board="default", gateway_profile="default", policies=[policy]
     )
@@ -331,20 +403,28 @@ def test_two_consumer_dispatchers_emit_one_real_launch_intent(tmp_path, monkeypa
     conn.close()
     launch_log = tmp_path / "launch.log"
     ctx = multiprocessing.get_context("fork")
-    barrier = ctx.Barrier(3)
-    workers = [
-        ctx.Process(
-            target=_consumer_dispatcher,
-            args=(str(kb.kanban_db_path()), _policy(spec), barrier, str(launch_log)),
-        )
-        for _ in range(2)
-    ]
-    for worker in workers:
-        worker.start()
-    barrier.wait()
-    for worker in workers:
-        worker.join(30)
-        assert worker.exitcode == 0
+    first_start = ctx.Event()
+    second_start = ctx.Event()
+    entered = ctx.Event()
+    release = ctx.Event()
+    first = ctx.Process(
+        target=_consumer_dispatcher,
+        args=(str(kb.kanban_db_path()), _policy(spec), first_start, str(launch_log), entered, release),
+    )
+    second = ctx.Process(
+        target=_consumer_dispatcher,
+        args=(str(kb.kanban_db_path()), _policy(spec), second_start, str(launch_log)),
+    )
+    first.start()
+    first_start.set()
+    assert entered.wait(20)  # first owns the durable intent and is paused outside SQLite
+    second.start()
+    second_start.set()
+    second.join(20)
+    assert second.exitcode == 0
+    release.set()
+    first.join(20)
+    assert first.exitcode == 0
     intents = launch_log.read_text(encoding="utf-8").splitlines()
     assert len(intents) == 1
     with kb.connect() as check:
@@ -359,6 +439,10 @@ def test_two_consumer_dispatchers_emit_one_real_launch_intent(tmp_path, monkeypa
             ).fetchone()[0]
             == 1
         )
+        assert check.execute(
+            "SELECT COUNT(*) FROM kanban_resume_launch_intents WHERE task_id=?",
+            (task_id,),
+        ).fetchone()[0] == 1
 
 
 def test_claim_before_launch_failure_is_fenced_then_retryable(tmp_path, monkeypatch):
@@ -412,6 +496,470 @@ def test_claim_before_launch_failure_is_fenced_then_retryable(tmp_path, monkeypa
     assert len(launched) == 1
     assert kb.get_task(conn, task_id).status == "running"
     conn.close()
+
+
+def test_spawn_callback_runs_without_sqlite_writer_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
+    other_id = kb.create_task(conn, title="unrelated comment", initial_status="blocked")
+    heartbeat_id = kb.create_task(
+        conn, title="unrelated heartbeat", assignee="reviewer", initial_status="blocked"
+    )
+    conn.execute(
+        "UPDATE tasks SET status='ready', block_kind=NULL WHERE id=?", (heartbeat_id,)
+    )
+    heartbeat_task = kb.claim_task(conn, heartbeat_id)
+    assert heartbeat_task is not None
+    claim_id = kb.create_task(
+        conn, title="unrelated claim", assignee="reviewer", initial_status="blocked"
+    )
+    spec = _request(snap, repo, sha, task_id)
+    rr._append_verified_request(conn, spec)
+    rr.consume_resume_requests(
+        conn, board="default", gateway_profile="default", policies=[_policy(spec)]
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def paused_spawn(*_args, **_kwargs):
+        entered.set()
+        assert release.wait(5)
+        return 4242
+
+    def capable(profile, candidate):
+        info = candidate.stat()
+        return WorkspaceCapability(
+            True, profile, str(candidate), "", device=info.st_dev, inode=info.st_ino,
+            content_sha256=spec.expected_candidate_fingerprint.removeprefix("sha256:"),
+        )
+
+    def run_dispatch():
+        with kb.connect() as dispatch_conn:
+            kb.dispatch_once(
+                dispatch_conn,
+                spawn_fn=paused_spawn,
+                workspace_capability_fn=capable,
+            )
+
+    dispatch = threading.Thread(target=run_dispatch)
+    dispatch.start()
+    assert entered.wait(5)
+    callback_entered_at = time.monotonic()
+    started = time.monotonic()
+    with kb.connect() as writer:
+        kb.add_comment(writer, other_id, "test", "must not wait for spawn")
+        assert kb.heartbeat_claim(
+            writer, heartbeat_id, claimer=heartbeat_task.claim_lock
+        )
+        writer.execute(
+            "UPDATE tasks SET status='ready', block_kind=NULL WHERE id=?", (claim_id,)
+        )
+        assert kb.claim_task(writer, claim_id) is not None
+    elapsed = time.monotonic() - started
+    # Keep the callback paused for a deterministic two-second window while
+    # proving all three unrelated writer paths completed promptly.
+    time.sleep(max(0.0, 2.0 - (time.monotonic() - callback_entered_at)))
+    release.set()
+    dispatch.join(10)
+    assert not dispatch.is_alive()
+    assert elapsed < 0.5
+
+
+def test_spawn_callback_can_reenter_database_write(tmp_path, monkeypatch):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
+    other_id = kb.create_task(conn, title="unrelated", initial_status="blocked")
+    spec = _request(snap, repo, sha, task_id)
+    rr._append_verified_request(conn, spec)
+    rr.consume_resume_requests(
+        conn, board="default", gateway_profile="default", policies=[_policy(spec)]
+    )
+
+    def capable(profile, candidate):
+        info = candidate.stat()
+        return WorkspaceCapability(
+            True, profile, str(candidate), "", device=info.st_dev, inode=info.st_ino,
+            content_sha256=spec.expected_candidate_fingerprint.removeprefix("sha256:"),
+        )
+
+    def reentrant_spawn(*_args, **_kwargs):
+        kb.add_comment(conn, other_id, "spawn", "reentrant write")
+        return 4242
+
+    result = kb.dispatch_once(
+        conn, spawn_fn=reentrant_spawn, workspace_capability_fn=capable
+    )
+    assert [item[0] for item in result.spawned] == [task_id]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_comments WHERE task_id=?", (other_id,)
+    ).fetchone()[0] == 1
+
+
+def test_provenance_change_after_intent_commit_rejects_worker_handshake(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
+    spec = _request(snap, repo, sha, task_id)
+    rr._append_verified_request(conn, spec)
+    rr.consume_resume_requests(
+        conn, board="default", gateway_profile="default", policies=[_policy(spec)]
+    )
+
+    def capable(profile, candidate):
+        info = candidate.stat()
+        return WorkspaceCapability(
+            True, profile, str(candidate), "", device=info.st_dev, inode=info.st_ino,
+            content_sha256=spec.expected_candidate_fingerprint.removeprefix("sha256:"),
+        )
+
+    monkeypatch.setattr(
+        rr,
+        "_current_workspace_capability",
+        lambda profile, workspace: capable(profile, Path(workspace)),
+    )
+    task_work = []
+
+    def launch(_task, _workspace, *, launch_intent):
+        with kb.connect() as attacker:
+            attacker.execute(
+                "UPDATE tasks SET expected_workspace_sha=? WHERE id=?",
+                ("b" * 40, task_id),
+            )
+        if rr.handshake_resume_launch_intent(
+            kb.kanban_db_path(),
+            intent_id=launch_intent.intent_id,
+            generation=launch_intent.generation,
+            task_id=launch_intent.task_id,
+            run_id=launch_intent.run_id,
+            claim_lock=launch_intent.claim_lock,
+            worker_pid=4242,
+        ):
+            task_work.append("ran")
+        return 4242
+
+    result = kb.dispatch_once(conn, spawn_fn=launch, workspace_capability_fn=capable)
+    assert result.spawned == []
+    assert task_work == []
+    intent = conn.execute(
+        "SELECT state FROM kanban_resume_launch_intents WHERE task_id=?", (task_id,)
+    ).fetchone()
+    assert intent["state"] == "rejected"
+
+
+def test_handshaken_worker_survives_coordinator_receipt_gap_without_duplicate(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
+    spec = _request(snap, repo, sha, task_id)
+    rr._append_verified_request(conn, spec)
+    rr.consume_resume_requests(
+        conn, board="default", gateway_profile="default", policies=[_policy(spec)]
+    )
+
+    def capable(profile, candidate):
+        info = candidate.stat()
+        return WorkspaceCapability(
+            True, profile, str(candidate), "", device=info.st_dev, inode=info.st_ino,
+            content_sha256=spec.expected_candidate_fingerprint.removeprefix("sha256:"),
+        )
+
+    monkeypatch.setattr(
+        rr,
+        "_current_workspace_capability",
+        lambda profile, workspace: capable(profile, Path(workspace)),
+    )
+    launches = []
+
+    def launch(_task, _workspace, *, launch_intent):
+        launches.append(launch_intent.intent_id)
+        assert rr.handshake_resume_launch_intent(
+            kb.kanban_db_path(),
+            intent_id=launch_intent.intent_id,
+            generation=launch_intent.generation,
+            task_id=launch_intent.task_id,
+            run_id=launch_intent.run_id,
+            claim_lock=launch_intent.claim_lock,
+            worker_pid=os.getpid(),
+        )
+        return os.getpid()
+
+    first = kb.dispatch_once(conn, spawn_fn=launch, workspace_capability_fn=capable)
+    assert [item[0] for item in first.spawned] == [task_id]
+    assert len(launches) == 1
+    state = conn.execute(
+        "SELECT state, worker_pid FROM kanban_resume_launch_intents WHERE task_id=?",
+        (task_id,),
+    ).fetchone()
+    assert tuple(state) == ("handshaken", os.getpid())
+
+    # Model a Popen receipt persisted just before coordinator death while the
+    # child is live but has not yet completed its handshake. Reconciliation
+    # must renew this exact owner/claim instead of letting generic lease reaping
+    # create a duplicate generation.
+    conn.execute(
+        "UPDATE kanban_resume_launch_intents SET state='spawned', expires_at=0 "
+        "WHERE task_id=?", (task_id,),
+    )
+    conn.execute("UPDATE tasks SET claim_expires=0 WHERE id=?", (task_id,))
+    conn.execute("UPDATE task_runs SET claim_expires=0 WHERE task_id=?", (task_id,))
+    assert rr.reconcile_resume_launch_intents(conn) == 0
+    assert len(launches) == 1
+    renewed = conn.execute(
+        "SELECT i.state, i.expires_at, t.status, t.claim_expires "
+        "FROM kanban_resume_launch_intents i JOIN tasks t ON t.id=i.task_id "
+        "WHERE i.task_id=?", (task_id,),
+    ).fetchone()
+    assert renewed["state"] == "spawned"
+    assert renewed["expires_at"] > int(time.time())
+    assert renewed["status"] == "running"
+    assert renewed["claim_expires"] == renewed["expires_at"]
+    identity = conn.execute(
+        "SELECT intent_id, generation, run_id, claim_lock FROM "
+        "kanban_resume_launch_intents WHERE task_id=?", (task_id,),
+    ).fetchone()
+    assert rr.handshake_resume_launch_intent(
+        kb.kanban_db_path(),
+        intent_id=identity["intent_id"],
+        generation=identity["generation"],
+        task_id=task_id,
+        run_id=identity["run_id"],
+        claim_lock=identity["claim_lock"],
+        worker_pid=os.getpid(),
+    )
+
+
+def test_real_launcher_handshakes_after_parent_records_spawned(tmp_path, monkeypatch):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
+    spec = _request(snap, repo, sha, task_id)
+    rr._append_verified_request(conn, spec)
+    rr.consume_resume_requests(
+        conn, board="default", gateway_profile="default", policies=[_policy(spec)]
+    )
+
+    def capable(profile, candidate):
+        info = candidate.stat()
+        return WorkspaceCapability(
+            True, profile, str(candidate), "", device=info.st_dev, inode=info.st_ino,
+            content_sha256=spec.expected_candidate_fingerprint.removeprefix("sha256:"),
+        )
+
+    monkeypatch.setattr(
+        rr,
+        "_current_workspace_capability",
+        lambda profile, workspace: capable(profile, Path(workspace)),
+    )
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *_args, **_kwargs: os.getpid(),
+        workspace_capability_fn=capable,
+    )
+    assert [item[0] for item in result.spawned] == [task_id]
+    identity = conn.execute(
+        "SELECT intent_id, generation, run_id, claim_lock, state FROM "
+        "kanban_resume_launch_intents WHERE task_id=?", (task_id,),
+    ).fetchone()
+    assert identity["state"] == "spawned"
+    assert conn.execute(
+        "SELECT kind FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()[0] == "spawned"
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path()))
+    monkeypatch.setenv("HERMES_KANBAN_LAUNCH_INTENT_ID", identity["intent_id"])
+    monkeypatch.setenv("HERMES_KANBAN_LAUNCH_GENERATION", str(identity["generation"]))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(identity["run_id"]))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", identity["claim_lock"])
+
+    class ExecReached(Exception):
+        pass
+
+    def exec_after_handshake(*_args):
+        raise ExecReached
+
+    monkeypatch.setattr(worker_launcher.os, "execvpe", exec_after_handshake)
+    with pytest.raises(ExecReached):
+        worker_launcher.main(["--", "hermes", "chat", "-q", "work"])
+    persisted = conn.execute(
+        "SELECT state, worker_pid FROM kanban_resume_launch_intents WHERE intent_id=?",
+        (identity["intent_id"],),
+    ).fetchone()
+    assert tuple(persisted) == ("handshaken", os.getpid())
+
+
+def test_stale_spawned_generation_cannot_handshake_after_replay(tmp_path, monkeypatch):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
+    spec = _request(snap, repo, sha, task_id)
+    rr._append_verified_request(conn, spec)
+    rr.consume_resume_requests(
+        conn, board="default", gateway_profile="default", policies=[_policy(spec)]
+    )
+
+    def capable(profile, candidate):
+        info = candidate.stat()
+        return WorkspaceCapability(
+            True, profile, str(candidate), "", device=info.st_dev, inode=info.st_ino,
+            content_sha256=spec.expected_candidate_fingerprint.removeprefix("sha256:"),
+        )
+
+    monkeypatch.setattr(
+        rr,
+        "_current_workspace_capability",
+        lambda profile, workspace: capable(profile, Path(workspace)),
+    )
+    intents = []
+
+    def launch(_task, _workspace, *, launch_intent):
+        intents.append(launch_intent)
+        return 999999
+
+    first = kb.dispatch_once(conn, spawn_fn=launch, workspace_capability_fn=capable)
+    assert len(first.spawned) == 1
+    stale = intents[0]
+    conn.execute(
+        "UPDATE kanban_resume_launch_intents SET expires_at=0 WHERE intent_id=?",
+        (stale.intent_id,),
+    )
+    conn.execute("UPDATE tasks SET claim_expires=0 WHERE id=?", (task_id,))
+    conn.execute("UPDATE task_runs SET claim_expires=0 WHERE task_id=?", (task_id,))
+    second = kb.dispatch_once(conn, spawn_fn=launch, workspace_capability_fn=capable)
+    assert len(second.spawned) == 1
+    assert [intent.generation for intent in intents] == [1, 2]
+
+    # Even if stale state is corrupted back to a nominally pending receipt,
+    # its old claim/run provenance cannot authorize task code.
+    conn.execute(
+        "UPDATE kanban_resume_launch_intents SET state='spawned', expires_at=? "
+        "WHERE intent_id=?", (int(time.time()) + 60, stale.intent_id),
+    )
+    assert not rr.handshake_resume_launch_intent(
+        kb.kanban_db_path(),
+        intent_id=stale.intent_id,
+        generation=stale.generation,
+        task_id=stale.task_id,
+        run_id=stale.run_id,
+        claim_lock=stale.claim_lock,
+        worker_pid=999999,
+    )
+    assert conn.execute(
+        "SELECT state FROM kanban_resume_launch_intents WHERE intent_id=?",
+        (stale.intent_id,),
+    ).fetchone()[0] == "rejected"
+
+
+def test_popen_success_then_coordinator_crash_does_not_duplicate_active_worker(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
+    spec = _request(snap, repo, sha, task_id)
+    rr._append_verified_request(conn, spec)
+    rr.consume_resume_requests(
+        conn, board="default", gateway_profile="default", policies=[_policy(spec)]
+    )
+    pid_file = tmp_path / "worker.pid"
+    ctx = multiprocessing.get_context("fork")
+    coordinator = ctx.Process(
+        target=_dispatch_crash_after_handshake,
+        args=(
+            str(kb.kanban_db_path()),
+            spec.expected_candidate_fingerprint,
+            str(pid_file),
+        ),
+    )
+    coordinator.start()
+    coordinator.join(30)
+    assert coordinator.exitcode == 23
+    worker_pid = int(pid_file.read_text(encoding="ascii"))
+    try:
+        assert kb._pid_alive(worker_pid)
+        launches = []
+        duplicate = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: launches.append(True) or 9898,
+            workspace_capability_fn=lambda profile, candidate: WorkspaceCapability(
+                True,
+                profile,
+                str(candidate),
+                "",
+                device=candidate.stat().st_dev,
+                inode=candidate.stat().st_ino,
+                content_sha256=spec.expected_candidate_fingerprint.removeprefix("sha256:"),
+            ),
+        )
+        assert duplicate.spawned == []
+        assert launches == []
+        intent = conn.execute(
+            "SELECT state, worker_pid FROM kanban_resume_launch_intents WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        assert tuple(intent) == ("handshaken", worker_pid)
+    finally:
+        Path(str(pid_file) + ".release").touch()
+        deadline = time.monotonic() + 5
+        while kb._pid_alive(worker_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+
+def test_expired_orphan_intent_replays_with_new_generation(tmp_path, monkeypatch):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    conn, task_id, repo, sha, snap = _blocked_task(tmp_path, monkeypatch)
+    spec = _request(snap, repo, sha, task_id)
+    rr._append_verified_request(conn, spec)
+    rr.consume_resume_requests(
+        conn, board="default", gateway_profile="default", policies=[_policy(spec)]
+    )
+
+    def capable(profile, candidate):
+        info = candidate.stat()
+        return WorkspaceCapability(
+            True, profile, str(candidate), "", device=info.st_dev, inode=info.st_ino,
+            content_sha256=spec.expected_candidate_fingerprint.removeprefix("sha256:"),
+        )
+
+    ctx = multiprocessing.get_context("fork")
+    crashed = ctx.Process(
+        target=_dispatch_crash_after_intent,
+        args=(str(kb.kanban_db_path()), spec.expected_candidate_fingerprint),
+    )
+    crashed.start()
+    crashed.join(30)
+    assert crashed.exitcode == 23
+    first = conn.execute(
+        "SELECT intent_id, generation FROM kanban_resume_launch_intents WHERE task_id=?",
+        (task_id,),
+    ).fetchone()
+    assert first is not None
+    # A real abrupt death cannot run the exception reconciler. Restore the
+    # persisted pre-callback state and expire both intent and claim deterministically.
+    conn.execute(
+        "UPDATE kanban_resume_launch_intents SET state='prepared', expires_at=0, finished_at=NULL "
+        "WHERE intent_id=?", (first["intent_id"],),
+    )
+    conn.execute("UPDATE tasks SET claim_expires=0 WHERE id=?", (task_id,))
+    conn.execute("UPDATE task_runs SET claim_expires=0 WHERE task_id=?", (task_id,))
+    launches = []
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *_args, **_kwargs: launches.append(True) or 4343,
+        workspace_capability_fn=capable,
+    )
+    assert [item[0] for item in result.spawned] == [task_id], (
+        result,
+        dict(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()),
+        dict(conn.execute("SELECT * FROM kanban_resume_requests").fetchone()),
+        [dict(row) for row in conn.execute("SELECT * FROM kanban_resume_launch_intents")],
+    )
+    assert launches == [True]
+    generations = [row[0] for row in conn.execute(
+        "SELECT generation FROM kanban_resume_launch_intents WHERE task_id=? ORDER BY generation",
+        (task_id,),
+    )]
+    assert generations == [1, 2]
 
 
 @pytest.mark.parametrize(

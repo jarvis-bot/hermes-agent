@@ -2267,6 +2267,26 @@ def test_auto_mount_rejects_extra_args_workspace_mounts(monkeypatch, tmp_path, e
         )
 
 
+def test_forbidden_extra_args_are_rejected_before_image_resolution(monkeypatch, tmp_path):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+
+    def network_must_not_run(*_args, **_kwargs):
+        raise AssertionError("image resolution/pull must not run for invalid local args")
+
+    monkeypatch.setattr(docker_env, "_resolve_image_identity", network_must_not_run)
+    monkeypatch.setattr(docker_env, "_image_uses_init_entrypoint", network_must_not_run)
+
+    with pytest.raises(ValueError, match="docker_extra_args mounts /workspace"):
+        _make_dummy_env(
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+            extra_args=["--mount=type=bind,src=/tmp/override,dst=/workspace"],
+        )
+
+
 @pytest.mark.parametrize(
     "volume",
     [

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from types import SimpleNamespace
 
 
 def _make_task(kb, *, assignee: str):
@@ -87,6 +88,21 @@ agent:
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
     for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
         assert required in pinned
+
+    intent = SimpleNamespace(intent_id="rli_spawn_test", generation=3)
+    pid = kb._default_spawn(
+        _make_task(kb, assignee="elias"),
+        str(workspace),
+        launch_intent=intent,
+    )
+    assert pid == 4242
+    assert captured["cmd"][0] == kb.sys.executable
+    assert captured["cmd"][1] == str(
+        kb.Path(kb.__file__).resolve().with_name("kanban_worker_launcher.py")
+    )
+    assert captured["cmd"][2] == "--"
+    assert captured["env"]["HERMES_KANBAN_LAUNCH_INTENT_ID"] == "rli_spawn_test"
+    assert captured["env"]["HERMES_KANBAN_LAUNCH_GENERATION"] == "3"
 
 
 def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_path):
