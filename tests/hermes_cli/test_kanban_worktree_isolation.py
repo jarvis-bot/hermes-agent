@@ -159,5 +159,27 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
     assert head == "wt/sibling"
 
 
+def test_external_registered_worktree_wrong_branch_gets_isolated_checkout(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    external_root = tmp_path / "external-worktrees"
+    occupied = _add_worktree(repo, external_root / "occupied", "wt/other")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="wanted", workspace_kind="worktree",
+            workspace_path=str(occupied), branch_name="wt/wanted",
+        )
+        task = kb.get_task(conn, tid)
+
+    workspace, branch = kb._resolve_worktree_workspace(task)
+
+    assert workspace == (repo / ".worktrees" / tid).resolve()
+    assert branch == "wt/wanted"
+    assert kb._git_current_branch(workspace) == "wt/wanted"
+    assert kb._git_current_branch(occupied) == "wt/other"
+
+
 
 

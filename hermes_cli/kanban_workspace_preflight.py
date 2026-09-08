@@ -302,7 +302,7 @@ def preflight_workspace_for_profile(
 
         from tools.environments.docker import (
             _enforce_reviewer_workspace_bounds,
-            _readonly_tree_digest,
+            _review_workspace_content_digest,
             _resolve_cwd_mount_source,
         )
 
@@ -338,8 +338,8 @@ def preflight_workspace_for_profile(
         ):
             raise ValueError("workspace filesystem object changed during preflight")
         content_sha256 = (
-            _readonly_tree_digest(
-                Path(canonical_source), include_root_mode=False, deadline=deadline
+            _review_workspace_content_digest(
+                Path(canonical_source), deadline=deadline
             )
             if reviewer
             else None

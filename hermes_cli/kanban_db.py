@@ -4634,6 +4634,9 @@ def claim_task(
     return claimed
 
 
+_CLAIM_EXPECTATION_UNSET = object()
+
+
 def claim_review_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4642,6 +4645,7 @@ def claim_review_task(
     claimer: Optional[str] = None,
     expected_assignee: Optional[str] = None,
     expected_workspace_path: Optional[str] = None,
+    expected_workspace_sha: object = _CLAIM_EXPECTATION_UNSET,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -4676,6 +4680,9 @@ def claim_review_task(
         if expected_workspace_path is not None:
             sql += " AND workspace_path = ?"
             params.append(expected_workspace_path)
+        if expected_workspace_sha is not _CLAIM_EXPECTATION_UNSET:
+            sql += " AND expected_workspace_sha IS ?"
+            params.append(expected_workspace_sha)
         cur = conn.execute(sql, tuple(params))
         if cur.rowcount != 1:
             return None
@@ -6953,35 +6960,72 @@ def _ensure_git_worktree(
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
             str(target), "HEAD",
         ]
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            timeout=60,
-            check=False,
-        )
-    finally:
-        created_worktree = bool(
-            repo_common is not None
-            and target.exists()
-            and _is_exact_registered_worktree(repo_root, target, branch_name)
-        )
-        created_branch = (
-            not branch_existed
-            and created_worktree
-            and _git_branch_exists(repo_root, branch_name)
-        )
-        if created_artifacts is not None and (created_worktree or created_branch):
-            created_artifacts.append(_CreatedWorktreeArtifact(
-                repo_root=repo_root, target=target, branch_name=branch_name,
-                created_worktree=created_worktree, created_branch=created_branch,
-            ))
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True, encoding='utf-8', errors='replace',
+        timeout=60,
+        check=False,
+    )
     if result.returncode != 0:
+        # A competing creator may have won after our absence check. Authenticate
+        # that winner, but never claim artifacts observed after our failed command.
+        if _is_exact_registered_worktree(repo_root, target, branch_name):
+            return
         stderr = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
+    created_worktree = bool(
+        repo_common is not None
+        and target.exists()
+        and _is_exact_registered_worktree(repo_root, target, branch_name)
+    )
+    if not created_worktree:
+        raise RuntimeError(
+            f"git worktree add succeeded but {target} is not the expected registered worktree"
+        )
+    created_branch = not branch_existed and _git_branch_exists(repo_root, branch_name)
+    if created_artifacts is not None:
+        created_artifacts.append(_CreatedWorktreeArtifact(
+            repo_root=repo_root, target=target, branch_name=branch_name,
+            created_worktree=True, created_branch=created_branch,
+        ))
+
+
+def _registered_worktree_repo_root(target: Path) -> Optional[Path]:
+    """Resolve a linked worktree's main checkout from registered Git metadata."""
+    common = _git_common_dir(target)
+    if common is None:
+        return None
+    try:
+        listed = subprocess.run(
+            ["git", f"--git-dir={common}", "worktree", "list", "--porcelain", "-z"],
+            capture_output=True, text=True, encoding="utf-8", errors="surrogateescape",
+            timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if listed.returncode != 0:
+        return None
+    target_resolved = target.resolve(strict=False)
+    registered: list[Path] = []
+    for record in listed.stdout.split("\0\0"):
+        first = record.split("\0", 1)[0]
+        if first.startswith("worktree "):
+            registered.append(Path(first[len("worktree "):]).resolve(strict=False))
+    if target_resolved not in registered:
+        return None
+    for candidate in registered:
+        try:
+            if (
+                (candidate / ".git").is_dir()
+                and (candidate / ".git").resolve(strict=True) == common
+            ):
+                return candidate
+        except OSError:
+            continue
+    return None
 
 
 def _resolve_worktree_workspace(
@@ -7051,7 +7095,7 @@ def _resolve_worktree_workspace(
         # branch — silent cross-task provenance corruption, and unsafe
         # when siblings run concurrently. Fall back to a fresh worktree
         # of our own under the same repo.
-        fallback_root = _repo_root_for_worktree_target(requested.parent)
+        fallback_root = _registered_worktree_repo_root(requested)
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
@@ -7060,10 +7104,10 @@ def _resolve_worktree_workspace(
                     created_artifacts=created_artifacts,
                 )
                 return fallback.resolve(strict=False), branch_name
-        # No repo to anchor a fallback on (or the occupied path IS this
-        # task's own canonical worktree): keep the legacy reuse rather
-        # than failing dispatch.
-        return requested_resolved, actual_branch or branch_name
+        raise RuntimeError(
+            f"worktree target {requested} is registered on branch {actual_branch!r}, "
+            f"not requested branch {branch_name!r}"
+        )
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
@@ -7086,27 +7130,40 @@ def _resolve_worktree_workspace(
 
 
 def _trusted_review_repository(task: Task, workspace: Path, *, board: Optional[str]) -> Path:
-    """Resolve a repository anchor without following candidate ``.git`` data."""
-    candidates: list[tuple[Path, bool]] = []
+    """Resolve a repository anchor only from independent durable metadata."""
+    candidates: list[Path] = []
     workspace = workspace.resolve(strict=True)
-    if workspace.parent.name == ".worktrees":
-        # Canonical Hermes worktree placement is itself an anchor derivation;
-        # therefore it must retain the exact root/.worktrees/task relation.
-        candidates.append((workspace.parent.parent, True))
     board_slug = board if board else get_current_board()
     board_default = (read_board_metadata(board_slug).get("default_workdir") or "").strip()
     if board_default:
-        candidates.append((Path(board_default).expanduser(), False))
+        candidates.append(Path(board_default).expanduser())
     if task.project_id:
         try:
             from hermes_cli import projects_db as _pdb
             with _pdb.connect_closing() as project_conn:
                 project = _pdb.get_project(project_conn, task.project_id)
             if project is not None and project.primary_path:
-                candidates.append((Path(project.primary_path).expanduser(), False))
+                candidates.append(Path(project.primary_path).expanduser())
         except Exception:
             pass
-    for candidate, require_canonical_parent in candidates:
+    try:
+        marker = _read_bounded_git_marker(workspace / ".git")
+        if not marker.strip().startswith("gitdir:"):
+            raise RuntimeError("immutable reviewer snapshot has invalid Git metadata")
+        git_dir_text = marker.strip()[7:].strip()
+        if not git_dir_text:
+            raise RuntimeError("immutable reviewer snapshot has invalid Git metadata")
+        candidate_git_dir = (workspace / git_dir_text).resolve(strict=True)
+        candidate_common = (
+            candidate_git_dir
+            / _read_bounded_git_marker(candidate_git_dir / "commondir").strip()
+        ).resolve(strict=True)
+        registered_workspace = Path(
+            _read_bounded_git_marker(candidate_git_dir / "gitdir").strip()
+        ).resolve(strict=False)
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError("immutable reviewer snapshot has invalid Git metadata") from exc
+    for candidate in candidates:
         try:
             root = candidate.resolve(strict=True)
             git_entry = root / ".git"
@@ -7114,7 +7171,12 @@ def _trusted_review_repository(task: Task, workspace: Path, *, board: Optional[s
                 continue
             if _git_toplevel(root) != root:
                 continue
-            if require_canonical_parent and workspace.parent != root / ".worktrees":
+            trusted_common = git_entry.resolve(strict=True)
+            if (
+                candidate_git_dir.parent != trusted_common / "worktrees"
+                or candidate_common != trusted_common
+                or registered_workspace != (workspace / ".git").resolve(strict=False)
+            ):
                 continue
             return root
         except (OSError, RuntimeError):
@@ -7225,27 +7287,14 @@ def _materialize_immutable_review_snapshot(
                 "existing immutable reviewer snapshot has wrong provenance or content"
             ) from exc
 
-    quarantine: Optional[Path] = None
     if target.exists():
         try:
             validate_snapshot(target)
             return target, authoritative_commit
         except RuntimeError:
-            quarantine = target.with_name(
-                f".{target.name}.invalid-{secrets.token_hex(8)}"
-            )
-            try:
-                target.rename(quarantine)
-            except FileNotFoundError:
-                # Another materializer moved the invalid checkout. Accept only
-                # a winner that has since installed an authenticated snapshot.
-                if target.exists():
-                    validate_snapshot(target)
-                    return target, authoritative_commit
-            except OSError as exc:
-                raise RuntimeError(
-                    "invalid immutable reviewer snapshot cannot be replaced atomically"
-                ) from exc
+            # Invalid provenance establishes rejection, not ownership. Preserve
+            # the existing inode and publish this attempt under a unique name.
+            target = target.with_name(f"{target.name}-{secrets.token_hex(8)}")
 
     staging = Path(tempfile.mkdtemp(prefix=f".{task.id}-", dir=target_root))
     try:
@@ -7264,6 +7313,7 @@ def _materialize_immutable_review_snapshot(
         ])
         _enforce_reviewer_workspace_bounds(staging, deadline=deadline)
         validate_snapshot(staging)
+        staging_stat = staging.stat(follow_symlinks=False)
         installed = False
         try:
             staging.rename(target)
@@ -7273,24 +7323,21 @@ def _materialize_immutable_review_snapshot(
                 raise
             validate_snapshot(target)
         validate_snapshot(target)
-        if installed and created_artifacts is not None:
-            installed_stat = target.stat(follow_symlinks=False)
+        installed_stat = target.stat(follow_symlinks=False)
+        owns_published_inode = (
+            installed
+            and (installed_stat.st_dev, installed_stat.st_ino)
+            == (staging_stat.st_dev, staging_stat.st_ino)
+        )
+        if owns_published_inode and created_artifacts is not None:
             created_artifacts.append(_CreatedReviewSnapshotArtifact(
                 target=target,
-                device=installed_stat.st_dev,
-                inode=installed_stat.st_ino,
+                device=staging_stat.st_dev,
+                inode=staging_stat.st_ino,
             ))
-        if quarantine is not None:
-            shutil.rmtree(quarantine, ignore_errors=True)
-            quarantine = None
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
-        if quarantine is not None and quarantine.exists() and not target.exists():
-            try:
-                quarantine.rename(target)
-            except OSError:
-                pass
     return target, authoritative_commit
 
 
@@ -9112,12 +9159,21 @@ def _materialize_dispatch_workspace_candidates(
         )
     }
     fallback = (default_assignee or "").strip() or None
-    rows = conn.execute(
-        "SELECT id, status, assignee FROM tasks WHERE claim_lock IS NULL AND ("
-        "status IN ('ready', 'review') OR "
-        "(status = 'blocked' AND block_kind = 'workspace_capability')) "
-        "ORDER BY priority DESC, created_at ASC"
+    spawnable_rows = conn.execute(
+        "SELECT id, status, assignee FROM tasks WHERE claim_lock IS NULL "
+        "AND status IN ('ready', 'review') "
+        "ORDER BY priority DESC, created_at ASC LIMIT ?",
+        (limit,),
     ).fetchall()
+    recovery_rows = conn.execute(
+        "SELECT id, status, assignee FROM tasks WHERE claim_lock IS NULL "
+        "AND status = 'blocked' AND block_kind = 'workspace_capability' "
+        "ORDER BY priority DESC, created_at ASC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    # Runnable tasks get first use of the bounded inventory. Recovery candidates
+    # may use only the remainder, so unavailable rows cannot starve dispatch.
+    rows = [*spawnable_rows, *recovery_rows]
     snapshots: dict[tuple[str, str], Task] = {}
     for row in rows:
         if len(snapshots) >= limit:
@@ -9990,12 +10046,18 @@ def _dispatch_once_locked(
                 )
             ):
                 continue
+            preflight_workspace_path = review_task.workspace_path
+            preflight_expected_sha = review_task.expected_workspace_sha
             with write_txn(conn):
                 cur = conn.execute(
                     "UPDATE tasks SET assignee = ?, requires_reviewer_isolation = 1 "
                     "WHERE id = ? AND status = 'review' AND claim_lock IS NULL "
-                    "AND assignee IS ? AND workspace_path = ?",
-                    (target_assignee, row["id"], row_assignee, review_task.workspace_path),
+                    "AND assignee IS ? AND workspace_path = ? "
+                    "AND expected_workspace_sha IS ?",
+                    (
+                        target_assignee, row["id"], row_assignee,
+                        preflight_workspace_path, preflight_expected_sha,
+                    ),
                 )
                 if cur.rowcount == 1 and target_assignee != row_assignee:
                     _append_event(
@@ -10013,7 +10075,11 @@ def _dispatch_once_locked(
             if cur.rowcount != 1:
                 continue
             review_task = get_task(conn, row["id"])
-            if review_task is None:
+            if (
+                review_task is None
+                or review_task.workspace_path != preflight_workspace_path
+                or review_task.expected_workspace_sha != preflight_expected_sha
+            ):
                 continue
         if dry_run:
             result.spawned.append((row["id"], target_assignee, ""))
@@ -10025,7 +10091,8 @@ def _dispatch_once_locked(
             row["id"],
             ttl_seconds=ttl_seconds,
             expected_assignee=target_assignee,
-            expected_workspace_path=review_task.workspace_path,
+            expected_workspace_path=preflight_workspace_path,
+            expected_workspace_sha=preflight_expected_sha,
         )
         if claimed is None:
             continue

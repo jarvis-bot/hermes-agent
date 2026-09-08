@@ -1348,6 +1348,71 @@ def test_materialize_reviewer_rejects_content_changed_since_dispatch_preflight(
     assert archive.closed
 
 
+def test_real_two_commit_reviewer_archive_matches_logical_preflight_digest(
+    monkeypatch, tmp_path
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.email", "review@test.invalid"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.name", "Review Test"], cwd=repository, check=True)
+    payload = repository / "payload.txt"
+    payload.write_text("first\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "first"], cwd=repository, check=True)
+    payload.write_text("second\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "second"], cwd=repository, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    expected = docker_env._review_workspace_content_digest(repository)
+    metadata = docker_env._readonly_tree_metadata_digest(repository)
+    archive_digest = ""
+    original_archive = docker_env._readonly_workspace_archive
+
+    def archive(*args, **kwargs):
+        nonlocal archive_digest
+        handle, archive_digest = original_archive(*args, **kwargs)
+        return handle, archive_digest
+
+    original_run = subprocess.run
+
+    def fake_run(command, **kwargs):
+        if command[0] != "docker":
+            return original_run(command, **kwargs)
+        if command[1:3] == ["volume", "inspect"]:
+            return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
+        if command[1] == "run" and "--rm" in command and "-i" in command:
+            return subprocess.CompletedProcess(
+                command, 0, stdout=(archive_digest + "\n").encode(), stderr=b""
+            )
+        if command[1] == "run" and "--name" in command and "-d" in command:
+            return subprocess.CompletedProcess(command, 0, stdout="verifier\n", stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(docker_env, "_readonly_workspace_archive", archive)
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+    monkeypatch.setattr(docker_env, "_container_tree_digest", lambda *_args: archive_digest)
+
+    docker_env._materialize_readonly_workspace(
+        "docker", "image", str(repository),
+        {"tree_metadata_sha256": metadata, "mounted_content_sha256": expected},
+        assigned, expected, disposable=True,
+    )
+
+    payload.write_text("mutated\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        docker_env._materialize_readonly_workspace(
+            "docker", "image", str(repository),
+            {
+                "tree_metadata_sha256": docker_env._readonly_tree_metadata_digest(repository),
+                "mounted_content_sha256": expected,
+            },
+            assigned, expected, disposable=True,
+        )
+
+
 def test_readonly_digest_length_framing_rejects_structural_collision(tmp_path):
     original = tmp_path / "original"
     crafted = tmp_path / "crafted"

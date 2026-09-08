@@ -405,6 +405,24 @@ def _authenticated_tree_digests(
     return content, mounted_content, metadata_after
 
 
+def _review_workspace_content_digest(
+    root: Path, *, deadline: Optional[float] = None
+) -> str:
+    """Hash the logical review tree independently of reconstructed ``.git``."""
+    inventory = _bounded_tree_inventory(root, deadline=deadline)
+    logical_inventory = [
+        path
+        for path in inventory
+        if path == root or path.relative_to(root).parts[0] != ".git"
+    ]
+    return _readonly_tree_digest(
+        root,
+        include_root_mode=False,
+        deadline=deadline,
+        _inventory=logical_inventory,
+    )
+
+
 def _container_tree_digest(
     docker_exe: str, container_id: str, container_path: str
 ) -> str:
@@ -1473,13 +1491,23 @@ def _materialize_readonly_workspace(
     Assigned-reviewer snapshots are uniquely named and explicitly reclaimed,
     so concurrent reviewers never populate the same mutable volume.
     """
+    if expected_git_sha is not None and expected_content_sha256 is not None:
+        logical_content = _review_workspace_content_digest(
+            Path(source), deadline=provenance_deadline
+        )
+        if logical_content != expected_content_sha256:
+            raise ValueError("reviewer workspace content changed after dispatcher preflight")
     archive, content = _readonly_workspace_archive(
         Path(source),
         str(expected["tree_metadata_sha256"]),
         expected_git_sha,
         provenance_deadline=provenance_deadline,
     )
-    if expected_content_sha256 is not None and content != expected_content_sha256:
+    if (
+        expected_git_sha is None
+        and expected_content_sha256 is not None
+        and content != expected_content_sha256
+    ):
         _best_effort_close(archive)
         raise ValueError("reviewer workspace content changed after dispatcher preflight")
     volume = (
