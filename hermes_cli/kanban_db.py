@@ -4484,6 +4484,9 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+_CLAIM_EXPECTATION_UNSET = object()
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4492,6 +4495,7 @@ def claim_task(
     claimer: Optional[str] = None,
     expected_assignee: Optional[str] = None,
     expected_workspace_path: Optional[str] = None,
+    expected_workspace_sha: object = _CLAIM_EXPECTATION_UNSET,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4505,9 +4509,13 @@ def claim_task(
         # Security/capability callers can bind an out-of-transaction preflight
         # to the exact row snapshot they inspected.  Check before repairing a
         # stale run so a failed optimistic CAS has no side effects.
-        if expected_assignee is not None or expected_workspace_path is not None:
+        if (
+            expected_assignee is not None
+            or expected_workspace_path is not None
+            or expected_workspace_sha is not _CLAIM_EXPECTATION_UNSET
+        ):
             observed = conn.execute(
-                "SELECT assignee, workspace_path FROM tasks "
+                "SELECT assignee, workspace_path, expected_workspace_sha FROM tasks "
                 "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL",
                 (task_id,),
             ).fetchone()
@@ -4521,6 +4529,11 @@ def claim_task(
             if (
                 expected_workspace_path is not None
                 and observed["workspace_path"] != expected_workspace_path
+            ):
+                return None
+            if (
+                expected_workspace_sha is not _CLAIM_EXPECTATION_UNSET
+                and observed["expected_workspace_sha"] != expected_workspace_sha
             ):
                 return None
         # Structural invariant: never transition ready -> running while any
@@ -4585,6 +4598,9 @@ def claim_task(
         if expected_workspace_path is not None:
             claim_sql += " AND workspace_path = ?"
             claim_params.append(expected_workspace_path)
+        if expected_workspace_sha is not _CLAIM_EXPECTATION_UNSET:
+            claim_sql += " AND expected_workspace_sha IS ?"
+            claim_params.append(expected_workspace_sha)
         cur = conn.execute(claim_sql, tuple(claim_params))
         if cur.rowcount != 1:
             return None
@@ -4632,9 +4648,6 @@ def claim_task(
         run_id=run_id,
     )
     return claimed
-
-
-_CLAIM_EXPECTATION_UNSET = object()
 
 
 def claim_review_task(
@@ -7087,7 +7100,18 @@ def _resolve_worktree_workspace(
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
-            return requested_resolved, actual_branch
+            registered_root = _registered_worktree_repo_root(requested)
+            if (
+                registered_root is not None
+                and _is_exact_registered_worktree(
+                    registered_root, requested, branch_name
+                )
+            ):
+                return requested_resolved, actual_branch
+            raise RuntimeError(
+                f"worktree target {requested} is not exactly registered on requested "
+                f"branch {branch_name!r}"
+            )
         # The requested path is an existing checkout of a DIFFERENT
         # task's branch. Decompose children inherit the root's
         # workspace_path verbatim, so siblings all point here; reusing
@@ -9201,17 +9225,13 @@ def _materialize_dispatch_workspace_candidates(
             resolved_branch = task.branch_name
             resolved_kind = task.workspace_kind
             resolved_expected_sha = task.expected_workspace_sha
-            if (
-                task.workspace_path
-                and (task.workspace_kind != "worktree" or task.branch_name)
-            ):
-                workspace = Path(task.workspace_path).resolve(strict=True)
-                resolved_branch = task.branch_name
-            elif task.workspace_kind == "worktree":
+            if task.workspace_kind == "worktree":
                 workspace, resolved_branch = _resolve_worktree_workspace(
                     task, board=board, created_artifacts=worktree_artifacts
                 )
                 workspace = Path(workspace).resolve(strict=True)
+            elif task.workspace_path:
+                workspace = Path(task.workspace_path).resolve(strict=True)
             else:
                 workspace = Path(resolve_workspace(task, board=board)).resolve(strict=True)
             if task.status == "review":
@@ -9603,6 +9623,23 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        prepared = prepared_workspace_preflights.get((row["id"], "ready"))
+        if not dry_run and prepared is None:
+            # A task promoted after the bounded preparation phase waits for the
+            # next tick; it is never claimed without an exact-path preflight.
+            continue
+        prepared_data = prepared or {}
+        task_for_preflight = (
+            prepared_data.get("task") if prepared is not None else get_task(conn, row["id"])
+        )
+        preflight_workspace_path = (
+            task_for_preflight.workspace_path if task_for_preflight is not None else None
+        )
+        preflight_expected_sha = (
+            task_for_preflight.expected_workspace_sha
+            if task_for_preflight is not None
+            else _CLAIM_EXPECTATION_UNSET
+        )
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -9622,11 +9659,18 @@ def _dispatch_once_locked(
                 if not dry_run:
                     try:
                         with write_txn(conn):
-                            conn.execute(
+                            cur = conn.execute(
                                 "UPDATE tasks SET assignee = ? WHERE id = ? "
-                                "AND (assignee IS NULL OR assignee = '')",
-                                (_default_assignee, row["id"]),
+                                "AND status = 'ready' AND claim_lock IS NULL "
+                                "AND (assignee IS NULL OR assignee = '') "
+                                "AND workspace_path IS ? AND expected_workspace_sha IS ?",
+                                (
+                                    _default_assignee, row["id"],
+                                    preflight_workspace_path, preflight_expected_sha,
+                                ),
                             )
+                            if cur.rowcount != 1:
+                                continue
                             _append_event(
                                 conn, row["id"], "assigned",
                                 {
@@ -9694,15 +9738,6 @@ def _dispatch_once_locked(
         # graph.  A capable configured fallback becomes the durable owner;
         # when no runtime is capable the row stays ready and unclaimed for a
         # later tick/config repair.
-        prepared = prepared_workspace_preflights.get((row["id"], "ready"))
-        if not dry_run and prepared is None:
-            # A task promoted after the bounded preparation phase waits for the
-            # next tick; it is never claimed without an exact-path preflight.
-            continue
-        prepared_data = prepared or {}
-        task_for_preflight = (
-            prepared_data.get("task") if prepared is not None else get_task(conn, row["id"])
-        )
         effective_capability = None
         if not dry_run and task_for_preflight and task_for_preflight.workspace_path:
             workspace_for_preflight = Path(task_for_preflight.workspace_path)
@@ -9728,16 +9763,22 @@ def _dispatch_once_locked(
                         cur = conn.execute(
                             "UPDATE tasks SET requires_reviewer_isolation = 1 "
                             "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL "
-                            "AND assignee = ? AND workspace_path = ?",
+                            "AND assignee = ? AND workspace_path = ? "
+                            "AND expected_workspace_sha IS ?",
                             (
                                 row["id"], row_assignee,
                                 task_for_preflight.workspace_path,
+                                preflight_expected_sha,
                             ),
                         )
                     if cur.rowcount != 1:
                         continue
                     task_for_preflight = get_task(conn, row["id"])
-                    if task_for_preflight is None:
+                    if (
+                        task_for_preflight is None
+                        or task_for_preflight.workspace_path != preflight_workspace_path
+                        or task_for_preflight.expected_workspace_sha != preflight_expected_sha
+                    ):
                         continue
                 fallback_capability = prepared_data.get("fallback")
                 if (
@@ -9764,13 +9805,15 @@ def _dispatch_once_locked(
                             "THEN 1 ELSE 0 END "
                             "WHERE id = ? "
                             "AND status = 'ready' AND claim_lock IS NULL "
-                            "AND assignee = ? AND workspace_path = ?",
+                            "AND assignee = ? AND workspace_path = ? "
+                            "AND expected_workspace_sha IS ?",
                             (
                                 row_assignee,
                                 1 if reviewer_isolation_required else 0,
                                 row["id"],
                                 previous_assignee,
                                 task_for_preflight.workspace_path,
+                                preflight_expected_sha,
                             ),
                         )
                         if cur.rowcount != 1:
@@ -9801,17 +9844,23 @@ def _dispatch_once_locked(
                     cur = conn.execute(
                         "UPDATE tasks SET requires_reviewer_isolation = 1 "
                         "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL "
-                        "AND assignee = ? AND workspace_path = ?",
+                        "AND assignee = ? AND workspace_path = ? "
+                        "AND expected_workspace_sha IS ?",
                         (
                             row["id"],
                             row_assignee,
                             task_for_preflight.workspace_path,
+                            preflight_expected_sha,
                         ),
                     )
                     if cur.rowcount != 1:
                         continue
                 task_for_preflight = get_task(conn, row["id"])
-                if task_for_preflight is None:
+                if (
+                    task_for_preflight is None
+                    or task_for_preflight.workspace_path != preflight_workspace_path
+                    or task_for_preflight.expected_workspace_sha != preflight_expected_sha
+                ):
                     continue
 
         # Respawn guard: refuse to re-spawn when useful work is already
@@ -9861,6 +9910,11 @@ def _dispatch_once_locked(
                 task_for_preflight.workspace_path
                 if task_for_preflight and task_for_preflight.workspace_path
                 else None
+            ),
+            expected_workspace_sha=(
+                preflight_expected_sha
+                if task_for_preflight and task_for_preflight.workspace_path
+                else _CLAIM_EXPECTATION_UNSET
             ),
         )
         if claimed is None:

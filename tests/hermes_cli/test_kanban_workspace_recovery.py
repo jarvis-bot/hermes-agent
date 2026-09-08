@@ -521,6 +521,77 @@ def test_linked_worktree_review_dispatches_from_standalone_runtime_snapshot(
     assert observed[0][1] == task.workspace_path
 
 
+def test_review_dispatch_validates_populated_worktree_requested_branch(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    external = tmp_path / "external-branch-a"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "candidate.txt").write_text("branch a\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "branch a"], check=True)
+    sha_a = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "-C", str(repo), "branch", "branch/A", sha_a], check=True)
+    (repo / "candidate.txt").write_text("branch b\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "commit", "-qam", "branch b"], check=True)
+    sha_b = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "-C", str(repo), "branch", "branch/B", sha_b], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", str(external), "branch/A"],
+        check=True,
+    )
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    monkeypatch.setattr(
+        kb, "read_board_metadata", lambda _board: {"default_workdir": str(repo)}
+    )
+
+    observed = []
+
+    def runtime_capability(profile: str, candidate: Path) -> WorkspaceCapability:
+        identity = candidate.stat()
+        return WorkspaceCapability(
+            True, profile, str(candidate), read_only=True,
+            device=identity.st_dev, inode=identity.st_ino,
+            reviewer_isolated=True,
+        )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="review requested branch B", assignee="quality-reviewer",
+            workspace_kind="worktree", workspace_path=str(external),
+            branch_name="branch/B",
+        )
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+        conn.commit()
+        result = kb.dispatch_once(
+            conn, workspace_capability_fn=runtime_capability,
+            spawn_fn=lambda task, path, **_: observed.append((task, path)) or 1234,
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert result.spawned
+    assert task is not None and task.workspace_kind == "dir"
+    assert task.expected_workspace_sha == sha_b
+    assert task.expected_workspace_sha != sha_a
+    snapshot = Path(task.workspace_path or "")
+    assert snapshot != external
+    assert (snapshot / "candidate.txt").read_text(encoding="utf-8") == "branch b\n"
+    assert observed[0][1] == str(snapshot)
+    assert subprocess.run(
+        ["git", "-C", str(external), "rev-parse", "--abbrev-ref", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip() == "branch/A"
+
+
 def test_linked_review_snapshot_rejects_candidate_gitdir_redirect_and_sha_mismatch(
     kanban_home, tmp_path, monkeypatch
 ):
@@ -1100,6 +1171,58 @@ def test_review_dispatch_sha_cas_rejects_stale_preflight(
     assert task.expected_workspace_sha == rival_sha
 
 
+def test_ready_dispatch_sha_cas_rejects_stale_preflight_before_run_or_spawn(
+    kanban_home, tmp_path, monkeypatch
+):
+    workspace = tmp_path / "ready-sha"
+    workspace.mkdir()
+    original_sha = "a" * 40
+    rival_sha = "b" * 40
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="sha-bound ready", assignee="worker",
+            workspace_kind="dir", workspace_path=str(workspace),
+            expected_workspace_sha=original_sha,
+        )
+
+        def capability(profile: str, candidate: Path) -> WorkspaceCapability:
+            identity = candidate.stat()
+            with kb.connect() as rival:
+                rival.execute(
+                    "UPDATE tasks SET expected_workspace_sha = ? WHERE id = ?",
+                    (rival_sha, task_id),
+                )
+                rival.commit()
+            return WorkspaceCapability(
+                True, profile, str(candidate),
+                device=identity.st_dev, inode=identity.st_ino,
+            )
+
+        spawned = []
+        result = kb.dispatch_once(
+            conn, workspace_capability_fn=capability,
+            spawn_fn=lambda *_args, **_kwargs: spawned.append(True) or 1234,
+        )
+        task = kb.get_task(conn, task_id)
+        claimed_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'claimed'",
+            (task_id,),
+        ).fetchone()[0]
+        run_count = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+
+    assert result.spawned == []
+    assert spawned == []
+    assert task is not None and task.status == "ready"
+    assert task.expected_workspace_sha == rival_sha
+    assert task.current_run_id is None
+    assert claimed_events == 0
+    assert run_count == 0
+
+
 def test_review_claim_includes_expected_workspace_sha_cas(kanban_home, tmp_path):
     workspace = tmp_path / "claim-sha"
     workspace.mkdir()
@@ -1121,6 +1244,39 @@ def test_review_claim_includes_expected_workspace_sha_cas(kanban_home, tmp_path)
     assert claimed is None
     assert task is not None and task.status == "review"
     assert task.current_run_id is None
+
+
+def test_ready_claim_expected_workspace_sha_cas_is_null_safe_and_optional(
+    kanban_home, tmp_path
+):
+    workspace = tmp_path / "claim-ready-sha"
+    workspace.mkdir()
+
+    with kb.connect() as conn:
+        null_id = kb.create_task(
+            conn, title="claim null sha", assignee="worker",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        nonnull_id = kb.create_task(
+            conn, title="reject null sha", assignee="worker",
+            workspace_kind="dir", workspace_path=str(workspace),
+            expected_workspace_sha="a" * 40,
+        )
+
+        claimed_null = kb.claim_task(
+            conn, null_id, expected_assignee="worker",
+            expected_workspace_path=str(workspace), expected_workspace_sha=None,
+        )
+        rejected_nonnull = kb.claim_task(
+            conn, nonnull_id, expected_assignee="worker",
+            expected_workspace_path=str(workspace), expected_workspace_sha=None,
+        )
+        nonnull_task = kb.get_task(conn, nonnull_id)
+
+    assert claimed_null is not None and claimed_null.status == "running"
+    assert rejected_nonnull is None
+    assert nonnull_task is not None and nonnull_task.status == "ready"
+    assert nonnull_task.current_run_id is None
 
 
 def test_foreign_invalid_deterministic_snapshot_is_preserved(
