@@ -7,7 +7,10 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import kanban_db as kb
-from hermes_cli.kanban_workspace_preflight import WorkspaceCapability
+from hermes_cli.kanban_workspace_preflight import (
+    WorkspaceCapability,
+    preflight_workspace_for_profile,
+)
 
 
 @pytest.fixture
@@ -226,6 +229,93 @@ def test_reviewer_isolation_never_downgrades_to_ordinary_fallback(
     assert task.current_run_id is None
 
 
+@pytest.mark.parametrize("initial_status", ["ready", "review"])
+def test_deleted_selected_assignee_uses_capable_fallback(
+    kanban_home, tmp_path, monkeypatch, initial_status
+):
+    workspace = tmp_path / "deleted-assignee"
+    workspace.mkdir()
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists",
+        lambda profile: profile == "fallback-reviewer",
+    )
+    probed = []
+
+    def capability(profile: str, candidate: Path) -> WorkspaceCapability:
+        probed.append(profile)
+        identity = candidate.stat()
+        return WorkspaceCapability(
+            profile == "fallback-reviewer", profile, str(candidate),
+            reason="profile does not exist" if profile != "fallback-reviewer" else "",
+            read_only=profile == "fallback-reviewer",
+            device=identity.st_dev, inode=identity.st_ino,
+            reviewer_isolated=True,
+        )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="legacy review", assignee="deleted-reviewer",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        if initial_status == "review":
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+            conn.commit()
+        spawned = []
+        result = kb.dispatch_once(
+            conn, default_assignee="fallback-reviewer",
+            workspace_capability_fn=capability,
+            spawn_fn=lambda task, path: spawned.append(
+                (task.assignee, task.requires_reviewer_isolation, path)
+            ) or 1234,
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert set(probed) == {"deleted-reviewer", "fallback-reviewer"}
+    assert result.spawned == [(task_id, "fallback-reviewer", str(workspace.resolve()))]
+    assert spawned == [("fallback-reviewer", True, str(workspace.resolve()))]
+    assert task is not None and task.status == "running"
+    assert task.assignee == "fallback-reviewer"
+    assert task.requires_reviewer_isolation is True
+
+
+def test_failed_production_reviewer_preflight_persists_before_rejecting_fallback(
+    kanban_home, tmp_path, monkeypatch
+):
+    workspace = tmp_path / "reviewer-failure"
+    workspace.mkdir()
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _profile: True)
+
+    def capability(profile: str, candidate: Path) -> WorkspaceCapability:
+        if profile == "security-reviewer":
+            return preflight_workspace_for_profile(
+                profile,
+                candidate,
+                profile_config={"terminal": {"backend": "local"}},
+                runtime_probe=lambda **_: None,
+            )
+        identity = candidate.stat()
+        return WorkspaceCapability(
+            True, profile, str(candidate), read_only=False,
+            device=identity.st_dev, inode=identity.st_ino,
+        )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="legacy reviewer task", assignee="security-reviewer",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        result = kb.dispatch_once(
+            conn, default_assignee="default", workspace_capability_fn=capability,
+            spawn_fn=lambda *_: pytest.fail("ordinary fallback must not spawn"),
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert result.spawned == []
+    assert task is not None and task.status == "ready"
+    assert task.assignee == "security-reviewer"
+    assert task.requires_reviewer_isolation is True
+
+
 def test_scratch_workspace_is_materialized_then_preflighted_before_claim(
     kanban_home, monkeypatch
 ):
@@ -368,7 +458,7 @@ def test_linked_worktree_review_dispatches_from_standalone_runtime_snapshot(
     kanban_home, tmp_path, monkeypatch
 ):
     repo = tmp_path / "repo"
-    linked = tmp_path / "linked"
+    linked = repo / ".worktrees" / "linked"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
@@ -422,6 +512,57 @@ def test_linked_worktree_review_dispatches_from_standalone_runtime_snapshot(
     assert Path(task.workspace_path or "") != linked
     assert (Path(task.workspace_path or "") / ".git").is_dir()
     assert observed[0][1] == task.workspace_path
+
+
+def test_linked_review_snapshot_rejects_candidate_gitdir_redirect_and_sha_mismatch(
+    kanban_home, tmp_path
+):
+    trusted = tmp_path / "trusted"
+    private = tmp_path / "private"
+    for repo, payload in ((trusted, "public\n"), (private, "private data\n")):
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+        (repo / "payload.txt").write_text(payload, encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    expected = subprocess.run(
+        ["git", "-C", str(trusted), "rev-parse", "HEAD"], check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    candidate = trusted / ".worktrees" / "task-malicious"
+    candidate.mkdir(parents=True)
+    (candidate / ".git").write_text(
+        f"gitdir: {private / '.git'}\n", encoding="utf-8"
+    )
+    task = SimpleNamespace(
+        id="task-malicious", expected_workspace_sha=expected,
+        project_id=None, workspace_path=str(candidate),
+    )
+
+    with pytest.raises(RuntimeError, match="trusted repository|Git metadata"):
+        kb._materialize_immutable_review_snapshot(task, candidate)
+
+    legitimate = trusted / ".worktrees" / "task-legitimate"
+    subprocess.run(
+        ["git", "-C", str(trusted), "worktree", "add", "-qb", "review-test", str(legitimate)],
+        check=True,
+    )
+    wrong_sha = subprocess.run(
+        ["git", "-C", str(private), "rev-parse", "HEAD"], check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    mismatch_task = SimpleNamespace(
+        id="task-legitimate", expected_workspace_sha=wrong_sha,
+        project_id=None, workspace_path=str(legitimate),
+    )
+    with pytest.raises(RuntimeError, match="HEAD does not match assigned SHA"):
+        kb._materialize_immutable_review_snapshot(mismatch_task, legitimate)
+    assert mismatch_task.expected_workspace_sha == wrong_sha
+
+    snapshots = kb.workspaces_root() / ".review-snapshots"
+    assert not snapshots.exists() or not any(snapshots.iterdir())
 
 
 def test_slow_workspace_probe_runs_outside_dispatch_lock(

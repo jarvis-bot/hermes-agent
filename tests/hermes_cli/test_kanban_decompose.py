@@ -354,6 +354,120 @@ def test_worktree_decomposition_materializes_and_attests_each_child_before_publi
     assert all(Path(child.workspace_path) != Path(root.workspace_path) for child in children)
 
 
+def test_worktree_decomposition_rolls_back_new_children_after_repeated_second_failure(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "base.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    subprocess.run(["git", "-C", str(repo), "branch", "preexisting"], check=True)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="fan out", triage=True, assignee="orchestrator",
+            workspace_kind="worktree", workspace_path=str(repo),
+        )
+    payload = jsonlib.dumps({
+        "fanout": True,
+        "tasks": [
+            {"title": "one", "body": "work", "assignee": "engineer", "parents": []},
+            {"title": "two", "body": "work", "assignee": "engineer", "parents": []},
+        ],
+    })
+    calls = 0
+    fail_second = True
+
+    def route(children, selected_workspace, *, fallback_profile):
+        nonlocal calls
+        calls += 1
+        if fail_second and calls == 2:
+            raise RuntimeError("second child rejected")
+        identity = Path(selected_workspace).stat()
+        return [dict(children[0], _workspace_device=identity.st_dev,
+                     _workspace_inode=identity.st_ino)], []
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for item in patches:
+        item.start()
+    try:
+        for _ in range(2):
+            calls = 0
+            with _patch_aux_client(payload), _patch_extra_body(), patch(
+                "hermes_cli.kanban_decompose.route_children_to_capable_profiles",
+                side_effect=route,
+            ):
+                outcome = decomp.decompose_task(tid, author="me")
+            assert outcome.ok is False
+            assert "second child rejected" in outcome.reason
+            listed = subprocess.run(
+                ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+                check=True, capture_output=True, text=True,
+            ).stdout
+            branches = subprocess.run(
+                ["git", "-C", str(repo), "for-each-ref", "--format=%(refname:short)", "refs/heads"],
+                check=True, capture_output=True, text=True,
+            ).stdout.splitlines()
+            assert "preexisting" in branches
+            assert listed.count("worktree ") == 2
+            assert [branch for branch in branches if branch.startswith("wt/")] == [f"wt/{tid}"]
+
+        fail_second = False
+        for publication_result in (ValueError("rejected graph"), None):
+            calls = 0
+            publication_patch = (
+                patch.object(kb, "decompose_triage_task", side_effect=publication_result)
+                if isinstance(publication_result, Exception)
+                else patch.object(kb, "decompose_triage_task", return_value=None)
+            )
+            with _patch_aux_client(payload), _patch_extra_body(), patch(
+                "hermes_cli.kanban_decompose.route_children_to_capable_profiles",
+                side_effect=route,
+            ), publication_patch:
+                outcome = decomp.decompose_task(tid, author="me")
+            assert outcome.ok is False
+            listed = subprocess.run(
+                ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+                check=True, capture_output=True, text=True,
+            ).stdout
+            assert listed.count("worktree ") == 2
+
+        existing_target = repo / ".worktrees" / "preexisting-child"
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "add", "-qb", "wt/preexisting-child", str(existing_target)],
+            check=True,
+        )
+        artifacts = []
+        kb._ensure_git_worktree(
+            repo, existing_target, "wt/preexisting-child",
+            created_artifacts=artifacts,
+        )
+        assert artifacts == []
+        kb._cleanup_created_worktree_artifacts(artifacts)
+        kb._cleanup_created_worktree_artifacts(artifacts)
+        assert existing_target.is_dir()
+        assert kb._git_branch_exists(repo, "wt/preexisting-child")
+
+        subprocess.run(
+            ["git", "-C", str(repo), "branch", "wt/reused-branch"], check=True
+        )
+        reused_target = repo / ".worktrees" / "reused-branch"
+        artifacts = []
+        kb._ensure_git_worktree(
+            repo, reused_target, "wt/reused-branch", created_artifacts=artifacts
+        )
+        assert len(artifacts) == 1 and artifacts[0].created_branch is False
+        kb._cleanup_created_worktree_artifacts(artifacts)
+        assert not reused_target.exists()
+        assert kb._git_branch_exists(repo, "wt/reused-branch")
+    finally:
+        for item in patches:
+            item.stop()
+
+
 def test_decompose_aborts_atomically_when_selected_and_fallback_cannot_mount(
     kanban_home, tmp_path
 ):

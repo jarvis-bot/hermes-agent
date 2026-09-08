@@ -258,6 +258,9 @@ def preflight_workspace_for_profile(
     requested = Path(workspace).expanduser()
     if deadline is None:
         deadline = time.monotonic() + _PROBE_DEADLINE_SECONDS
+    # Preserve semantic provenance even when config loading/policy validation
+    # fails before a runtime can prove availability.
+    reviewer = "reviewer" in profile.lower()
     try:
         if time.monotonic() >= deadline:
             raise TimeoutError("workspace preflight deadline exceeded")
@@ -364,6 +367,7 @@ def preflight_workspace_for_profile(
             profile,
             str(requested),
             reason=str(exc) or type(exc).__name__,
+            reviewer_isolated=reviewer,
         )
 
 
@@ -373,10 +377,14 @@ def cached_preflight_workspace_for_profile(
     """Run/cache one deadline-bounded probe, deduplicating before tree traversal."""
     requested = Path(workspace).expanduser()
     deadline = time.monotonic() + _PROBE_DEADLINE_SECONDS
+    reviewer = "reviewer" in profile.lower()
     try:
         canonical = requested.resolve(strict=True)
         identity = os.stat(canonical, follow_symlinks=False)
         config = _profile_config(profile)
+        reviewer = profile_uses_restricted_reviewer_runtime(
+            profile, profile_config=config
+        )
         config_identity = hashlib.sha256(
             json.dumps(config, sort_keys=True, separators=(",", ":"), default=str).encode()
         ).hexdigest()
@@ -392,6 +400,7 @@ def cached_preflight_workspace_for_profile(
         return WorkspaceCapability(
             False, profile, str(requested),
             reason=f"workspace preflight setup failed: {exc}",
+            reviewer_isolated=reviewer,
         )
 
     with _probe_cache_lock:
@@ -411,6 +420,7 @@ def cached_preflight_workspace_for_profile(
             return WorkspaceCapability(
                 False, profile, str(canonical),
                 reason="workspace preflight deadline exceeded while waiting for identical probe",
+                reviewer_isolated=reviewer,
             )
         with _probe_cache_lock:
             cached = _probe_cache.get(key)
@@ -419,6 +429,7 @@ def cached_preflight_workspace_for_profile(
         return WorkspaceCapability(
             False, profile, str(canonical),
             reason="identical workspace preflight completed without published evidence",
+            reviewer_isolated=reviewer,
         )
 
     try:
@@ -427,7 +438,9 @@ def cached_preflight_workspace_for_profile(
         )
     except Exception as exc:
         result = WorkspaceCapability(
-            False, profile, str(canonical), reason=f"workspace preflight failed: {exc}"
+            False, profile, str(canonical),
+            reason=f"workspace preflight failed: {exc}",
+            reviewer_isolated=reviewer,
         )
     with _probe_cache_lock:
         if len(_probe_cache) >= _PROBE_CACHE_MAX_ENTRIES:
@@ -464,6 +477,11 @@ def route_children_to_capable_profiles(
         selected_capability = capability(selected)
         target = selected
         effective_capability = selected_capability
+        reviewer_isolation_required = bool(
+            child.get("requires_reviewer_isolation")
+            or selected_capability.reviewer_isolated
+            or profile_uses_restricted_reviewer_runtime(selected)
+        )
         if not selected_capability.available:
             failures.append(selected_capability)
             fallback = capability(fallback_profile)
@@ -473,12 +491,8 @@ def route_children_to_capable_profiles(
                     f"({selected_capability.reason}); fallback profile "
                     f"{fallback_profile!r} is unavailable ({fallback.reason})"
                 )
-            if (
-                profile_uses_restricted_reviewer_runtime(selected)
-                and not (
-                    fallback.read_only
-                    and profile_uses_restricted_reviewer_runtime(fallback_profile)
-                )
+            if reviewer_isolation_required and not (
+                fallback.read_only and fallback.reviewer_isolated
             ):
                 raise RuntimeError(
                     f"reviewer profile {selected!r} cannot access workspace and fallback "
@@ -488,10 +502,7 @@ def route_children_to_capable_profiles(
             effective_capability = fallback
         item = dict(child)
         item["assignee"] = target
-        if (
-            profile_uses_restricted_reviewer_runtime(selected)
-            or profile_uses_restricted_reviewer_runtime(target)
-        ):
+        if reviewer_isolation_required or effective_capability.reviewer_isolated:
             item["requires_reviewer_isolation"] = True
         if not workspace_capability_matches(effective_capability, workspace_path):
             raise RuntimeError(

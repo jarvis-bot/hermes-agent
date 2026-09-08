@@ -435,9 +435,12 @@ def decompose_task(
     # Materialize the root workspace before publishing the dependency graph.
     # Scratch tasks and repo-anchored worktrees otherwise carry no exact path,
     # making a capability check either impossible or about the wrong object.
+    root_worktree_artifacts: list[kb._CreatedWorktreeArtifact] = []
     try:
         if task.workspace_kind == "worktree":
-            materialized, branch_name = kb._resolve_worktree_workspace(task)
+            materialized, branch_name = kb._resolve_worktree_workspace(
+                task, created_artifacts=root_worktree_artifacts
+            )
         else:
             materialized = kb.resolve_workspace(task)
             branch_name = None
@@ -451,13 +454,16 @@ def decompose_task(
                     (str(materialized), branch_name, task.id, task.workspace_path),
                 )
             if cur.rowcount != 1:
+                kb._cleanup_created_worktree_artifacts(root_worktree_artifacts)
                 return DecomposeOutcome(
                     task_id, False, "task workspace changed during materialization"
                 )
             task = kb.get_task(conn, task_id)
         if task is None:
+            kb._cleanup_created_worktree_artifacts(root_worktree_artifacts)
             return DecomposeOutcome(task_id, False, "task disappeared during materialization")
     except Exception as exc:
+        kb._cleanup_created_worktree_artifacts(root_worktree_artifacts)
         return DecomposeOutcome(
             task_id, False, f"workspace materialization failed: {exc}"
         )
@@ -466,6 +472,7 @@ def decompose_task(
     # Worktree children need their own durable checkout before graph publication.
     # Allocate stable child IDs now, materialize each exact path from the root's
     # repository anchor, then preflight that final object (not the root checkout).
+    child_worktree_artifacts: list[kb._CreatedWorktreeArtifact] = []
     if task.workspace_kind == "worktree":
         materialized_children: list[dict] = []
         try:
@@ -480,7 +487,9 @@ def decompose_task(
                     status="todo",
                     assignee=str(child.get("assignee") or orchestrator),
                 )
-                child_workspace, resolved_branch = kb._resolve_worktree_workspace(child_task)
+                child_workspace, resolved_branch = kb._resolve_worktree_workspace(
+                    child_task, created_artifacts=child_worktree_artifacts
+                )
                 item = dict(child)
                 item.update({
                     "_id": child_id,
@@ -495,6 +504,7 @@ def decompose_task(
                 unavailable.extend(failures)
             children = materialized_children
         except Exception as exc:
+            kb._cleanup_created_worktree_artifacts(child_worktree_artifacts)
             return DecomposeOutcome(
                 task_id, False, f"child workspace materialization/preflight failed: {exc}"
             )
@@ -539,12 +549,15 @@ def decompose_task(
                 ),
             )
     except ValueError as exc:
+        kb._cleanup_created_worktree_artifacts(child_worktree_artifacts)
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
     except Exception as exc:
+        kb._cleanup_created_worktree_artifacts(child_worktree_artifacts)
         logger.exception("decompose: DB error on task %s", task_id)
         return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
 
     if child_ids is None:
+        kb._cleanup_created_worktree_artifacts(child_worktree_artifacts)
         return DecomposeOutcome(
             task_id, False, "task moved out of triage before decomposition",
         )

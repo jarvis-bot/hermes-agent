@@ -205,6 +205,22 @@ def test_reviewer_mutating_tool_surface_is_rejected(tmp_path: Path) -> None:
     assert "mutating tool surface" in result.reason
 
 
+def test_failed_reviewer_preflight_preserves_isolation_provenance(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    result = preflight_workspace_for_profile(
+        "security-reviewer",
+        workspace,
+        profile_config={"terminal": {"backend": "local"}},
+        runtime_probe=lambda **_: None,
+    )
+
+    assert result.available is False
+    assert result.reviewer_isolated is True
+    assert "Docker terminal backend" in result.reason
+
+
 def test_all_reviewers_unavailable_route_to_capable_fallback(tmp_path: Path) -> None:
     workspace = tmp_path / "repo"
     workspace.mkdir()
@@ -222,6 +238,7 @@ def test_all_reviewers_unavailable_route_to_capable_fallback(tmp_path: Path) -> 
             read_only=True,
             device=workspace.stat().st_dev,
             inode=workspace.stat().st_ino,
+            reviewer_isolated=profile == "fallback-reviewer",
         )
 
     routed, failures = route_children_to_capable_profiles(
@@ -257,6 +274,7 @@ def test_partial_reviewer_availability_preserves_capable_assignment(tmp_path: Pa
             read_only="reviewer" in profile,
             device=workspace.stat().st_dev,
             inode=workspace.stat().st_ino,
+            reviewer_isolated="reviewer" in profile,
         )
 
     routed, failures = route_children_to_capable_profiles(
@@ -287,6 +305,7 @@ def test_reviewer_fallback_marks_child_for_durable_isolation(tmp_path: Path) -> 
             read_only=profile == "quality-reviewer",
             device=identity.st_dev,
             inode=identity.st_ino,
+            reviewer_isolated=profile == "quality-reviewer",
         )
 
     routed, _ = route_children_to_capable_profiles(

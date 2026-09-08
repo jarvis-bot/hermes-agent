@@ -251,38 +251,46 @@ def _sanitize_label_value(value: str) -> str:
     return f"{prefix}-{digest}"
 
 
+_READONLY_TREE_DIGEST_DOMAIN = b"hermes-readonly-tree-v2"
+
+
+def _update_framed_digest(digest, value: bytes) -> None:
+    """Append one unambiguous canonical field to a tree digest."""
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)
+
+
 def _readonly_tree_digest(
     root: Path, *, include_root_mode: bool = True, deadline: Optional[float] = None
 ) -> str:
     """Hash a complete read-only source tree without following symlinks.
 
-    Permission bits are part of the identity because Git tracks the executable
-    bit and reviewers must not reuse a container across a mode-only change.
-    Any traversal/read error propagates so an unauthenticated workspace can
-    never collapse onto a shared reusable label.
+    Every node is a domain-separated sequence of length-framed fields. Regular
+    file bytes are represented by their own SHA-256, so content can be streamed
+    without allowing one file's bytes to impersonate later path records.
     """
     digest = hashlib.sha256()
+    _update_framed_digest(digest, _READONLY_TREE_DIGEST_DOMAIN)
     if root.is_file():
         paths = [root]
     else:
         paths = sorted(root.rglob("*"))
-    # Include the source object itself as well as its descendants.  ``lstat``
-    # deliberately authenticates symlinks rather than their targets.
     for path in [root, *paths] if paths != [root] else paths:
         _check_review_deadline(deadline)
         relative = "." if path == root else path.relative_to(root).as_posix()
-        digest.update(relative.encode("utf-8", errors="surrogateescape"))
-        digest.update(b"\0")
         path_stat = path.lstat()
-        if include_root_mode or path != root:
-            digest.update(f"{stat.S_IMODE(path_stat.st_mode):04o}".encode("ascii"))
-        digest.update(b"\0")
+        relative_bytes = relative.encode("utf-8", errors="surrogateescape")
+        mode_bytes = (
+            f"{stat.S_IMODE(path_stat.st_mode):04o}".encode("ascii")
+            if include_root_mode or path != root else b""
+        )
         mode = path_stat.st_mode
         if stat.S_ISLNK(mode):
-            digest.update(b"L")
-            digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+            kind = b"L"
+            payload = os.readlink(path).encode("utf-8", errors="surrogateescape")
         elif stat.S_ISREG(mode):
-            digest.update(b"F")
+            kind = b"F"
+            file_digest = hashlib.sha256()
             flags = (
                 os.O_RDONLY
                 | getattr(os, "O_NOFOLLOW", 0)
@@ -301,14 +309,17 @@ def _readonly_tree_digest(
                     )
                 while chunk := os.read(descriptor, 1024 * 1024):
                     _check_review_deadline(deadline)
-                    digest.update(chunk)
+                    file_digest.update(chunk)
             finally:
                 os.close(descriptor)
+            payload = file_digest.digest()
         elif stat.S_ISDIR(mode):
-            digest.update(b"D")
+            kind = b"D"
+            payload = b""
         else:
             raise ValueError(f"unsupported filesystem node in read-only workspace: {path}")
-        digest.update(b"\0")
+        for field in (relative_bytes, mode_bytes, kind, payload):
+            _update_framed_digest(digest, field)
     return digest.hexdigest()
 
 
@@ -369,28 +380,28 @@ import hashlib, os, stat, sys
 from pathlib import Path
 root = Path(sys.argv[1])
 digest = hashlib.sha256()
+def frame(value):
+    digest.update(len(value).to_bytes(8, 'big')); digest.update(value)
+frame(b'hermes-readonly-tree-v2')
 paths = [root] if not root.is_dir() else [root, *sorted(root.rglob("*"))]
 for path in paths:
     relative = "." if path == root else path.relative_to(root).as_posix()
-    digest.update(relative.encode("utf-8", errors="surrogateescape"))
-    digest.update(b"\0")
-    if path != root:
-        digest.update(f"{stat.S_IMODE(path.lstat().st_mode):04o}".encode("ascii"))
-    digest.update(b"\0")
+    relative_bytes = relative.encode("utf-8", errors="surrogateescape")
+    mode_bytes = (b'' if path == root else f"{stat.S_IMODE(path.lstat().st_mode):04o}".encode("ascii"))
     mode = path.lstat().st_mode
     if stat.S_ISLNK(mode):
-        digest.update(b"L")
-        digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+        kind = b'L'; payload = os.readlink(path).encode("utf-8", errors="surrogateescape")
     elif stat.S_ISREG(mode):
-        digest.update(b"F")
+        kind = b'F'; file_digest = hashlib.sha256()
         with path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
+                file_digest.update(chunk)
+        payload = file_digest.digest()
     elif stat.S_ISDIR(mode):
-        digest.update(b"D")
+        kind = b'D'; payload = b''
     else:
         raise ValueError(f"unsupported filesystem node in read-only workspace: {path}")
-    digest.update(b"\0")
+    for field in (relative_bytes, mode_bytes, kind, payload): frame(field)
 print(digest.hexdigest())
 '''
     failures: list[str] = []
@@ -1486,19 +1497,23 @@ with tarfile.open(fileobj=sys.stdin.buffer, mode='r|*') as archive:
         if member.isfile() or member.isdir():
             os.chmod(root / member.name, member.mode & 0o777)
 digest = hashlib.sha256()
+def frame(value):
+    digest.update(len(value).to_bytes(8, 'big')); digest.update(value)
+frame(b'hermes-readonly-tree-v2')
 for path in [root, *sorted(root.rglob('*'))]:
     relative = '.' if path == root else path.relative_to(root).as_posix()
-    digest.update(relative.encode('utf-8', errors='surrogateescape')); digest.update(b'\0')
-    if path != root: digest.update(f'{stat.S_IMODE(path.lstat().st_mode):04o}'.encode('ascii'))
-    digest.update(b'\0'); mode = path.lstat().st_mode
-    if stat.S_ISLNK(mode): digest.update(b'L'); digest.update(os.readlink(path).encode('utf-8', errors='surrogateescape'))
+    relative_bytes = relative.encode('utf-8', errors='surrogateescape')
+    mode_bytes = b'' if path == root else f'{stat.S_IMODE(path.lstat().st_mode):04o}'.encode('ascii')
+    mode = path.lstat().st_mode
+    if stat.S_ISLNK(mode): kind = b'L'; payload = os.readlink(path).encode('utf-8', errors='surrogateescape')
     elif stat.S_ISREG(mode):
-        digest.update(b'F')
+        kind = b'F'; file_digest = hashlib.sha256()
         with path.open('rb') as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b''): digest.update(chunk)
-    elif stat.S_ISDIR(mode): digest.update(b'D')
+            for chunk in iter(lambda: handle.read(1024 * 1024), b''): file_digest.update(chunk)
+        payload = file_digest.digest()
+    elif stat.S_ISDIR(mode): kind = b'D'; payload = b''
     else: raise ValueError(f'unsupported filesystem node: {path}')
-    digest.update(b'\0')
+    for field in (relative_bytes, mode_bytes, kind, payload): frame(field)
 print(digest.hexdigest())
 '''
         populate_name = f"{volume}-populate"

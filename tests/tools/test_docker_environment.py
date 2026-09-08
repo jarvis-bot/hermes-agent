@@ -1,8 +1,10 @@
+import hashlib
 import logging
 from io import BytesIO, StringIO
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tarfile
 
@@ -1294,6 +1296,48 @@ def test_materialize_reviewer_rejects_content_changed_since_dispatch_preflight(
             disposable=True,
         )
     assert archive.closed
+
+
+def test_readonly_digest_length_framing_rejects_structural_collision(tmp_path):
+    original = tmp_path / "original"
+    crafted = tmp_path / "crafted"
+    original.mkdir()
+    crafted.mkdir()
+    (original / "a").write_bytes(b"X")
+    (original / "b").write_bytes(b"Y")
+    # This single crafted ``a`` record authenticates as the two records above
+    # under the legacy raw concatenation protocol.
+    (crafted / "a").write_bytes(b"X\x00b\x000644\x00FY")
+
+    def legacy_digest(root):
+        digest = hashlib.sha256()
+        for path in sorted(root.rglob("*")):
+            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(f"{stat.S_IMODE(path.lstat().st_mode):04o}".encode("ascii"))
+            digest.update(b"\0F")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    assert legacy_digest(original) == legacy_digest(crafted)
+    original_digest = docker_env._readonly_tree_digest(
+        original, include_root_mode=False
+    )
+    assert original_digest != docker_env._readonly_tree_digest(
+        crafted, include_root_mode=False
+    )
+
+    with pytest.raises(ValueError, match="changed after dispatcher preflight"):
+        docker_env._materialize_readonly_workspace(
+            "docker",
+            "image",
+            str(crafted),
+            {"tree_metadata_sha256": docker_env._readonly_tree_metadata_digest(crafted)},
+            None,
+            original_digest,
+            disposable=True,
+        )
 
 
 def test_materialize_reviewer_overrides_image_entrypoint(monkeypatch, tmp_path):
