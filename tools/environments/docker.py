@@ -49,6 +49,7 @@ _WORKSPACE_LABEL_KEY = "hermes-workspace"
 _TMP_STORAGE_LABEL_KEY = "hermes-tmp-storage"
 _POLICY_LABEL_KEY = "hermes-policy"
 _MAX_REVIEW_WORKSPACE_NODES = 100_000
+_MAX_REVIEW_WORKSPACE_FILES = 100_000
 _MAX_REVIEW_WORKSPACE_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_REVIEW_GIT_OBJECT_BYTES = 512 * 1024 * 1024
 _MAX_REVIEW_LOOSE_OBJECT_COMPRESSED_BYTES = 128 * 1024 * 1024
@@ -260,8 +261,42 @@ def _update_framed_digest(digest, value: bytes) -> None:
     digest.update(value)
 
 
+def _bounded_tree_inventory(
+    root: Path, *, deadline: Optional[float] = None
+) -> list[Path]:
+    """Collect a sortable tree inventory while enforcing bounds incrementally."""
+    _check_review_deadline(deadline)
+    if root.is_file():
+        return [root]
+    paths: list[Path] = [root]
+    nodes = files = total_bytes = 0
+    iterator = root.rglob("*")
+    while True:
+        _check_review_deadline(deadline)
+        try:
+            path = next(iterator)
+        except StopIteration:
+            break
+        _check_review_deadline(deadline)
+        nodes += 1
+        if nodes > _MAX_REVIEW_WORKSPACE_NODES:
+            raise ValueError("reviewer workspace exceeds reviewer node limit")
+        info = path.lstat()
+        if stat.S_ISREG(info.st_mode):
+            files += 1
+            if files > _MAX_REVIEW_WORKSPACE_FILES:
+                raise ValueError("reviewer workspace exceeds reviewer file limit")
+            total_bytes += info.st_size
+            if total_bytes > _MAX_REVIEW_WORKSPACE_BYTES:
+                raise ValueError("reviewer workspace exceeds reviewer byte limit")
+        paths.append(path)
+    _check_review_deadline(deadline)
+    return [root, *sorted(paths[1:])]
+
+
 def _readonly_tree_digest(
-    root: Path, *, include_root_mode: bool = True, deadline: Optional[float] = None
+    root: Path, *, include_root_mode: bool = True, deadline: Optional[float] = None,
+    _inventory: Optional[list[Path]] = None,
 ) -> str:
     """Hash a complete read-only source tree without following symlinks.
 
@@ -271,11 +306,8 @@ def _readonly_tree_digest(
     """
     digest = hashlib.sha256()
     _update_framed_digest(digest, _READONLY_TREE_DIGEST_DOMAIN)
-    if root.is_file():
-        paths = [root]
-    else:
-        paths = sorted(root.rglob("*"))
-    for path in [root, *paths] if paths != [root] else paths:
+    paths = _inventory or _bounded_tree_inventory(root, deadline=deadline)
+    for path in paths:
         _check_review_deadline(deadline)
         relative = "." if path == root else path.relative_to(root).as_posix()
         path_stat = path.lstat()
@@ -324,11 +356,12 @@ def _readonly_tree_digest(
 
 
 def _readonly_tree_metadata_digest(
-    root: Path, *, deadline: Optional[float] = None
+    root: Path, *, deadline: Optional[float] = None,
+    _inventory: Optional[list[Path]] = None,
 ) -> str:
     """Hash mutation-sensitive tree metadata without rereading file contents."""
     digest = hashlib.sha256()
-    paths = [root] if root.is_file() else [root, *sorted(root.rglob("*"))]
+    paths = _inventory or _bounded_tree_inventory(root, deadline=deadline)
     for path in paths:
         _check_review_deadline(deadline)
         relative = "." if path == root else path.relative_to(root).as_posix()
@@ -346,7 +379,8 @@ def _readonly_tree_metadata_digest(
 
 
 def _authenticated_tree_digests(
-    root: Path, *, deadline: Optional[float] = None
+    root: Path, *, deadline: Optional[float] = None,
+    _inventory: Optional[list[Path]] = None,
 ) -> tuple[str, str, str]:
     """Return content and metadata digests from one stable authentication window.
 
@@ -354,12 +388,18 @@ def _authenticated_tree_digests(
     it is being authenticated is rejected rather than producing an identity
     assembled from two different tree states.
     """
-    metadata_before = _readonly_tree_metadata_digest(root, deadline=deadline)
-    content = _readonly_tree_digest(root, deadline=deadline)
-    mounted_content = _readonly_tree_digest(
-        root, include_root_mode=False, deadline=deadline
+    inventory = _inventory or _bounded_tree_inventory(root, deadline=deadline)
+    metadata_before = _readonly_tree_metadata_digest(
+        root, deadline=deadline, _inventory=inventory
     )
-    metadata_after = _readonly_tree_metadata_digest(root, deadline=deadline)
+    content = _readonly_tree_digest(root, deadline=deadline, _inventory=inventory)
+    mounted_content = _readonly_tree_digest(
+        root, include_root_mode=False, deadline=deadline, _inventory=inventory
+    )
+    after_inventory = _bounded_tree_inventory(root, deadline=deadline)
+    metadata_after = _readonly_tree_metadata_digest(
+        root, deadline=deadline, _inventory=after_inventory
+    )
     if metadata_before != metadata_after:
         raise ValueError(f"read-only workspace changed during authentication: {root}")
     return content, mounted_content, metadata_after
@@ -923,13 +963,17 @@ def _readonly_workspace_archive(
         )
 
     try:
-        mounted_digest = _authenticated_tree_digests(
+        archive_inventory = _bounded_tree_inventory(
             archive_root, deadline=provenance_deadline
+        )
+        mounted_digest = _authenticated_tree_digests(
+            archive_root, deadline=provenance_deadline,
+            _inventory=archive_inventory,
         )[1]
         archive_file = tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024)
         try:
             with tarfile.open(fileobj=archive_file, mode="w") as archive:
-                for path in sorted(archive_root.rglob("*")):
+                for path in archive_inventory[1:]:
                     _check_review_deadline(provenance_deadline)
                     path_stat = path.lstat()
                     mode = path_stat.st_mode
@@ -984,18 +1028,7 @@ def _enforce_reviewer_workspace_bounds(
     root: Path, *, deadline: Optional[float] = None
 ) -> None:
     """Bound candidate-controlled host work before reviewer isolation exists."""
-    nodes = 0
-    total_bytes = 0
-    for path in root.rglob("*"):
-        _check_review_deadline(deadline)
-        nodes += 1
-        if nodes > _MAX_REVIEW_WORKSPACE_NODES:
-            raise ValueError("reviewer workspace exceeds reviewer node limit")
-        stat_result = path.lstat()
-        if stat.S_ISREG(stat_result.st_mode):
-            total_bytes += stat_result.st_size
-            if total_bytes > _MAX_REVIEW_WORKSPACE_BYTES:
-                raise ValueError("reviewer workspace exceeds reviewer byte limit")
+    _bounded_tree_inventory(root, deadline=deadline)
 
 
 def _validated_loose_git_object_bytes(

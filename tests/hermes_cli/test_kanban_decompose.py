@@ -468,6 +468,79 @@ def test_worktree_decomposition_rolls_back_new_children_after_repeated_second_fa
             item.stop()
 
 
+def test_ensure_git_worktree_rejects_ordinary_directory_inside_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "base.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    target = repo / ".worktrees" / "collision"
+    target.mkdir(parents=True)
+
+    with pytest.raises(RuntimeError, match="already exists.*registered worktree"):
+        kb._ensure_git_worktree(repo, target, "wt/collision", created_artifacts=[])
+
+    assert not (target / ".git").exists()
+    assert not kb._git_branch_exists(repo, "wt/collision")
+
+
+def test_worktree_decomposition_promotion_failure_rolls_back_graph_and_artifacts(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "base.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="fan out", triage=True, assignee="orchestrator",
+            workspace_kind="worktree", workspace_path=str(repo),
+        )
+    payload = jsonlib.dumps({
+        "fanout": True,
+        "tasks": [{"title": "child", "body": "work", "assignee": "engineer", "parents": []}],
+    })
+
+    def route(children, selected_workspace, *, fallback_profile):
+        identity = Path(selected_workspace).stat()
+        return [dict(children[0], _workspace_device=identity.st_dev,
+                     _workspace_inode=identity.st_ino)], []
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for item in patches:
+        item.start()
+    try:
+        with _patch_aux_client(payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose.route_children_to_capable_profiles",
+            side_effect=route,
+        ), patch.object(kb, "recompute_ready", side_effect=RuntimeError("promotion failed")):
+            outcome = decomp.decompose_task(task_id, author="me")
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert outcome.ok is False
+    with kb.connect() as conn:
+        root = kb.get_task(conn, task_id)
+        child_count = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE id != ?", (task_id,)
+        ).fetchone()[0]
+    assert root is not None and root.status == "triage"
+    assert child_count == 0
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"], check=True,
+        capture_output=True, text=True,
+    ).stdout
+    assert listed.count("worktree ") == 2  # main checkout + persistent root worktree
+
+
 def test_decompose_aborts_atomically_when_selected_and_fallback_cannot_mount(
     kanban_home, tmp_path
 ):

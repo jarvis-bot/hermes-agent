@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import contextlib
 import concurrent.futures
+import errno
 import hashlib
 import json
 import os
@@ -6612,13 +6613,12 @@ def decompose_triage_task(
             },
         )
 
-    # Outside the write_txn: promote parent-free children to 'ready'
-    # so the dispatcher picks them up on its next tick. Same pattern
-    # specify_triage_task uses.  When auto_promote is False children
-    # stay in 'todo' until the user manually promotes them — useful
-    # for manual-review-first workflows.
-    if auto_promote:
-        recompute_ready(conn)
+        # Publication and initial promotion are one transaction. A promotion
+        # failure must not leave durable children pointing at artifacts that
+        # the caller still owns and will roll back.
+        if auto_promote:
+            recompute_ready(conn)
+
     return child_ids
 
 
@@ -6840,6 +6840,13 @@ class _CreatedWorktreeArtifact:
     created_branch: bool
 
 
+@dataclass(frozen=True)
+class _CreatedReviewSnapshotArtifact:
+    target: Path
+    device: int
+    inode: int
+
+
 def _cleanup_created_worktree_artifacts(
     artifacts: list[_CreatedWorktreeArtifact],
 ) -> None:
@@ -6865,6 +6872,62 @@ def _cleanup_created_worktree_artifacts(
                 pass
 
 
+def _cleanup_created_review_snapshots(
+    artifacts: list[_CreatedReviewSnapshotArtifact],
+) -> None:
+    """Remove only snapshot directory objects installed by this attempt."""
+    for artifact in reversed(artifacts):
+        try:
+            current = artifact.target.lstat()
+            if (
+                stat.S_ISDIR(current.st_mode)
+                and (current.st_dev, current.st_ino) == (artifact.device, artifact.inode)
+            ):
+                shutil.rmtree(artifact.target)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            _log.warning("immutable reviewer snapshot cleanup failed: %s", exc)
+
+
+def _is_exact_registered_worktree(
+    repo_root: Path, target: Path, branch_name: str
+) -> bool:
+    """Require *target* itself (not an ancestor) to be the registered checkout."""
+    try:
+        target_resolved = target.resolve(strict=True)
+    except OSError:
+        return False
+    if not (target_resolved / ".git").exists():
+        return False
+    if _git_toplevel(target_resolved) != target_resolved:
+        return False
+    repo_common = _git_common_dir(repo_root)
+    if repo_common is None or _git_common_dir(target_resolved) != repo_common:
+        return False
+    if _git_current_branch(target_resolved) != branch_name:
+        return False
+    try:
+        listed = subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "list", "--porcelain", "-z"],
+            capture_output=True, text=True, encoding="utf-8", errors="surrogateescape",
+            timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if listed.returncode != 0:
+        return False
+    expected_ref = f"branch refs/heads/{branch_name}"
+    for record in listed.stdout.split("\0\0"):
+        lines = record.split("\0")
+        if not lines or not lines[0].startswith("worktree "):
+            continue
+        registered = Path(lines[0][len("worktree "):]).resolve(strict=False)
+        if registered == target_resolved:
+            return expected_ref in lines
+    return False
+
+
 def _ensure_git_worktree(
     repo_root: Path,
     target: Path,
@@ -6875,10 +6938,12 @@ def _ensure_git_worktree(
     """Materialize ``target`` and optionally record only newly created artifacts."""
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
-    if target.exists() and repo_common is not None:
-        target_common = _git_common_dir(target)
-        if target_common == repo_common:
+    if target.exists():
+        if _is_exact_registered_worktree(repo_root, target, branch_name):
             return
+        raise RuntimeError(
+            f"worktree target {target} already exists but is not the expected registered worktree"
+        )
     branch_existed = _git_branch_exists(repo_root, branch_name)
     target.parent.mkdir(parents=True, exist_ok=True)
     if branch_existed:
@@ -6900,7 +6965,7 @@ def _ensure_git_worktree(
         created_worktree = bool(
             repo_common is not None
             and target.exists()
-            and _git_common_dir(target) == repo_common
+            and _is_exact_registered_worktree(repo_root, target, branch_name)
         )
         created_branch = (
             not branch_existed
@@ -7057,8 +7122,28 @@ def _trusted_review_repository(task: Task, workspace: Path, *, board: Optional[s
     raise RuntimeError("immutable reviewer snapshot has no trusted repository anchor")
 
 
+def _read_bounded_git_marker(path: Path, *, maximum_bytes: int = 16 * 1024) -> str:
+    """Read small Git pointer metadata without following a substituted symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > maximum_bytes:
+            raise RuntimeError("immutable reviewer snapshot has invalid Git metadata")
+        data = os.read(descriptor, maximum_bytes + 1)
+        if len(data) > maximum_bytes:
+            raise RuntimeError("immutable reviewer snapshot has invalid Git metadata")
+        return data.decode("utf-8", errors="strict")
+    finally:
+        os.close(descriptor)
+
+
 def _materialize_immutable_review_snapshot(
-    task: Task, workspace: Path, *, board: Optional[str] = None
+    task: Task,
+    workspace: Path,
+    *,
+    board: Optional[str] = None,
+    created_artifacts: Optional[list[_CreatedReviewSnapshotArtifact]] = None,
 ) -> tuple[Path, Optional[str]]:
     """Turn a linked worktree into a standalone exact-commit review checkout."""
     git_entry = workspace / ".git"
@@ -7067,10 +7152,10 @@ def _materialize_immutable_review_snapshot(
     trusted_root = _trusted_review_repository(task, workspace, board=board)
     trusted_common = (trusted_root / ".git").resolve(strict=True)
     try:
-        marker = git_entry.read_text(encoding="utf-8", errors="strict")
-    except OSError as exc:
+        marker = _read_bounded_git_marker(git_entry)
+    except (OSError, UnicodeError) as exc:
         raise RuntimeError("immutable reviewer snapshot cannot read Git metadata") from exc
-    if len(marker.encode("utf-8")) > 16 * 1024 or not marker.strip().startswith("gitdir:"):
+    if not marker.strip().startswith("gitdir:"):
         raise RuntimeError("immutable reviewer snapshot has invalid Git metadata")
     git_dir_text = marker.strip()[7:].strip()
     if not git_dir_text:
@@ -7080,9 +7165,11 @@ def _materialize_immutable_review_snapshot(
         raise RuntimeError("immutable reviewer snapshot Git metadata escapes trusted repository")
     commondir = candidate_git_dir / "commondir"
     try:
-        candidate_common = (candidate_git_dir / commondir.read_text(encoding="utf-8").strip()).resolve(strict=True)
-        registered_workspace = (candidate_git_dir / "gitdir").read_text(encoding="utf-8").strip()
-    except OSError as exc:
+        candidate_common = (
+            candidate_git_dir / _read_bounded_git_marker(commondir).strip()
+        ).resolve(strict=True)
+        registered_workspace = _read_bounded_git_marker(candidate_git_dir / "gitdir").strip()
+    except (OSError, UnicodeError) as exc:
         raise RuntimeError("immutable reviewer snapshot has incomplete Git metadata") from exc
     if candidate_common != trusted_common or Path(registered_workspace).resolve(strict=False) != git_entry.resolve(strict=False):
         raise RuntimeError("immutable reviewer snapshot Git metadata is not bound to trusted repository")
@@ -7124,44 +7211,86 @@ def _materialize_immutable_review_snapshot(
     target_root = workspaces_root(board=board) / ".review-snapshots"
     target_root.mkdir(parents=True, exist_ok=True)
     target = target_root / f"{task.id}-{commit[:12]}"
+    from tools.environments.docker import (
+        _enforce_reviewer_workspace_bounds,
+        _verify_git_workspace_provenance,
+    )
+
+    def validate_snapshot(candidate: Path) -> None:
+        try:
+            _enforce_reviewer_workspace_bounds(candidate, deadline=deadline)
+            _verify_git_workspace_provenance(candidate, commit, deadline=deadline)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                "existing immutable reviewer snapshot has wrong provenance or content"
+            ) from exc
+
+    quarantine: Optional[Path] = None
     if target.exists():
-        from tools.environments.docker import _path_identity
-        existing = _path_identity(
-            str(target), content_digest=True, deadline=deadline
-        )
-        if existing.get("git_ref") != commit:
-            raise RuntimeError("existing immutable reviewer snapshot has wrong provenance")
-        return target, authoritative_commit
+        try:
+            validate_snapshot(target)
+            return target, authoritative_commit
+        except RuntimeError:
+            quarantine = target.with_name(
+                f".{target.name}.invalid-{secrets.token_hex(8)}"
+            )
+            try:
+                target.rename(quarantine)
+            except FileNotFoundError:
+                # Another materializer moved the invalid checkout. Accept only
+                # a winner that has since installed an authenticated snapshot.
+                if target.exists():
+                    validate_snapshot(target)
+                    return target, authoritative_commit
+            except OSError as exc:
+                raise RuntimeError(
+                    "invalid immutable reviewer snapshot cannot be replaced atomically"
+                ) from exc
 
     staging = Path(tempfile.mkdtemp(prefix=f".{task.id}-", dir=target_root))
     try:
         run_git(["init", "--quiet", str(staging)])
         source_url = trusted_root.as_uri()
+        # Fetch the complete ancestry reachable from the assigned commit. The
+        # reviewer runtime deliberately rejects shallow/incomplete history, so
+        # a depth-one snapshot cannot satisfy the final provenance contract.
         run_git([
             "-C", str(staging), "-c", "protocol.file.allow=always",
-            "fetch", "--quiet", "--no-tags", "--depth=1", source_url, commit,
+            "fetch", "--quiet", "--no-tags", source_url, commit,
         ])
         run_git([
             "-C", str(staging), "-c", f"core.hooksPath={os.devnull}",
             "checkout", "--quiet", "--detach", commit,
         ])
-        from tools.environments.docker import (
-            _enforce_reviewer_workspace_bounds,
-            _path_identity,
-        )
         _enforce_reviewer_workspace_bounds(staging, deadline=deadline)
-        snapshot_identity = _path_identity(
-            str(staging), content_digest=True, deadline=deadline
-        )
-        if snapshot_identity.get("git_ref") != commit:
-            raise RuntimeError("immutable reviewer snapshot provenance mismatch")
+        validate_snapshot(staging)
+        installed = False
         try:
             staging.rename(target)
-        except FileExistsError:
-            pass
+            installed = True
+        except OSError as exc:
+            if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                raise
+            validate_snapshot(target)
+        validate_snapshot(target)
+        if installed and created_artifacts is not None:
+            installed_stat = target.stat(follow_symlinks=False)
+            created_artifacts.append(_CreatedReviewSnapshotArtifact(
+                target=target,
+                device=installed_stat.st_dev,
+                inode=installed_stat.st_ino,
+            ))
+        if quarantine is not None:
+            shutil.rmtree(quarantine, ignore_errors=True)
+            quarantine = None
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
+        if quarantine is not None and quarantine.exists() and not target.exists():
+            try:
+                quarantine.rename(target)
+            except OSError:
+                pass
     return target, authoritative_commit
 
 
@@ -9010,6 +9139,8 @@ def _materialize_dispatch_workspace_candidates(
         task = get_task(conn, row["id"])
         if task is None or task.status != row["status"]:
             continue
+        worktree_artifacts: list[_CreatedWorktreeArtifact] = []
+        snapshot_artifacts: list[_CreatedReviewSnapshotArtifact] = []
         try:
             resolved_branch = task.branch_name
             resolved_kind = task.workspace_kind
@@ -9021,19 +9152,24 @@ def _materialize_dispatch_workspace_candidates(
                 workspace = Path(task.workspace_path).resolve(strict=True)
                 resolved_branch = task.branch_name
             elif task.workspace_kind == "worktree":
-                workspace, resolved_branch = _resolve_worktree_workspace(task, board=board)
+                workspace, resolved_branch = _resolve_worktree_workspace(
+                    task, board=board, created_artifacts=worktree_artifacts
+                )
                 workspace = Path(workspace).resolve(strict=True)
             else:
                 workspace = Path(resolve_workspace(task, board=board)).resolve(strict=True)
             if task.status == "review":
                 workspace, snapshot_sha = _materialize_immutable_review_snapshot(
-                    task, workspace, board=board
+                    task, workspace, board=board,
+                    created_artifacts=snapshot_artifacts,
                 )
                 if snapshot_sha is not None:
                     resolved_kind = "dir"
                     resolved_branch = None
                     resolved_expected_sha = snapshot_sha
         except Exception as exc:
+            _cleanup_created_review_snapshots(snapshot_artifacts)
+            _cleanup_created_worktree_artifacts(worktree_artifacts)
             _log.warning(
                 "kanban workspace preparation failed for task %s: %s", task.id, exc
             )
@@ -9043,14 +9179,24 @@ def _materialize_dispatch_workspace_candidates(
                 "UPDATE tasks SET workspace_path = ?, branch_name = ?, "
                 "workspace_kind = ?, expected_workspace_sha = ? "
                 "WHERE id = ? AND status = ? AND claim_lock IS NULL "
-                "AND assignee IS ? AND workspace_path IS ?",
+                "AND assignee IS ? AND workspace_path IS ? "
+                "AND expected_workspace_sha IS ?",
                 (
                     str(workspace), resolved_branch, resolved_kind,
                     resolved_expected_sha, task.id, task.status,
-                    task.assignee, task.workspace_path,
+                    task.assignee, task.workspace_path, task.expected_workspace_sha,
                 ),
             )
         if cur.rowcount != 1:
+            current = get_task(conn, task.id)
+            artifacts_were_published = bool(
+                current is not None
+                and current.workspace_path == str(workspace)
+                and current.expected_workspace_sha == resolved_expected_sha
+            )
+            if not artifacts_were_published:
+                _cleanup_created_review_snapshots(snapshot_artifacts)
+                _cleanup_created_worktree_artifacts(worktree_artifacts)
             continue
         refreshed = get_task(conn, task.id)
         if refreshed is not None:

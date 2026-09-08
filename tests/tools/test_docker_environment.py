@@ -1045,6 +1045,56 @@ def test_reviewer_workspace_bounds_enforce_shared_provenance_deadline(tmp_path):
         )
 
 
+def test_tree_inventory_checks_deadline_while_slow_iterator_is_consumed(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    entries = []
+    for index in range(3):
+        entry = project_dir / f"{index}.txt"
+        entry.write_text("x", encoding="utf-8")
+        entries.append(entry)
+    original_rglob = docker_env.Path.rglob
+
+    def slow_rglob(path, pattern):
+        if path != project_dir:
+            return original_rglob(path, pattern)
+
+        def generate():
+            for entry in entries:
+                docker_env.time.sleep(0.06)
+                yield entry
+
+        return generate()
+
+    monkeypatch.setattr(docker_env.Path, "rglob", slow_rglob)
+    started = docker_env.time.monotonic()
+    with pytest.raises(ValueError, match="exceeded its deadline"):
+        docker_env._readonly_tree_digest(
+            project_dir, deadline=started + 0.04
+        )
+    assert docker_env.time.monotonic() - started < 0.14
+
+
+def test_tree_inventory_enforces_node_limit_before_sorting(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    entries = []
+    for index in range(3):
+        entry = project_dir / f"{index}.txt"
+        entry.write_text("x", encoding="utf-8")
+        entries.append(entry)
+    monkeypatch.setattr(docker_env, "_MAX_REVIEW_WORKSPACE_NODES", 2)
+    monkeypatch.setattr(
+        docker_env.Path, "rglob",
+        lambda path, _pattern: iter(entries) if path == project_dir else iter(()),
+    )
+
+    with pytest.raises(ValueError, match="node limit"):
+        docker_env._readonly_tree_metadata_digest(project_dir)
+
+
 def test_tree_authentication_rejects_regular_file_swapped_to_fifo(
     monkeypatch, tmp_path
 ):
