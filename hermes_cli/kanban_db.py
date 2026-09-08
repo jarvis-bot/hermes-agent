@@ -78,6 +78,7 @@ import re
 import random
 import secrets
 import shutil
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -884,6 +885,9 @@ class Task:
     tenant: Optional[str]
     branch_name: Optional[str] = None
     expected_workspace_sha: Optional[str] = None
+    # Durable provenance for review tasks.  Unlike assignee-name inference,
+    # this survives capability fallback to an orchestrator/default profile.
+    requires_reviewer_isolation: bool = False
     project_id: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
@@ -981,6 +985,11 @@ class Task:
                 row["expected_workspace_sha"]
                 if "expected_workspace_sha" in keys
                 else None
+            ),
+            requires_reviewer_isolation=(
+                bool(row["requires_reviewer_isolation"])
+                if "requires_reviewer_isolation" in keys
+                else False
             ),
             project_id=row["project_id"] if "project_id" in keys else None,
             claim_lock=row["claim_lock"],
@@ -1186,6 +1195,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     workspace_path       TEXT,
     branch_name          TEXT,
     expected_workspace_sha TEXT,
+    -- Security provenance survives capability reassignment away from a profile
+    -- whose name/config identifies it as a reviewer.
+    requires_reviewer_isolation INTEGER NOT NULL DEFAULT 0,
     -- Optional link to a first-class Project (hermes_cli/projects_db). When set,
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
@@ -2340,6 +2352,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "expected_workspace_sha",
             "expected_workspace_sha TEXT",
         )
+    if "requires_reviewer_isolation" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "requires_reviewer_isolation",
+            "requires_reviewer_isolation INTEGER NOT NULL DEFAULT 0",
+        )
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
     if "idempotency_key" not in cols:
@@ -3176,6 +3195,7 @@ def create_task(
     workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None,
     expected_workspace_sha: Optional[str] = None,
+    requires_reviewer_isolation: bool = False,
     tenant: Optional[str] = None,
     priority: int = 0,
     parents: Iterable[str] = (),
@@ -3487,12 +3507,13 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, expected_workspace_sha, project_id, tenant,
+                        branch_name, expected_workspace_sha,
+                        requires_reviewer_isolation, project_id, tenant,
                         idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3507,6 +3528,7 @@ def create_task(
                         workspace_path,
                         branch_name,
                         expected_workspace_sha,
+                        1 if requires_reviewer_isolation else 0,
                         project_id,
                         tenant,
                         idempotency_key,
@@ -6435,6 +6457,35 @@ def decompose_triage_task(
         root_ws_path = root_row["workspace_path"]
         root_expected_sha = root_row["expected_workspace_sha"]
 
+        # Bind decomposition to the filesystem objects proved by the runtime
+        # canaries, not merely to pathname strings. All preflighted children
+        # inherit this same root object; any missing/mismatched attestation
+        # aborts before the first child row is inserted.
+        attestations = [
+            (child.get("_workspace_device"), child.get("_workspace_inode"))
+            for child in children
+            if "_workspace_device" in child and "_workspace_inode" in child
+        ]
+        if expected_workspace_path is not None and len(attestations) != len(children):
+            raise ValueError("workspace capability attestation is required")
+        unique_attestations = set(attestations)
+        if unique_attestations:
+            if len(unique_attestations) != 1 or root_ws_path is None:
+                raise ValueError("inconsistent workspace filesystem attestation")
+            expected_device, expected_inode = next(iter(unique_attestations))
+            if expected_device is None or expected_inode is None:
+                raise ValueError("incomplete workspace filesystem attestation")
+            try:
+                current_workspace = os.stat(root_ws_path, follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError("workspace disappeared after preflight") from exc
+            if (
+                not stat.S_ISDIR(current_workspace.st_mode)
+                or (current_workspace.st_dev, current_workspace.st_ino)
+                != (expected_device, expected_inode)
+            ):
+                raise ValueError("workspace filesystem object changed after preflight")
+
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
         # sees a coherent state, and recompute_ready() at the end
@@ -6468,8 +6519,9 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, expected_workspace_sha, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
+                " workspace_path, expected_workspace_sha, requires_reviewer_isolation, "
+                " tenant, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -6483,6 +6535,7 @@ def decompose_triage_task(
                         and child_ws_path == root_ws_path
                         else None
                     ),
+                    1 if child.get("requires_reviewer_isolation") else 0,
                     tenant,
                     now,
                     (author or "decomposer"),
@@ -8510,7 +8563,8 @@ def recover_workspace_capability_tasks(
     ``block_kind='capability'`` participate.
     """
     rows = conn.execute(
-        "SELECT id, assignee, workspace_path FROM tasks "
+        "SELECT id, assignee, workspace_path, requires_reviewer_isolation "
+        "FROM tasks "
         "WHERE status = 'blocked' AND block_kind = 'capability' "
         "AND workspace_path IS NOT NULL AND workspace_path != '' "
         "ORDER BY created_at ASC"
@@ -8533,6 +8587,7 @@ def recover_workspace_capability_tasks(
             )
             selected_capability = None
         target = selected if selected_capability and selected_capability.available else None
+        target_capability = selected_capability if target else None
         failure_reason = (
             selected_capability.reason if selected_capability is not None else "probe failed"
         )
@@ -8547,10 +8602,27 @@ def recover_workspace_capability_tasks(
                 fallback_capability = None
             if fallback_capability and fallback_capability.available:
                 target = fallback
-        if target is None:
+                target_capability = fallback_capability
+        if target is None or target_capability is None:
             continue
+        from hermes_cli.kanban_workspace_preflight import (
+            profile_uses_restricted_reviewer_runtime,
+            workspace_capability_matches,
+        )
+        if not workspace_capability_matches(target_capability, workspace):
+            continue
+        requires_reviewer_isolation = bool(row["requires_reviewer_isolation"])
+        if (
+            profile_uses_restricted_reviewer_runtime(selected)
+            or profile_uses_restricted_reviewer_runtime(target)
+        ):
+            requires_reviewer_isolation = True
 
         with write_txn(conn):
+            # Re-check the filesystem identity at the owning mutation boundary;
+            # pathname CAS alone cannot detect rename-and-replace attacks.
+            if not workspace_capability_matches(target_capability, workspace):
+                continue
             # Recompute dependency state under the same write lock as the
             # optimistic mutation.  The canary stays outside the transaction,
             # so the UPDATE also binds its result to the exact assignee and
@@ -8563,13 +8635,16 @@ def recover_workspace_capability_tasks(
             ).fetchone()
             target_status = "ready" if parents_done else "todo"
             cur = conn.execute(
-                "UPDATE tasks SET assignee = ?, status = ? "
+                "UPDATE tasks SET assignee = ?, status = ?, "
+                "requires_reviewer_isolation = ?, block_kind = NULL, "
+                "block_recurrences = 0 "
                 "WHERE id = ? AND status = 'blocked' "
                 "AND block_kind = 'capability' AND assignee IS ? "
                 "AND workspace_path = ?",
                 (
                     target,
                     target_status,
+                    1 if requires_reviewer_isolation else 0,
                     row["id"],
                     selected_raw,
                     workspace_raw,
@@ -8741,6 +8816,10 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    from hermes_cli.kanban_workspace_preflight import (
+        profile_uses_restricted_reviewer_runtime,
+        workspace_capability_matches,
+    )
     if workspace_capability_fn is None:
         from hermes_cli.kanban_workspace_preflight import (
             preflight_workspace_for_profile as workspace_capability_fn,
@@ -8871,6 +8950,13 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+        # Both assignment paths should establish a concrete profile name.
+        # Keep the runtime guard because SQLite rows and legacy callers are not
+        # type-checked inputs.
+        if not isinstance(row_assignee, str) or not row_assignee:
+            result.skipped_unassigned.append(row["id"])
+            continue
+        row_assignee = str(row_assignee)
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
@@ -8913,6 +8999,7 @@ def _dispatch_once_locked(
                     row["id"], exc,
                 )
                 selected_capability = None
+            effective_capability = selected_capability
             if not selected_capability or not selected_capability.available:
                 fallback_capability = None
                 if _default_assignee and _default_assignee != row_assignee:
@@ -8929,15 +9016,23 @@ def _dispatch_once_locked(
                 if not fallback_capability or not fallback_capability.available:
                     continue
                 previous_assignee = row_assignee
-                row_assignee = _default_assignee
+                row_assignee = str(_default_assignee)
+                effective_capability = fallback_capability
                 if not dry_run:
                     with write_txn(conn):
                         cur = conn.execute(
-                            "UPDATE tasks SET assignee = ? WHERE id = ? "
+                            "UPDATE tasks SET assignee = ?, "
+                            "requires_reviewer_isolation = "
+                            "CASE WHEN requires_reviewer_isolation = 1 OR ? = 1 "
+                            "THEN 1 ELSE 0 END "
+                            "WHERE id = ? "
                             "AND status = 'ready' AND claim_lock IS NULL "
                             "AND assignee = ? AND workspace_path = ?",
                             (
                                 row_assignee,
+                                1 if profile_uses_restricted_reviewer_runtime(
+                                    previous_assignee
+                                ) else 0,
                                 row["id"],
                                 previous_assignee,
                                 task_for_preflight.workspace_path,
@@ -8958,6 +9053,31 @@ def _dispatch_once_locked(
                                 ),
                             },
                         )
+            if not effective_capability or not workspace_capability_matches(
+                effective_capability, workspace_for_preflight
+            ):
+                continue
+            if (
+                not dry_run
+                and profile_uses_restricted_reviewer_runtime(row_assignee)
+                and not task_for_preflight.requires_reviewer_isolation
+            ):
+                with write_txn(conn):
+                    cur = conn.execute(
+                        "UPDATE tasks SET requires_reviewer_isolation = 1 "
+                        "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL "
+                        "AND assignee = ? AND workspace_path = ?",
+                        (
+                            row["id"],
+                            row_assignee,
+                            task_for_preflight.workspace_path,
+                        ),
+                    )
+                    if cur.rowcount != 1:
+                        continue
+                task_for_preflight = get_task(conn, row["id"])
+                if task_for_preflight is None:
+                    continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
@@ -9033,6 +9153,42 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            continue
+        if (
+            task_for_preflight
+            and task_for_preflight.workspace_path
+            and (
+                not effective_capability
+                or not workspace_capability_matches(
+                    effective_capability, task_for_preflight.workspace_path
+                )
+            )
+        ):
+            # The path was replaced after claim but before spawn. Close the
+            # bookkeeping run and restore the original task without charging a
+            # worker failure; no worker ever observed the untrusted object.
+            with write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
+                    (claimed.id, claimed.claim_lock),
+                )
+                if cur.rowcount == 1:
+                    run_id = _end_run(
+                        conn,
+                        claimed.id,
+                        outcome="workspace_changed",
+                        status="workspace_changed",
+                        error="workspace filesystem object changed after preflight",
+                    )
+                    _append_event(
+                        conn,
+                        claimed.id,
+                        "workspace_preflight_stale",
+                        {"workspace": task_for_preflight.workspace_path},
+                        run_id=run_id,
+                    )
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
@@ -9452,7 +9608,10 @@ def _default_spawn(
     from hermes_cli.kanban_workspace_preflight import (
         profile_uses_restricted_reviewer_runtime,
     )
-    reviewer_runtime = profile_uses_restricted_reviewer_runtime(profile_arg)
+    reviewer_runtime = (
+        task.requires_reviewer_isolation
+        or profile_uses_restricted_reviewer_runtime(profile_arg)
+    )
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)

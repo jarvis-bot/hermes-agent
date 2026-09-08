@@ -162,6 +162,8 @@ def test_all_reviewers_unavailable_route_to_capable_fallback(tmp_path: Path) -> 
             workspace=str(workspace),
             reason="mount denied" if profile != "default" else "",
             read_only=profile != "default",
+            device=workspace.stat().st_dev,
+            inode=workspace.stat().st_ino,
         )
 
     routed, failures = route_children_to_capable_profiles(
@@ -193,6 +195,8 @@ def test_partial_reviewer_availability_preserves_capable_assignment(tmp_path: Pa
             workspace=str(workspace),
             reason="mount denied" if profile == "security-reviewer" else "",
             read_only="reviewer" in profile,
+            device=workspace.stat().st_dev,
+            inode=workspace.stat().st_ino,
         )
 
     routed, failures = route_children_to_capable_profiles(
@@ -207,6 +211,33 @@ def test_partial_reviewer_availability_preserves_capable_assignment(tmp_path: Pa
         "default",
     ]
     assert len(failures) == 1
+
+
+def test_reviewer_fallback_marks_child_for_durable_isolation(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    identity = workspace.stat()
+
+    def capability(profile: str, _workspace: Path) -> WorkspaceCapability:
+        return WorkspaceCapability(
+            available=profile == "quality-reviewer",
+            profile=profile,
+            workspace=str(workspace),
+            reason="unavailable" if profile != "quality-reviewer" else "",
+            read_only=profile == "quality-reviewer",
+            device=identity.st_dev,
+            inode=identity.st_ino,
+        )
+
+    routed, _ = route_children_to_capable_profiles(
+        [{"title": "review", "assignee": "implementer", "parents": []}],
+        workspace,
+        fallback_profile="quality-reviewer",
+        capability_fn=capability,
+    )
+
+    assert routed[0]["assignee"] == "quality-reviewer"
+    assert routed[0]["requires_reviewer_isolation"] is True
 
 
 def test_no_capable_fallback_aborts_entire_route(tmp_path: Path) -> None:
@@ -262,6 +293,34 @@ def test_runtime_probe_is_networkless_read_only_and_credential_free(
     assert f"{source}:/workspace:ro" in command
     assert observed["kwargs"]["stdin"] is subprocess.DEVNULL
     assert set(observed["kwargs"]["env"]) == {"PATH"}
+
+
+def test_runtime_probe_supports_ordinary_writable_networked_docker_profile(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "repo"
+    source.mkdir()
+    observed = {}
+
+    monkeypatch.setattr("tools.environments.docker.find_docker", lambda: "/usr/bin/docker")
+
+    def run(command, **kwargs):
+        observed["command"] = command
+        return SimpleNamespace(returncode=0, stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    _runtime_mount_probe(
+        docker_source=str(source),
+        image="worker@sha256:deadbeef",
+        expected_inode=source.stat().st_ino,
+        read_only=False,
+        network_enabled=True,
+    )
+
+    command = observed["command"]
+    assert "--network=none" not in command
+    assert f"{source}:/workspace:rw" in command
+    assert "--read-only" not in command
 
 
 @pytest.mark.skipif(

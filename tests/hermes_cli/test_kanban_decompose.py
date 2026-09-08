@@ -194,7 +194,18 @@ def test_decompose_preflights_exact_workspace_and_reroutes_before_create(
             WorkspaceCapability(False, child["assignee"], str(selected_workspace), "denied")
             for child in children
         ]
-        return ([dict(child, assignee="orchestrator") for child in children], failures)
+        attestation = Path(selected_workspace).stat()
+        routed = [
+            dict(
+                child,
+                assignee="orchestrator",
+                requires_reviewer_isolation=True,
+                _workspace_device=attestation.st_dev,
+                _workspace_inode=attestation.st_ino,
+            )
+            for child in children
+        ]
+        return routed, failures
 
     patches = _patch_list_profiles(
         ["orchestrator", "functional-reviewer", "security-reviewer"]
@@ -320,5 +331,47 @@ def test_decompose_aborts_if_workspace_changes_after_preflight(
     assert root.status == "triage"
     assert root.workspace_path == str(replacement)
     assert children == 0
+
+
+def test_decompose_aborts_if_workspace_object_is_replaced_after_preflight(
+    kanban_home, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="review candidate",
+            triage=True,
+            assignee="orchestrator",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        before = workspace.stat()
+        workspace.rename(tmp_path / "attested-original")
+        workspace.mkdir()
+        with pytest.raises(ValueError, match="filesystem object changed"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orchestrator",
+                children=[{
+                    "title": "security review",
+                    "assignee": "security-reviewer",
+                    "parents": [],
+                    "requires_reviewer_isolation": True,
+                    "_workspace_device": before.st_dev,
+                    "_workspace_inode": before.st_ino,
+                }],
+                expected_workspace_path=str(workspace),
+            )
+        root = kb.get_task(conn, tid)
+        child_count = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE id != ?", (tid,)
+        ).fetchone()[0]
+
+    assert root is not None
+    assert root.status == "triage"
+    assert child_count == 0
 
 

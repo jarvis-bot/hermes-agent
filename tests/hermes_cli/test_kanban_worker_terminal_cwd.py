@@ -16,7 +16,13 @@ from __future__ import annotations
 import subprocess
 
 
-def _make_task(kb, *, assignee: str = "w", expected_workspace_sha: str | None = None):
+def _make_task(
+    kb,
+    *,
+    assignee: str = "w",
+    expected_workspace_sha: str | None = None,
+    requires_reviewer_isolation: bool = False,
+):
     return kb.Task(
         id="t_cwd",
         title="cwd pin",
@@ -34,6 +40,7 @@ def _make_task(kb, *, assignee: str = "w", expected_workspace_sha: str | None = 
         claim_expires=None,
         tenant=None,
         expected_workspace_sha=expected_workspace_sha,
+        requires_reviewer_isolation=requires_reviewer_isolation,
         current_run_id=1,
     )
 
@@ -45,6 +52,7 @@ def _capture_spawn_env(
     *,
     expected_workspace_sha: str | None = None,
     assignee: str = "w",
+    requires_reviewer_isolation: bool = False,
 ) -> dict:
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
 
@@ -65,6 +73,7 @@ def _capture_spawn_env(
             kb,
             assignee=assignee,
             expected_workspace_sha=expected_workspace_sha,
+            requires_reviewer_isolation=requires_reviewer_isolation,
         ),
         workspace,
     )
@@ -167,6 +176,39 @@ def test_read_only_reviewer_worker_forces_safe_restricted_tool_surface(
         monkeypatch,
         str(workspace),
         assignee="security-reviewer",
+    )
+
+    assert captured["env"]["HERMES_SAFE_MODE"] == "1"
+    assert "--accept-hooks" not in captured["cmd"]
+    assert "--ignore-rules" in captured["cmd"]
+    toolsets_index = captured["cmd"].index("--toolsets")
+    assert captured["cmd"][toolsets_index + 1] == "terminal,kanban"
+
+
+def test_reviewer_isolation_survives_fallback_assignee_without_sha(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "default"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        "toolsets:\n  - hermes-cli\n", encoding="utf-8"
+    )
+    root.joinpath("config.yaml").write_text(
+        "toolsets:\n  - hermes-cli\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    captured = _capture_spawn_env(
+        kb,
+        monkeypatch,
+        str(workspace),
+        assignee="default",
+        requires_reviewer_isolation=True,
     )
 
     assert captured["env"]["HERMES_SAFE_MODE"] == "1"
