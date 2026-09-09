@@ -544,25 +544,39 @@ def test_spawn_callback_runs_without_sqlite_writer_lock(tmp_path, monkeypatch):
     dispatch = threading.Thread(target=run_dispatch)
     dispatch.start()
     assert entered.wait(5)
-    callback_entered_at = time.monotonic()
-    started = time.monotonic()
-    with kb.connect() as writer:
-        kb.add_comment(writer, other_id, "test", "must not wait for spawn")
-        assert kb.heartbeat_claim(
-            writer, heartbeat_id, claimer=heartbeat_task.claim_lock
-        )
-        writer.execute(
-            "UPDATE tasks SET status='ready', block_kind=NULL WHERE id=?", (claim_id,)
-        )
-        assert kb.claim_task(writer, claim_id) is not None
-    elapsed = time.monotonic() - started
-    # Keep the callback paused for a deterministic two-second window while
-    # proving all three unrelated writer paths completed promptly.
-    time.sleep(max(0.0, 2.0 - (time.monotonic() - callback_entered_at)))
-    release.set()
+
+    writer_done = threading.Event()
+    writer_errors: list[BaseException] = []
+
+    def run_writer():
+        try:
+            with kb.connect() as writer:
+                kb.add_comment(writer, other_id, "test", "must not wait for spawn")
+                assert kb.heartbeat_claim(
+                    writer, heartbeat_id, claimer=heartbeat_task.claim_lock
+                )
+                writer.execute(
+                    "UPDATE tasks SET status='ready', block_kind=NULL WHERE id=?", (claim_id,)
+                )
+                assert kb.claim_task(writer, claim_id) is not None
+        except BaseException as exc:
+            writer_errors.append(exc)
+        finally:
+            writer_done.set()
+
+    writer = threading.Thread(target=run_writer)
+    writer.start()
+    try:
+        # Completion while the spawn callback is still paused proves these
+        # unrelated writes are not waiting for the dispatcher's write lock.
+        assert writer_done.wait(3)
+    finally:
+        release.set()
+    writer.join(5)
     dispatch.join(10)
+    assert not writer.is_alive()
     assert not dispatch.is_alive()
-    assert elapsed < 0.5
+    assert writer_errors == []
 
 
 def test_spawn_callback_can_reenter_database_write(tmp_path, monkeypatch):
