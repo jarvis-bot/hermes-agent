@@ -69,6 +69,36 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
+### Exact-SHA reviewer workspaces
+
+For an isolated review of a pre-existing checkout, create a `dir:` task with
+`--expected-workspace-sha <40-character-lowercase-SHA>`. This option is not
+valid for `scratch` or `worktree` tasks.
+
+```bash
+hermes config set terminal.backend docker --profile security-reviewer
+hermes config set terminal.docker_network false --profile security-reviewer
+hermes config set terminal.docker_mount_cwd_to_workspace true --profile security-reviewer
+hermes config set terminal.docker_cwd_mount_mode ro --profile security-reviewer
+hermes config set terminal.docker_tmp_storage disk --profile security-reviewer
+hermes kanban create "Security review" \
+  --assignee security-reviewer \
+  --workspace dir:/srv/reviews/project \
+  --expected-workspace-sha 0123456789abcdef0123456789abcdef01234567
+```
+
+Hermes authenticates the clean filesystem against that commit without trusting
+candidate-selected Git configuration, copies the authenticated bytes and
+rebuilt Git metadata into a daemon-owned snapshot, and mounts that snapshot
+read-only at `/workspace`. Before any tool command, Hermes removes stale
+`/tmp/review` state, copies `/workspace/.` (including rebuilt `.git`) into a
+fresh writable `/tmp/review`, verifies its detached HEAD against the assigned
+SHA, and uses that copy as the reviewer working directory. Dispatch fails
+closed unless Docker networking is disabled and the
+profile supplies no forwarded/configured environment, Docker volumes, or raw
+Docker arguments; it also rejects SHA/content drift, unsupported image tooling,
+and image-declared writable volumes outside the fixed scratch mounts.
+
 ## Boards (multi-project)
 
 Boards let you separate unrelated streams of work — one per project, repo,

@@ -40,11 +40,14 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import profiles as profiles_mod
+from hermes_cli.kanban_workspace_preflight import (
+    route_children_to_capable_profiles,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -429,6 +432,109 @@ def decompose_task(
             "parents": clean_parents,
         })
 
+    # Materialize the root workspace before publishing the dependency graph.
+    # Scratch tasks and repo-anchored worktrees otherwise carry no exact path,
+    # making a capability check either impossible or about the wrong object.
+    root_worktree_artifacts: list[kb._CreatedWorktreeArtifact] = []
+    try:
+        if task.workspace_kind == "worktree":
+            materialized, branch_name = kb._resolve_worktree_workspace(
+                task, created_artifacts=root_worktree_artifacts
+            )
+        else:
+            materialized = kb.resolve_workspace(task)
+            branch_name = None
+        materialized = materialized.resolve(strict=True)
+        with kb.connect_closing() as conn:
+            with kb.write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET workspace_path = ?, "
+                    "branch_name = COALESCE(?, branch_name) "
+                    "WHERE id = ? AND status = 'triage' AND workspace_path IS ?",
+                    (str(materialized), branch_name, task.id, task.workspace_path),
+                )
+            if cur.rowcount != 1:
+                kb._cleanup_created_worktree_artifacts(root_worktree_artifacts)
+                return DecomposeOutcome(
+                    task_id, False, "task workspace changed during materialization"
+                )
+            task = kb.get_task(conn, task_id)
+        if task is None:
+            kb._cleanup_created_worktree_artifacts(root_worktree_artifacts)
+            return DecomposeOutcome(task_id, False, "task disappeared during materialization")
+    except Exception as exc:
+        kb._cleanup_created_worktree_artifacts(root_worktree_artifacts)
+        return DecomposeOutcome(
+            task_id, False, f"workspace materialization failed: {exc}"
+        )
+
+    unavailable = []
+    # Worktree children need their own durable checkout before graph publication.
+    # Allocate stable child IDs now, materialize each exact path from the root's
+    # repository anchor, then preflight that final object (not the root checkout).
+    child_worktree_artifacts: list[kb._CreatedWorktreeArtifact] = []
+    if task.workspace_kind == "worktree":
+        materialized_children: list[dict] = []
+        try:
+            for child in children:
+                child_id = kb._new_task_id()
+                branch = f"wt/{child_id}"
+                child_task = replace(
+                    task,
+                    id=child_id,
+                    workspace_path=str(materialized),
+                    branch_name=branch,
+                    status="todo",
+                    assignee=str(child.get("assignee") or orchestrator),
+                )
+                child_workspace, resolved_branch = kb._resolve_worktree_workspace(
+                    child_task, created_artifacts=child_worktree_artifacts
+                )
+                item = dict(child)
+                item.update({
+                    "_id": child_id,
+                    "workspace_kind": "worktree",
+                    "workspace_path": str(child_workspace.resolve(strict=True)),
+                    "branch_name": resolved_branch,
+                })
+                routed, failures = route_children_to_capable_profiles(
+                    [item], child_workspace, fallback_profile=orchestrator
+                )
+                materialized_children.extend(routed)
+                unavailable.extend(failures)
+            children = materialized_children
+        except Exception as exc:
+            kb._cleanup_created_worktree_artifacts(child_worktree_artifacts)
+            return DecomposeOutcome(
+                task_id, False, f"child workspace materialization/preflight failed: {exc}"
+            )
+    # A profile's presence in the roster proves only that its configuration
+    # directory exists.  Before publishing any child cards, prove that each
+    # selected runtime can access this task's exact workspace.  Incapable
+    # assignments are routed to the orchestrator (the durable owner of the
+    # root); if that owner is also unavailable, abort before the atomic DB
+    # mutation so no doomed cards or parent dependencies are created.
+    if task.workspace_path and task.workspace_kind != "worktree":
+        try:
+            children, unavailable = route_children_to_capable_profiles(
+                children,
+                task.workspace_path,
+                fallback_profile=orchestrator,
+            )
+        except RuntimeError as exc:
+            return DecomposeOutcome(
+                task_id, False, f"workspace preflight failed: {exc}"
+            )
+        for capability in unavailable:
+            logger.warning(
+                "decompose: task %s profile %s cannot access exact workspace; "
+                "routing child to orchestrator %s (%s)",
+                task_id,
+                capability.profile,
+                orchestrator,
+                capability.reason,
+            )
+
     try:
         with kb.connect_closing() as conn:
             child_ids = kb.decompose_triage_task(
@@ -438,14 +544,20 @@ def decompose_task(
                 children=children,
                 author=audit_author,
                 auto_promote=auto_promote,
+                expected_workspace_path=(
+                    str(task.workspace_path) if task.workspace_path else None
+                ),
             )
     except ValueError as exc:
+        kb._cleanup_created_worktree_artifacts(child_worktree_artifacts)
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
     except Exception as exc:
+        kb._cleanup_created_worktree_artifacts(child_worktree_artifacts)
         logger.exception("decompose: DB error on task %s", task_id)
         return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
 
     if child_ids is None:
+        kb._cleanup_created_worktree_artifacts(child_worktree_artifacts)
         return DecomposeOutcome(
             task_id, False, "task moved out of triage before decomposition",
         )

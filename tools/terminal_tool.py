@@ -1371,6 +1371,64 @@ def _is_unusable_container_cwd(cwd: str) -> bool:
     return False
 
 
+def resolve_container_cwd_mount(
+    env_type: str, cwd: str, config: Dict[str, Any]
+) -> tuple[str, Optional[str]]:
+    """Resolve a task cwd into the container cwd and dynamic Docker bind source."""
+    host_cwd = config.get("host_cwd")
+    if env_type == "docker" and config.get("docker_mount_cwd_to_workspace", False):
+        candidate = os.path.abspath(os.path.expanduser(cwd))
+        is_container_path = candidate == "/workspace" or candidate.startswith(
+            "/workspace/"
+        )
+        is_container_path = (
+            is_container_path
+            or candidate == "/root"
+            or candidate.startswith("/root/")
+        )
+        if not is_container_path and os.path.isdir(candidate):
+            return "/workspace", candidate
+        if not is_container_path and cwd != config["cwd"]:
+            raise ValueError(f"Docker task cwd is not an existing directory: {cwd!r}")
+
+    if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
+        if cwd != config["cwd"]:
+            logger.info(
+                "Ignoring host/relative cwd override %r for %s backend "
+                "(won't exist in sandbox). Using %r instead.",
+                cwd,
+                env_type,
+                config["cwd"],
+            )
+        cwd = config["cwd"]
+    return cwd, host_cwd
+
+
+def resolve_container_creation_cwd(
+    env_type: str,
+    cwd: str,
+    config: Dict[str, Any],
+    overrides: Dict[str, Any],
+) -> tuple[str, Optional[str]]:
+    """Resolve creation cwd while preserving an exact-SHA reviewer's host source.
+
+    Reviewer sessions record the container-local ``/tmp/review`` cwd. After an
+    idle cleanup, every tool entry point must rematerialize from the original
+    authenticated host workspace rather than interpreting that disposable path
+    as a host bind candidate.
+    """
+    reviewer_sha = os.environ.get("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "")
+    exact_sha_reviewer = (
+        env_type == "docker"
+        and len(reviewer_sha) == 40
+        and all(char in "0123456789abcdef" for char in reviewer_sha)
+    )
+    if exact_sha_reviewer:
+        mount_source = overrides.get("cwd") or config.get("host_cwd") or config["cwd"]
+        return resolve_container_cwd_mount(env_type, mount_source, config)
+    return resolve_container_cwd_mount(env_type, cwd, config)
+
+
 # One-shot guard for the config-fallback bridge below.  Purely an
 # optimization: after the first attempt either TERMINAL_ENV is set (bridge
 # succeeded — merged config always carries terminal.backend) or the import
@@ -1437,15 +1495,25 @@ def _get_env_config() -> Dict[str, Any]:
         container_disk = 51200
 
     if docker_backend:
+        docker_tmp_storage = os.getenv("TERMINAL_DOCKER_TMP_STORAGE", "tmpfs")
         docker_forward_env = _parse_env_var("TERMINAL_DOCKER_FORWARD_ENV", "[]", json.loads, "valid JSON")
         docker_volumes = _parse_env_var("TERMINAL_DOCKER_VOLUMES", "[]", json.loads, "valid JSON")
         docker_env = _parse_env_var("TERMINAL_DOCKER_ENV", "{}", json.loads, "valid JSON")
         docker_extra_args = _parse_env_var("TERMINAL_DOCKER_EXTRA_ARGS", "[]", json.loads, "valid JSON")
+        docker_cwd_path_mappings = _parse_env_var(
+            "TERMINAL_DOCKER_CWD_PATH_MAPPINGS", "{}", json.loads, "valid JSON"
+        )
+        docker_cwd_allowed_roots = _parse_env_var(
+            "TERMINAL_DOCKER_CWD_ALLOWED_ROOTS", "[]", json.loads, "valid JSON"
+        )
     else:
+        docker_tmp_storage = "tmpfs"
         docker_forward_env = []
         docker_volumes = []
         docker_env = {}
         docker_extra_args = []
+        docker_cwd_path_mappings = {}
+        docker_cwd_allowed_roots = []
 
     # Default cwd: local uses the host's current directory, ssh uses the
     # remote home, Vercel uses its documented workspace root, and everything
@@ -1488,6 +1556,7 @@ def _get_env_config() -> Dict[str, Any]:
         "env_type": env_type,
         "modal_mode": coerce_modal_mode(os.getenv("TERMINAL_MODAL_MODE", "auto")),
         "docker_image": os.getenv("TERMINAL_DOCKER_IMAGE", default_image),
+        "docker_tmp_storage": docker_tmp_storage,
         "docker_forward_env": docker_forward_env,
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
@@ -1496,6 +1565,9 @@ def _get_env_config() -> Dict[str, Any]:
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
+        "docker_cwd_mount_mode": os.getenv("TERMINAL_DOCKER_CWD_MOUNT_MODE", "rw").strip().lower(),
+        "docker_cwd_path_mappings": docker_cwd_path_mappings,
+        "docker_cwd_allowed_roots": docker_cwd_allowed_roots,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
         # SSH-specific config
@@ -1550,11 +1622,39 @@ def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:
     )
 
 
+def _expected_kanban_workspace_sha() -> Optional[str]:
+    """Return the assigned SHA, rejecting malformed provenance constraints."""
+    value = os.environ.get("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA")
+    if value is None:
+        return None
+    if not re.fullmatch(r"[0-9a-f]{40}", value):
+        raise ValueError(
+            "HERMES_KANBAN_EXPECTED_WORKSPACE_SHA must be 40 lowercase hex characters"
+        )
+    return value
+
+
+def _kanban_reviewer_isolation_required() -> bool:
+    """Return the dispatcher-owned reviewer runtime requirement."""
+    return os.environ.get("HERMES_KANBAN_REVIEWER_ISOLATION") == "1"
+
+
+def _expected_kanban_workspace_content_sha256() -> Optional[str]:
+    value = os.environ.get("HERMES_KANBAN_EXPECTED_WORKSPACE_CONTENT_SHA256")
+    if value is None:
+        return None
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError(
+            "HERMES_KANBAN_EXPECTED_WORKSPACE_CONTENT_SHA256 must be 64 lowercase hex characters"
+        )
+    return value
+
+
 def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                         ssh_config: dict = None, container_config: dict = None,
                         local_config: dict = None,
                         task_id: str = "default",
-                        host_cwd: str = None):
+                        host_cwd: Optional[str] = None):
     """
     Create an execution environment for sandboxed command execution.
     
@@ -1583,6 +1683,27 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     docker_extra_args = cc.get("docker_extra_args", [])
     docker_network = cc.get("docker_network", True)
 
+    expected_workspace_sha = _expected_kanban_workspace_sha()
+    expected_workspace_content = _expected_kanban_workspace_content_sha256()
+    reviewer_isolation = _kanban_reviewer_isolation_required()
+    if (expected_workspace_sha is not None or reviewer_isolation) and env_type != "docker":
+        raise ValueError("an assigned Kanban reviewer requires the docker terminal backend")
+    if reviewer_isolation:
+        allowed_roots = cc.get("docker_cwd_allowed_roots")
+        if not isinstance(allowed_roots, list) or not allowed_roots:
+            raise ValueError(
+                "an assigned Kanban reviewer requires a non-empty Docker cwd allowlist"
+            )
+        # Reviewer isolation is a task contract, not a profile preference.
+        # Force every mutable/credential-bearing option off at environment
+        # creation so a changed or fallback profile cannot weaken preflight.
+        persistent = False
+        volumes = []
+        docker_forward_env = []
+        docker_env = {}
+        docker_extra_args = []
+        docker_network = False
+
     if env_type == "local":
         return _LocalEnvironment(cwd=cwd, timeout=timeout)
     
@@ -1600,13 +1721,32 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             persistent_filesystem=persistent, task_id=task_id,
             volumes=volumes,
             host_cwd=host_cwd,
-            auto_mount_cwd=cc.get("docker_mount_cwd_to_workspace", False),
+            auto_mount_cwd=(
+                True if reviewer_isolation
+                else cc.get("docker_mount_cwd_to_workspace", False)
+            ),
+            cwd_mount_mode=(
+                "ro" if reviewer_isolation
+                else cc.get("docker_cwd_mount_mode", "rw")
+            ),
+            cwd_path_mappings=cc.get("docker_cwd_path_mappings", {}),
+            cwd_allowed_roots=cc.get("docker_cwd_allowed_roots", []),
             forward_env=docker_forward_env,
             env=docker_env,
-            run_as_host_user=cc.get("docker_run_as_host_user", False),
+            run_as_host_user=(
+                False if reviewer_isolation
+                else cc.get("docker_run_as_host_user", False)
+            ),
             network=docker_network,
             extra_args=docker_extra_args,
-            persist_across_processes=cc.get("docker_persist_across_processes", True),
+            tmp_storage=cc.get("docker_tmp_storage", "tmpfs"),
+            expected_git_sha=expected_workspace_sha,
+            reviewer_mode=reviewer_isolation,
+            expected_content_sha256=expected_workspace_content,
+            persist_across_processes=(
+                False if reviewer_isolation
+                else cc.get("docker_persist_across_processes", True)
+            ),
         )
     
     elif env_type == "singularity":
@@ -2268,25 +2408,9 @@ def terminal_tool(
             image = ""
 
         cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
-        # A per-task cwd override (registered by the gateway/TUI for workspace
-        # tracking, or by RL/benchmark envs) wins over config["cwd"] — but
-        # config["cwd"] was already sanitized for container backends in
-        # _get_env_config() while the override is raw. On a container backend a
-        # raw host path (e.g. a Windows desktop session's C:\Users\<user>, or a
-        # POSIX /home/<user>) reaches `docker run -w <host-path>` and the
-        # container fails to start (exit 125). Re-apply the same host/relative
-        # path guard to the *resolved* cwd so the override can't bypass it.
-        # Valid in-container override paths (RL/benchmark sandboxes that set
-        # cwd to /workspace, /root, etc.) are absolute non-host paths and pass
-        # through untouched.
-        if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
-            if cwd != config["cwd"]:
-                logger.info(
-                    "Ignoring host/relative cwd override %r for %s backend "
-                    "(won't exist in sandbox). Using %r instead.",
-                    cwd, env_type, config["cwd"],
-                )
-            cwd = config["cwd"]
+        creation_cwd, host_cwd = resolve_container_creation_cwd(
+            env_type, cwd, config, overrides
+        )
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
@@ -2379,8 +2503,12 @@ def terminal_tool(
                                 "container_persistent": config.get("container_persistent", True),
                                 "modal_mode": config.get("modal_mode", "auto"),
                                 "vercel_runtime": config.get("vercel_runtime", ""),
+                                "docker_tmp_storage": config.get("docker_tmp_storage", "tmpfs"),
                                 "docker_volumes": config.get("docker_volumes", []),
                                 "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
+                                "docker_cwd_mount_mode": config.get("docker_cwd_mount_mode", "rw"),
+                                "docker_cwd_path_mappings": config.get("docker_cwd_path_mappings", {}),
+                                "docker_cwd_allowed_roots": config.get("docker_cwd_allowed_roots", []),
                                 "docker_forward_env": config.get("docker_forward_env", []),
                                 "docker_env": config.get("docker_env", {}),
                                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
@@ -2399,13 +2527,13 @@ def terminal_tool(
                         new_env = _create_environment(
                             env_type=env_type,
                             image=image,
-                            cwd=cwd,
+                            cwd=creation_cwd,
                             timeout=effective_timeout,
                             ssh_config=ssh_config,
                             container_config=container_config,
                             local_config=local_config,
                             task_id=effective_task_id,
-                            host_cwd=config.get("host_cwd"),
+                            host_cwd=host_cwd,
                         )
                     except ImportError as e:
                         return json.dumps({
@@ -2535,6 +2663,11 @@ def terminal_tool(
         from tools.approval import get_current_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
+        # Exact-SHA reviewer environments expose their writable tree at
+        # /tmp/review while the requested /workspace mount stays read-only.
+        # Use the environment's effective cwd for a first command; explicit
+        # workdir and per-session cwd records still win below.
+        command_default_cwd = getattr(env, "cwd", cwd)
 
         if background:
             # Spawn a tracked background process via the process registry.
@@ -2544,7 +2677,7 @@ def terminal_tool(
 
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
-                default_cwd=cwd,
+                default_cwd=command_default_cwd,
                 session_key=session_key,
             )
             try:
@@ -2804,7 +2937,7 @@ def terminal_tool(
                 try:
                     command_cwd = _resolve_command_cwd(
                         workdir=workdir,
-                        default_cwd=cwd,
+                        default_cwd=command_default_cwd,
                         session_key=session_key,
                     )
                     execute_kwargs = {

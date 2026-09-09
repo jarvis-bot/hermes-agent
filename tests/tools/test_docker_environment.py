@@ -1,10 +1,54 @@
+import hashlib
 import logging
-from io import StringIO
+from io import BytesIO, StringIO
+import os
+from pathlib import Path
+import shutil
+import stat
 import subprocess
+import tarfile
 
 import pytest
 
 from tools.environments import docker as docker_env
+
+
+def test_reviewer_rejects_scratch_mount_resolving_into_workspace(monkeypatch):
+    """An image symlink must not turn an allowlisted mount into a workspace write."""
+    env = object.__new__(docker_env.DockerEnvironment)
+    env._docker_exe = "/usr/bin/docker"
+    mounts = '[{"Destination":"/root","RW":true}]\n'
+    monkeypatch.setattr(
+        docker_env.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, mounts, ""),
+    )
+    monkeypatch.setattr(
+        env,
+        "_container_resolved_path",
+        lambda _container_id, path: "/workspace/root" if path == "/root" else path,
+    )
+
+    assert env._unexpected_reviewer_writable_mount("container") == "/root"
+
+
+def test_reviewer_rejects_workspace_path_resolving_elsewhere(monkeypatch):
+    env = object.__new__(docker_env.DockerEnvironment)
+    env._reviewer_mode = True
+    env._workspace_requires_ro = True
+    env._tmp_storage = "tmpfs"
+    monkeypatch.setattr(env, "_readonly_workspace_identity_violation", lambda: None)
+    monkeypatch.setattr(env, "_unexpected_reviewer_writable_mount", lambda _id: None)
+    monkeypatch.setattr(env, "_container_has_mount_at_or_below", lambda *a, **kw: False)
+    monkeypatch.setattr(
+        env,
+        "_container_resolved_path",
+        lambda _id, path: "/tmp/redirect" if path == "/workspace" else path,
+    )
+
+    violation = env._effective_policy_violation("container")
+    assert violation is not None
+    assert "read-only /workspace" in violation
 
 
 def _mock_subprocess_run(monkeypatch):
@@ -19,6 +63,7 @@ def _mock_subprocess_run(monkeypatch):
     """
     docker_env._cgroup_limits_ok = True
     calls = []
+    snapshot_digests = {}
 
     def _run(cmd, **kwargs):
         calls.append((list(cmd) if isinstance(cmd, list) else cmd, kwargs))
@@ -27,9 +72,48 @@ def _mock_subprocess_run(monkeypatch):
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
             if cmd[1] == "run":
                 return subprocess.CompletedProcess(cmd, 0, stdout="fake-container-id\n", stderr="")
+            if cmd[1] == "exec" and len(cmd) >= 10 and cmd[-3] == "-c":
+                run_cmd = next(
+                    call[0]
+                    for call in reversed(calls[:-1])
+                    if isinstance(call[0], list) and call[0][1] == "run"
+                )
+                container_path = cmd[-1]
+                workspace_spec = next(
+                    run_cmd[index + 1]
+                    for index, arg in enumerate(run_cmd[:-1])
+                    if arg == "-v"
+                    and run_cmd[index + 1].split(":", 2)[1] == container_path
+                )
+                source = workspace_spec.split(":", 1)[0]
+                digest = snapshot_digests.get(source)
+                if digest is None:
+                    digest = docker_env._readonly_tree_digest(
+                        docker_env.Path(source), include_root_mode=False
+                    )
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{digest}\n", stderr=""
+                )
+            if cmd[1] == "image" and cmd[2] == "inspect":
+                return subprocess.CompletedProcess(cmd, 0, stdout="sha256:test-image\n", stderr="")
+            if cmd[1] == "exec" and cmd[-3:-1] == ["-f", "--"]:
+                protected = cmd[-1].rsplit(" ", 1)[-1]
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{protected}\n", stderr="")
+            if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="[]\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    def _materialize(
+        _docker, _image, _source, expected, _expected_git_sha=None,
+        _expected_content_sha256=None, *, disposable=False, provenance_deadline=None
+    ):
+        volume = f"hermes-ro-{str(expected['mounted_content_sha256'])[:24]}"
+        snapshot_digests[volume] = str(expected["mounted_content_sha256"])
+        return volume
+
+    monkeypatch.setattr(docker_env, "_materialize_readonly_workspace", _materialize)
     return calls
 
 
@@ -49,9 +133,14 @@ def _make_dummy_env(**kwargs):
         network=kwargs.get("network", True),
         host_cwd=kwargs.get("host_cwd"),
         auto_mount_cwd=kwargs.get("auto_mount_cwd", False),
+        cwd_mount_mode=kwargs.get("cwd_mount_mode", "rw"),
+        cwd_path_mappings=kwargs.get("cwd_path_mappings"),
+        cwd_allowed_roots=kwargs.get("cwd_allowed_roots"),
         env=kwargs.get("env"),
         run_as_host_user=kwargs.get("run_as_host_user", False),
         extra_args=kwargs.get("extra_args", []),
+        tmp_storage=kwargs.get("tmp_storage", "tmpfs"),
+        expected_git_sha=kwargs.get("expected_git_sha"),
         persist_across_processes=kwargs.get("persist_across_processes", True),
     )
 
@@ -97,6 +186,2127 @@ def test_auto_mount_host_cwd_adds_volume(monkeypatch, tmp_path):
     assert run_calls, "docker run should have been called"
     run_args_str = " ".join(run_calls[0][0])
     assert f"{project_dir}:/workspace" in run_args_str
+
+
+def test_disk_tmp_storage_uses_container_writable_layer(monkeypatch):
+    """Disk mode must omit only the /tmp tmpfs while retaining other hardening."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(tmp_storage="disk", persist_across_processes=False)
+
+    run_args = next(c[0] for c in calls if c[0][1] == "run")
+    tmpfs_mounts = [
+        run_args[index + 1]
+        for index, arg in enumerate(run_args[:-1])
+        if arg == "--tmpfs"
+    ]
+    assert not any(mount.startswith("/tmp:") for mount in tmpfs_mounts)
+    assert any(mount.startswith("/var/tmp:") for mount in tmpfs_mounts)
+    assert "no-new-privileges" in run_args
+
+
+def test_disk_tmp_storage_rejects_image_declared_tmp_volume(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    docker_env._cgroup_limits_ok = True
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+        if cmd[1] == "image":
+            return subprocess.CompletedProcess(cmd, 0, stdout="sha256:test-image\n", stderr="")
+        if cmd[1] == "run":
+            return subprocess.CompletedProcess(cmd, 0, stdout="disk-container\n", stderr="")
+        if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
+            mounts = '[{"Type":"volume","Destination":"/tmp"}]\n'
+            return subprocess.CompletedProcess(cmd, 0, stdout=mounts, stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    with pytest.raises(RuntimeError, match="container writable layer"):
+        _make_dummy_env(tmp_storage="disk", persist_across_processes=False)
+
+    assert ["/usr/bin/docker", "rm", "-f", "-v", "disk-container"] in calls
+
+
+def test_disk_tmp_storage_rejects_ancestor_root_mount(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    docker_env._cgroup_limits_ok = True
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+        if cmd[1] == "image":
+            return subprocess.CompletedProcess(cmd, 0, stdout="sha256:test-image\n", stderr="")
+        if cmd[1] == "run":
+            return subprocess.CompletedProcess(cmd, 0, stdout="disk-container\n", stderr="")
+        if cmd[1] == "exec" and cmd[-3:-1] == ["-f", "--"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="/tmp\n", stderr="")
+        if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
+            mounts = '[{"Type":"volume","Destination":"/","RW":true}]\n'
+            return subprocess.CompletedProcess(cmd, 0, stdout=mounts, stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    with pytest.raises(RuntimeError, match="container writable layer"):
+        _make_dummy_env(tmp_storage="disk", persist_across_processes=False)
+
+    assert ["/usr/bin/docker", "rm", "-f", "-v", "disk-container"] in calls
+
+
+def test_default_tmp_storage_preserves_hardened_tmpfs(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(persist_across_processes=False)
+
+    run_args = next(c[0] for c in calls if c[0][1] == "run")
+    assert "/tmp:rw,nosuid,size=512m" in run_args
+
+
+def test_disk_tmp_storage_rejects_image_volume_reached_through_tmp_symlink(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    docker_env._cgroup_limits_ok = True
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+        if cmd[1] == "image":
+            return subprocess.CompletedProcess(cmd, 0, stdout="sha256:symlink-image\n", stderr="")
+        if cmd[1] == "run":
+            return subprocess.CompletedProcess(cmd, 0, stdout="disk-container\n", stderr="")
+        if cmd[1] == "exec" and cmd[-3:-1] == ["-f", "--"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="/scratch\n", stderr="")
+        if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
+            mounts = '[{"Type":"volume","Destination":"/scratch","RW":true}]\n'
+            return subprocess.CompletedProcess(cmd, 0, stdout=mounts, stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    with pytest.raises(RuntimeError, match="container writable layer"):
+        _make_dummy_env(tmp_storage="disk", persist_across_processes=False)
+
+    assert ["/usr/bin/docker", "rm", "-f", "-v", "disk-container"] in calls
+
+
+def test_disk_tmp_storage_rejects_mutable_tmp_symlink_chain(monkeypatch):
+    """A checked symlink target can later be redirected through a mounted parent."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    docker_env._cgroup_limits_ok = True
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+        if cmd[1] == "image":
+            return subprocess.CompletedProcess(cmd, 0, stdout="sha256:symlink-image\n", stderr="")
+        if cmd[1] == "run":
+            return subprocess.CompletedProcess(cmd, 0, stdout="disk-container\n", stderr="")
+        if cmd[1] == "exec" and cmd[-3:-1] == ["-f", "--"]:
+            # For example: /tmp -> /a/link -> /opt/layer-tmp.  /a/link can be
+            # changed after this check when /a is an image-declared volume.
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="/opt/layer-tmp\n", stderr=""
+            )
+        if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
+            mounts = '[{"Type":"volume","Destination":"/a","RW":true}]\n'
+            return subprocess.CompletedProcess(cmd, 0, stdout=mounts, stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    with pytest.raises(RuntimeError, match="container writable layer"):
+        _make_dummy_env(tmp_storage="disk", persist_across_processes=False)
+
+    assert ["/usr/bin/docker", "rm", "-f", "-v", "disk-container"] in calls
+
+
+def test_disk_tmp_storage_rejects_tmp_symlink_below_ancestor_mount(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    docker_env._cgroup_limits_ok = True
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+        if cmd[1] == "image":
+            return subprocess.CompletedProcess(cmd, 0, stdout="sha256:symlink-image\n", stderr="")
+        if cmd[1] == "run":
+            return subprocess.CompletedProcess(cmd, 0, stdout="disk-container\n", stderr="")
+        if cmd[1] == "exec" and cmd[-3:-1] == ["-f", "--"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="/workspace/tmp\n", stderr="")
+        if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
+            mounts = '[{"Type":"bind","Destination":"/workspace","RW":false}]\n'
+            return subprocess.CompletedProcess(cmd, 0, stdout=mounts, stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    with pytest.raises(RuntimeError, match="container writable layer"):
+        _make_dummy_env(tmp_storage="disk", persist_across_processes=False)
+
+    assert ["/usr/bin/docker", "rm", "-f", "-v", "disk-container"] in calls
+
+
+def test_tmp_storage_participates_in_container_reuse_fingerprint(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(tmp_storage="disk")
+
+    run_args = next(c[0] for c in calls if c[0][1] == "run")
+    assert "hermes-tmp-storage=disk" in run_args
+    reuse_probe = next(c[0] for c in calls if c[0][1:3] == ["ps", "-a"])
+    assert "label=hermes-tmp-storage=disk" in reuse_probe
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--label", "hermes-tmp-storage=tmpfs"],
+        ["--label=hermes-tmp-storage=tmpfs"],
+        ["-l", "hermes-task-id=other"],
+        ["-l=hermes-profile=other"],
+        ["-dlhermes-tmp-storage=tmpfs"],
+        ["--label-file", "/tmp/labels"],
+        ["--label-file=/tmp/labels"],
+    ],
+)
+def test_extra_args_cannot_override_reserved_reuse_labels(monkeypatch, extra_args):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="reserved Hermes labels"):
+        _make_dummy_env(extra_args=extra_args)
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--tmpfs", "/tmp:size=1g"],
+        ["--tmpfs=/tmp:size=1g"],
+        ["--volume", "scratch:/tmp"],
+        ["--volume=scratch:/tmp/cache"],
+        ["-vscratch:/tmp"],
+        ["-itvscratch:/tmp/cache"],
+        ["-Pvscratch:/tmp/cache"],
+        ["--mount", "type=tmpfs,target=/tmp"],
+        ["--mount=type=volume,source=scratch,destination=/tmp/cache"],
+        ['--mount=type=volume,source=scratch,"target=/tmp"'],
+        ["--mount=type=volume,source=scratch,target=/x/../tmp/cache"],
+        ["--mount=type=volume,source=scratch,TARGET=/tmp/cache"],
+        ["--volume=scratch:/x/../tmp"],
+        ["--tmpfs=//tmp/cache:size=1g"],
+        ["--volumes-from", "tmp-donor"],
+        ["--volumes-from=tmp-donor"],
+    ],
+)
+def test_extra_args_cannot_override_tmp_storage_policy(monkeypatch, extra_args):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="use docker_tmp_storage"):
+        _make_dummy_env(extra_args=extra_args)
+
+
+@pytest.mark.parametrize("volume", ["scratch:/tmp", "/host/cache:/tmp/cache:ro"])
+def test_docker_volumes_cannot_override_tmp_storage_policy(monkeypatch, volume):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="use docker_tmp_storage"):
+        _make_dummy_env(volumes=[volume])
+
+
+def test_attached_env_value_is_not_misparsed_as_volume(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(extra_args=["-eFOOv=/tmp/cache"], persist_across_processes=False)
+
+    run_args = next(c[0] for c in calls if c[0][1] == "run")
+    assert "-eFOOv=/tmp/cache" in run_args
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["-v", "/host/review:/workspace:ro"],
+        ["-Pvscratch:/workspace/cache:ro"],
+        ["--mount=type=bind,source=/host/review,target=/workspace"],
+        ["--mount=type=bind,source=/host/review,target=/x/../workspace"],
+        ["--mount=type=bind,source=/host/review,Destination=/workspace"],
+        ["--volume=/host/review://workspace:ro"],
+        ["--volume", "/workspace/cache"],
+        ["-dv/workspace/cache"],
+        ["--tmpfs=/x/../workspace/cache:size=1g"],
+        ["--volumes-from", "workspace-donor"],
+    ],
+)
+def test_extra_args_cannot_mount_workspace_without_reuse_fingerprint(
+    monkeypatch, extra_args
+):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="container reuse isolation"):
+        _make_dummy_env(extra_args=extra_args)
+
+
+@pytest.mark.parametrize("network_arg", [["--network=host"], ["--net", "bridge"]])
+def test_network_disabled_rejects_extra_arg_override(monkeypatch, network_arg):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="network mode"):
+        _make_dummy_env(network=False, extra_args=network_arg)
+
+
+def test_network_enabled_rejects_explicit_network_mode(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="network mode"):
+        _make_dummy_env(network=True, extra_args=["--network=host"])
+
+
+def test_explicit_workspace_mount_participates_in_reuse_fingerprint(
+    monkeypatch, tmp_path
+):
+    review_dir = tmp_path / "review"
+    review_dir.mkdir()
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(volumes=[f"{review_dir}:/workspace:ro"])
+
+    run_args = next(c[0] for c in calls if c[0][1] == "run")
+    workspace_label = next(
+        arg.split("=", 1)[1]
+        for arg in run_args
+        if arg.startswith("hermes-workspace=")
+    )
+    assert workspace_label != "off"
+    reuse_probe = next(c[0] for c in calls if c[0][1:3] == ["ps", "-a"])
+    assert f"label=hermes-workspace={workspace_label}" in reuse_probe
+
+
+def test_managed_workspace_policy_participates_in_reuse_fingerprint(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env()
+
+    reuse_probe = next(c[0] for c in calls if c[0][1:3] == ["ps", "-a"])
+    assert "label=hermes-workspace=managed-ephemeral" in reuse_probe
+
+
+@pytest.mark.parametrize(
+    "volume",
+    ["review-source:/workspace:ro", r"C:\review:/workspace:ro"],
+)
+def test_read_only_workspace_requires_authenticatable_bind_source(monkeypatch, volume):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="authenticated host bind"):
+        _make_dummy_env(volumes=[volume])
+
+
+def test_env_file_contents_participate_in_reuse_fingerprint(monkeypatch, tmp_path):
+    env_file = tmp_path / "container.env"
+    env_file.write_text("VALUE=first\n", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(extra_args=["--env-file", str(env_file)])
+    first_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    first_label = next(arg for arg in first_run if arg.startswith("hermes-policy="))
+
+    env_file.write_text("VALUE=second\n", encoding="utf-8")
+    _make_dummy_env(extra_args=["--env-file", str(env_file)])
+    second_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    second_label = next(arg for arg in second_run if arg.startswith("hermes-policy="))
+
+    assert first_label != second_label
+
+
+def test_mutable_image_identity_participates_in_reuse_fingerprint(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    identities = iter(["sha256:first", "sha256:second"])
+    monkeypatch.setattr(docker_env, "_resolve_image_identity", lambda *_: next(identities))
+
+    _make_dummy_env(image="reviewer:latest")
+    first_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    first_label = next(arg for arg in first_run if arg.startswith("hermes-policy="))
+    _make_dummy_env(image="reviewer:latest")
+    second_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    second_label = next(arg for arg in second_run if arg.startswith("hermes-policy="))
+
+    assert first_label != second_label
+
+
+def test_container_starts_from_authenticated_immutable_image(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        docker_env,
+        "_resolve_image_identity",
+        lambda *_: "sha256:authenticated-image",
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(image="reviewer:latest", persist_across_processes=False)
+
+    run_args = next(call[0] for call in calls if call[0][1] == "run")
+    assert "sha256:authenticated-image" in run_args
+    assert "reviewer:latest" not in run_args
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ({"image": "python:3.11"}, {"image": "python:3.12"}),
+        ({"extra_args": ["--shm-size=64m"]}, {"extra_args": ["--shm-size=1g"]}),
+        ({"persistent_filesystem": False}, {"persistent_filesystem": True}),
+        ({"env": {"TOKEN": "before"}}, {"env": {"TOKEN": "after"}}),
+    ],
+)
+def test_complete_container_policy_participates_in_reuse_fingerprint(
+    monkeypatch, first, second
+):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+
+    calls = _mock_subprocess_run(monkeypatch)
+    _make_dummy_env(**first)
+    first_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    first_label = next(arg for arg in first_run if arg.startswith("hermes-policy="))
+
+    _make_dummy_env(**second)
+    second_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    second_label = next(arg for arg in second_run if arg.startswith("hermes-policy="))
+
+    assert first_label != second_label
+
+
+def test_read_only_workspace_content_participates_in_policy(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    candidate = project_dir / "candidate.txt"
+    candidate.write_text("first candidate", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    options = {
+        "cwd": "/workspace",
+        "host_cwd": str(project_dir),
+        "auto_mount_cwd": True,
+        "cwd_mount_mode": "ro",
+    }
+    _make_dummy_env(**options)
+    first_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    first_label = next(arg for arg in first_run if arg.startswith("hermes-policy="))
+
+    candidate.write_text("second candidate", encoding="utf-8")
+    _make_dummy_env(**options)
+    second_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    second_label = next(arg for arg in second_run if arg.startswith("hermes-policy="))
+
+    assert first_label != second_label
+
+
+def test_read_only_workspace_executable_mode_participates_in_policy(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    candidate = project_dir / "candidate.sh"
+    candidate.write_text("#!/bin/sh\n", encoding="utf-8")
+    candidate.chmod(0o644)
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    options = {
+        "cwd": "/workspace",
+        "host_cwd": str(project_dir),
+        "auto_mount_cwd": True,
+        "cwd_mount_mode": "ro",
+    }
+
+    _make_dummy_env(**options)
+    first_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    first_label = next(arg for arg in first_run if arg.startswith("hermes-policy="))
+
+    candidate.chmod(0o755)
+    _make_dummy_env(**options)
+    second_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    second_label = next(arg for arg in second_run if arg.startswith("hermes-policy="))
+
+    assert first_label != second_label
+
+
+def test_read_only_workspace_digest_failure_is_fail_closed(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        docker_env,
+        "_readonly_tree_digest",
+        lambda _root, **_kwargs: (_ for _ in ()).throw(OSError("unreadable")),
+    )
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="cannot authenticate read-only workspace"):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+        )
+
+
+@pytest.mark.parametrize("node_kind", ["fifo", "socket"])
+def test_read_only_workspace_rejects_unsupported_nodes(tmp_path, node_kind):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    node = project_dir / node_kind
+    if node_kind == "fifo":
+        os.mkfifo(node)
+    else:
+        import socket
+
+        sock = socket.socket(socket.AF_UNIX)
+        sock.bind(str(node))
+        sock.close()
+
+    with pytest.raises(ValueError, match="unsupported filesystem node"):
+        docker_env._readonly_tree_digest(project_dir)
+
+
+def test_container_workspace_digest_rejects_unsupported_nodes(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        assert "unsupported filesystem node" in cmd[-2]
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="unsupported filesystem node: /workspace/fifo"
+        )
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="unsupported filesystem node"):
+        docker_env._container_tree_digest("docker", "container", "/workspace")
+
+
+def test_git_workspace_provenance_rejects_fabricated_head(tmp_path):
+    project_dir = tmp_path / "review-target"
+    git_dir = project_dir / ".git"
+    git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("1" * 40 + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="commit object is missing or invalid"):
+        docker_env._verify_git_workspace_provenance(project_dir)
+
+
+def test_git_workspace_provenance_requires_exact_clean_commit_tree(tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"],
+        cwd=project_dir,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    tracked = project_dir / "tracked.txt"
+    tracked.write_text("assigned bytes\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=project_dir, check=True)
+
+    docker_env._verify_git_workspace_provenance(project_dir)
+
+    tracked.write_text("candidate replacement\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="tracked files do not match HEAD"):
+        docker_env._verify_git_workspace_provenance(project_dir)
+
+    subprocess.run(["git", "checkout", "--", "tracked.txt"], cwd=project_dir, check=True)
+    (project_dir / ".gitignore").write_text(".hidden\n", encoding="utf-8")
+    (project_dir / ".hidden").write_text("candidate bytes\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="untracked files"):
+        docker_env._verify_git_workspace_provenance(project_dir)
+
+
+def test_git_workspace_provenance_rejects_forged_loose_object(tmp_path):
+    import zlib
+
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"],
+        cwd=project_dir,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    payload = project_dir / "payload.txt"
+    payload.write_bytes(b"assigned bytes\n")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=project_dir, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    blob_id = subprocess.run(
+        ["git", "rev-parse", "HEAD:payload.txt"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    forged = b"candidate-controlled bytes\n"
+    loose_object = project_dir / ".git" / "objects" / blob_id[:2] / blob_id[2:]
+    loose_object.chmod(0o644)
+    loose_object.write_bytes(zlib.compress(b"blob " + str(len(forged)).encode() + b"\0" + forged))
+    payload.write_bytes(forged)
+
+    with pytest.raises(ValueError, match="loose Git object failed independent validation"):
+        docker_env._verify_git_workspace_provenance(project_dir, assigned)
+
+
+def test_git_workspace_provenance_rejects_candidate_replacement_refs(tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"],
+        cwd=project_dir,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    payload = project_dir / "payload.txt"
+    payload.write_text("assigned\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=project_dir, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    payload.write_text("candidate replacement\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "replacement"], cwd=project_dir, check=True)
+    replacement = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "checkout", "-q", assigned], cwd=project_dir, check=True)
+    subprocess.run(["git", "replace", assigned, replacement], cwd=project_dir, check=True)
+    subprocess.run(["git", "pack-refs", "--all", "--prune"], cwd=project_dir, check=True)
+    payload.write_text("assigned\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="replacement refs"):
+        docker_env._verify_git_workspace_provenance(project_dir, assigned)
+
+
+def test_git_workspace_provenance_does_not_trust_candidate_index_stat_cache(tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"],
+        cwd=project_dir, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    payload = project_dir / "payload.txt"
+    payload.write_text("SAFE-CONTENT\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=project_dir, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    original_stat = payload.stat()
+    subprocess.run(
+        ["git", "config", "core.trustctime", "false"], cwd=project_dir, check=True
+    )
+    subprocess.run(
+        ["git", "config", "core.checkStat", "minimal"], cwd=project_dir, check=True
+    )
+    payload.write_text("EVIL-CONTENT\n", encoding="utf-8")
+    os.utime(payload, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    with pytest.raises(ValueError, match="tracked files do not match HEAD"):
+        docker_env._verify_git_workspace_provenance(project_dir, assigned)
+
+
+@pytest.mark.parametrize("metadata", ["info/grafts", "shallow"])
+def test_git_workspace_provenance_rejects_candidate_history_metadata(
+    tmp_path, metadata
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"],
+        cwd=project_dir, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    (project_dir / "payload.txt").write_text("assigned\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=project_dir, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    metadata_path = project_dir / ".git" / metadata
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(f"{assigned}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="candidate-selected Git history metadata"):
+        docker_env._verify_git_workspace_provenance(project_dir, assigned)
+
+
+def test_git_workspace_provenance_rejects_incomplete_ancestry(tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"],
+        cwd=project_dir, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    payload = project_dir / "payload.txt"
+    payload.write_text("parent\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "parent"], cwd=project_dir, check=True)
+    parent = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    payload.write_text("assigned\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "assigned"], cwd=project_dir, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    (project_dir / ".git" / "objects" / parent[:2] / parent[2:]).unlink()
+
+    with pytest.raises(ValueError, match="history is incomplete or invalid"):
+        docker_env._verify_git_workspace_provenance(project_dir, assigned)
+
+
+def test_git_workspace_provenance_requires_out_of_band_assigned_sha(tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"],
+        cwd=project_dir,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    (project_dir / "payload.txt").write_text("tree\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "other"], cwd=project_dir, check=True)
+
+    with pytest.raises(ValueError, match="assigned SHA"):
+        docker_env._verify_git_workspace_provenance(project_dir, "1" * 40)
+
+
+def test_pinned_workspace_archive_rebuilds_trusted_git_metadata(tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "review-branch"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"], cwd=project_dir, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    payload = project_dir / "payload.txt"
+    payload.write_text("assigned\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=project_dir, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "config", "diff.hostile.external", "/bin/true"],
+        cwd=project_dir,
+        check=True,
+    )
+    (project_dir / ".git" / "hooks" / "status").write_text(
+        "#!/bin/sh\nexit 99\n", encoding="utf-8"
+    )
+
+    archive, _digest = docker_env._readonly_workspace_archive(
+        project_dir,
+        docker_env._readonly_tree_metadata_digest(project_dir),
+        assigned,
+    )
+    extracted = tmp_path / "extracted"
+    extracted.mkdir()
+    try:
+        with tarfile.open(fileobj=archive, mode="r:") as handle:
+            handle.extractall(extracted, filter="data")
+    finally:
+        archive.close()
+
+    config = (extracted / ".git" / "config").read_text(encoding="utf-8")
+    assert "hostile" not in config
+    assert not (extracted / ".git" / "hooks").exists()
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=extracted, check=True,
+        capture_output=True, text=True,
+    ).stdout == ""
+    assert (extracted / ".git" / "HEAD").read_text(encoding="ascii").strip() == assigned
+    assert subprocess.run(
+        ["git", "symbolic-ref", "--quiet", "HEAD"], cwd=extracted,
+        capture_output=True, text=True,
+    ).returncode == 1
+
+
+def test_pinned_workspace_archive_rejects_source_swap_restored_after_copy(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"],
+        cwd=project_dir, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    payload = project_dir / "payload.txt"
+    payload.write_text("assigned\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=project_dir, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    expected_metadata = docker_env._readonly_tree_metadata_digest(project_dir)
+    original_copy_node = docker_env._copy_review_node
+    swapped = False
+
+    def swap_copy_restore(source, destination, deadline):
+        nonlocal swapped
+        if Path(source).name == "payload.txt" and not swapped:
+            swapped = True
+            original = project_dir.with_name("review-target-authenticated")
+            project_dir.rename(original)
+            project_dir.mkdir()
+            (project_dir / "payload.txt").write_text("candidate substitution\n", encoding="utf-8")
+            try:
+                return original_copy_node(source, destination, deadline)
+            finally:
+                shutil.rmtree(project_dir)
+                original.rename(project_dir)
+        return original_copy_node(source, destination, deadline)
+
+    monkeypatch.setattr(docker_env, "_copy_review_node", swap_copy_restore)
+
+    with pytest.raises(ValueError, match="tracked files do not match HEAD"):
+        docker_env._readonly_workspace_archive(
+            project_dir, expected_metadata, assigned
+        )
+    assert swapped is True
+
+
+def test_reviewer_workspace_bounds_enforce_shared_provenance_deadline(tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    (project_dir / "payload.txt").write_text("candidate\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exceeded its deadline"):
+        docker_env._enforce_reviewer_workspace_bounds(
+            project_dir, deadline=docker_env.time.monotonic() - 1
+        )
+
+
+def test_tree_inventory_checks_deadline_while_slow_iterator_is_consumed(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    entries = []
+    for index in range(3):
+        entry = project_dir / f"{index}.txt"
+        entry.write_text("x", encoding="utf-8")
+        entries.append(entry)
+    original_rglob = docker_env.Path.rglob
+
+    def slow_rglob(path, pattern):
+        if path != project_dir:
+            return original_rglob(path, pattern)
+
+        def generate():
+            for entry in entries:
+                docker_env.time.sleep(0.06)
+                yield entry
+
+        return generate()
+
+    monkeypatch.setattr(docker_env.Path, "rglob", slow_rglob)
+    started = docker_env.time.monotonic()
+    with pytest.raises(ValueError, match="exceeded its deadline"):
+        docker_env._readonly_tree_digest(
+            project_dir, deadline=started + 0.04
+        )
+    assert docker_env.time.monotonic() - started < 0.14
+
+
+def test_tree_inventory_enforces_node_limit_before_sorting(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    entries = []
+    for index in range(3):
+        entry = project_dir / f"{index}.txt"
+        entry.write_text("x", encoding="utf-8")
+        entries.append(entry)
+    monkeypatch.setattr(docker_env, "_MAX_REVIEW_WORKSPACE_NODES", 2)
+    monkeypatch.setattr(
+        docker_env.Path, "rglob",
+        lambda path, _pattern: iter(entries) if path == project_dir else iter(()),
+    )
+
+    with pytest.raises(ValueError, match="node limit"):
+        docker_env._readonly_tree_metadata_digest(project_dir)
+
+
+def test_tree_authentication_rejects_regular_file_swapped_to_fifo(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    payload = project_dir / "payload.txt"
+    payload.write_text("candidate\n", encoding="utf-8")
+    original_open = docker_env.os.open
+    swapped = False
+
+    def swap_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path).name == payload.name and kwargs.get("dir_fd") is not None and not swapped:
+            swapped = True
+            payload.unlink()
+            docker_env.os.mkfifo(payload)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(docker_env.os, "open", swap_before_open)
+    with pytest.raises(ValueError, match="changed during authentication"):
+        docker_env._readonly_tree_digest(
+            project_dir, deadline=docker_env.time.monotonic() + 2
+        )
+    assert swapped is True
+
+
+def test_git_head_authentication_rejects_regular_file_swapped_to_fifo(
+    monkeypatch, tmp_path
+):
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    head = git_dir / "HEAD"
+    head.write_text("1" * 40 + "\n", encoding="ascii")
+    original_open = docker_env.os.open
+    swapped = False
+
+    def swap_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path).name == head.name and kwargs.get("dir_fd") is not None and not swapped:
+            swapped = True
+            head.unlink()
+            docker_env.os.mkfifo(head)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(docker_env.os, "open", swap_before_open)
+    with pytest.raises((OSError, ValueError)):
+        docker_env._git_commit_identity(
+            git_dir, deadline=docker_env.time.monotonic() + 2
+        )
+    assert swapped is True
+
+
+def test_host_git_authentication_uses_resource_limited_exec_wrapper():
+    command = docker_env._resource_limited_git_command(
+        "/usr/bin/git", ["index-pack", "--strict", "/tmp/review.pack"]
+    )
+
+    assert command[:3] == [docker_env.sys.executable, "-I", "-c"]
+    assert "RLIMIT_AS" in command[3]
+    assert "RLIMIT_FSIZE" in command[3]
+    assert command[-4:] == [
+        "/usr/bin/git", "index-pack", "--strict", "/tmp/review.pack"
+    ]
+
+
+def test_host_git_authentication_bounds_parent_output():
+    with pytest.raises(ValueError, match="output exceeds"):
+        docker_env._run_resource_limited_git(
+            docker_env.sys.executable,
+            ["-c", "print('x' * 4096)"],
+            timeout=5,
+            env={"PATH": "/usr/bin:/bin"},
+            capture=True,
+            maximum_output=128,
+        )
+
+
+def test_host_git_authentication_fails_closed_without_posix_limits(monkeypatch):
+    monkeypatch.setattr(docker_env.os, "name", "nt")
+    with pytest.raises(ValueError, match="requires POSIX resource limits"):
+        docker_env._resource_limited_git_command("git", ["status"])
+
+
+def test_trusted_git_objects_exclude_candidate_semantic_caches(tmp_path):
+    repository = tmp_path / "repository"
+    destination = tmp_path / "destination"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.email", "review@test.invalid"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.name", "Review Test"], cwd=repository, check=True)
+    (repository / "payload.txt").write_text("packed object\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "packed"], cwd=repository, check=True)
+    subprocess.run(["git", "gc", "--prune=now"], cwd=repository, check=True)
+
+    source = repository / ".git" / "objects"
+    packed = source / "pack"
+    info = source / "info"
+    pack_path = next(packed.glob("pack-*.pack"))
+    pack_id = pack_path.stem.removeprefix("pack-")
+    candidate_index = packed / f"pack-{pack_id}.idx"
+    candidate_index.chmod(0o644)
+    candidate_index.write_bytes(b"candidate-selected-index")
+    (packed / f"pack-{pack_id}.bitmap").write_bytes(b"candidate-bitmap")
+    (packed / "multi-pack-index").write_bytes(b"candidate-midx")
+
+    docker_env._copy_trusted_git_objects(source, destination)
+
+    copied_pack = destination / "pack" / pack_path.name
+    copied_index = copied_pack.with_suffix(".idx")
+    assert copied_pack.read_bytes() == pack_path.read_bytes()
+    assert copied_index.read_bytes() != b"candidate-selected-index"
+    subprocess.run(
+        ["git", "verify-pack", str(copied_index)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    assert not (destination / "pack" / f"pack-{pack_id}.bitmap").exists()
+    assert not (destination / "pack" / "multi-pack-index").exists()
+    assert not (destination / "info").exists()
+
+
+def test_git_workspace_provenance_ignores_candidate_pack_index(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.email", "review@test.invalid"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.name", "Review Test"], cwd=repository, check=True)
+    (repository / "payload.txt").write_text("assigned packed tree\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=repository, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "gc", "--prune=now"], cwd=repository, check=True)
+    candidate_index = next((repository / ".git" / "objects" / "pack").glob("pack-*.idx"))
+    candidate_index.chmod(0o644)
+    candidate_index.write_bytes(b"candidate-selected-index")
+
+    docker_env._verify_git_workspace_provenance(repository, assigned)
+
+
+def test_git_workspace_provenance_disables_lazy_fetch(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"], cwd=project_dir, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    (project_dir / "payload.txt").write_text("assigned\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=project_dir, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    original_run = subprocess.run
+    environments = []
+
+    def recording_run(*args, **kwargs):
+        environments.append(kwargs.get("env"))
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(docker_env.subprocess, "run", recording_run)
+
+    docker_env._verify_git_workspace_provenance(project_dir, assigned)
+
+    assert environments
+    assert all(env is not None and env.get("GIT_NO_LAZY_FETCH") == "1" for env in environments)
+
+
+def test_git_workspace_provenance_rejects_untracked_empty_directory(tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "review@test.invalid"], cwd=project_dir, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"], cwd=project_dir, check=True
+    )
+    (project_dir / "payload.txt").write_text("assigned\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=project_dir, check=True)
+    subprocess.run(["git", "commit", "-qm", "assigned"], cwd=project_dir, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project_dir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    (project_dir / "untracked-empty-dir").mkdir()
+
+    with pytest.raises(ValueError, match="untracked directories"):
+        docker_env._verify_git_workspace_provenance(project_dir, assigned)
+
+
+def test_materialize_reviewer_updates_expected_mounted_digest(monkeypatch, tmp_path):
+    calls = []
+    content = "f" * 64
+    expected: dict[str, object] = {
+        "tree_metadata_sha256": "m",
+        "mounted_content_sha256": "original",
+    }
+    monkeypatch.setattr(
+        docker_env,
+        "_readonly_workspace_archive",
+        lambda *_args, **_kwargs: (BytesIO(b"archive"), content),
+    )
+    monkeypatch.setattr(docker_env, "_container_tree_digest", lambda *_args: content)
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[1:3] == ["volume", "inspect"]:
+            return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
+        if command[1] == "run" and "--rm" in command and "-i" in command:
+            return subprocess.CompletedProcess(command, 0, stdout=(content + "\n").encode(), stderr=b"")
+        if command[1] == "run" and "--name" in command and "-d" in command:
+            return subprocess.CompletedProcess(command, 0, stdout="verifier\n", stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+
+    docker_env._materialize_readonly_workspace(
+        "docker", "image", str(tmp_path), expected, "1" * 40, disposable=True
+    )
+
+    assert expected["mounted_content_sha256"] == content
+
+
+def test_materialize_reviewer_rejects_content_changed_since_dispatch_preflight(
+    monkeypatch, tmp_path
+):
+    archive = BytesIO(b"archive")
+    monkeypatch.setattr(
+        docker_env,
+        "_readonly_workspace_archive",
+        lambda *_args, **_kwargs: (archive, "f" * 64),
+    )
+    with pytest.raises(ValueError, match="changed after dispatcher preflight"):
+        docker_env._materialize_readonly_workspace(
+            "docker",
+            "image",
+            str(tmp_path),
+            {"tree_metadata_sha256": "m"},
+            None,
+            "e" * 64,
+            disposable=True,
+        )
+    assert archive.closed
+
+
+def test_real_two_commit_reviewer_archive_matches_logical_preflight_digest(
+    monkeypatch, tmp_path
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.email", "review@test.invalid"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.name", "Review Test"], cwd=repository, check=True)
+    payload = repository / "payload.txt"
+    payload.write_text("first\n", encoding="utf-8")
+    subprocess.run(["git", "add", "payload.txt"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "first"], cwd=repository, check=True)
+    payload.write_text("second\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "second"], cwd=repository, check=True)
+    assigned = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    expected = docker_env._review_workspace_content_digest(repository)
+    metadata = docker_env._readonly_tree_metadata_digest(repository)
+    archive_digest = ""
+    original_archive = docker_env._readonly_workspace_archive
+
+    def archive(*args, **kwargs):
+        nonlocal archive_digest
+        handle, archive_digest = original_archive(*args, **kwargs)
+        return handle, archive_digest
+
+    original_run = subprocess.run
+
+    def fake_run(command, **kwargs):
+        if command[0] != "docker":
+            return original_run(command, **kwargs)
+        if command[1:3] == ["volume", "inspect"]:
+            return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
+        if command[1] == "run" and "--rm" in command and "-i" in command:
+            return subprocess.CompletedProcess(
+                command, 0, stdout=(archive_digest + "\n").encode(), stderr=b""
+            )
+        if command[1] == "run" and "--name" in command and "-d" in command:
+            return subprocess.CompletedProcess(command, 0, stdout="verifier\n", stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(docker_env, "_readonly_workspace_archive", archive)
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+    monkeypatch.setattr(docker_env, "_container_tree_digest", lambda *_args: archive_digest)
+
+    docker_env._materialize_readonly_workspace(
+        "docker", "image", str(repository),
+        {"tree_metadata_sha256": metadata, "mounted_content_sha256": expected},
+        assigned, expected, disposable=True,
+    )
+
+    payload.write_text("mutated\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        docker_env._materialize_readonly_workspace(
+            "docker", "image", str(repository),
+            {
+                "tree_metadata_sha256": docker_env._readonly_tree_metadata_digest(repository),
+                "mounted_content_sha256": expected,
+            },
+            assigned, expected, disposable=True,
+        )
+
+
+def test_readonly_digest_length_framing_rejects_structural_collision(tmp_path):
+    original = tmp_path / "original"
+    crafted = tmp_path / "crafted"
+    original.mkdir()
+    crafted.mkdir()
+    (original / "a").write_bytes(b"X")
+    (original / "b").write_bytes(b"Y")
+    # This single crafted ``a`` record authenticates as the two records above
+    # under the legacy raw concatenation protocol.
+    (crafted / "a").write_bytes(b"X\x00b\x000644\x00FY")
+
+    def legacy_digest(root):
+        digest = hashlib.sha256()
+        for path in sorted(root.rglob("*")):
+            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(f"{stat.S_IMODE(path.lstat().st_mode):04o}".encode("ascii"))
+            digest.update(b"\0F")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    assert legacy_digest(original) == legacy_digest(crafted)
+    original_digest = docker_env._readonly_tree_digest(
+        original, include_root_mode=False
+    )
+    assert original_digest != docker_env._readonly_tree_digest(
+        crafted, include_root_mode=False
+    )
+
+    with pytest.raises(ValueError, match="changed after dispatcher preflight"):
+        docker_env._materialize_readonly_workspace(
+            "docker",
+            "image",
+            str(crafted),
+            {"tree_metadata_sha256": docker_env._readonly_tree_metadata_digest(crafted)},
+            None,
+            original_digest,
+            disposable=True,
+        )
+
+
+def test_materialize_reviewer_overrides_image_entrypoint(monkeypatch, tmp_path):
+    """Helper containers must not execute an image-selected entrypoint."""
+    calls = []
+    content = "f" * 64
+    expected: dict[str, object] = {
+        "tree_metadata_sha256": "m",
+        "mounted_content_sha256": "original",
+    }
+    monkeypatch.setattr(
+        docker_env,
+        "_readonly_workspace_archive",
+        lambda *_args, **_kwargs: (BytesIO(b"archive"), content),
+    )
+    monkeypatch.setattr(docker_env, "_container_tree_digest", lambda *_args: content)
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[1:3] == ["volume", "inspect"]:
+            return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
+        if command[1] == "run" and "--rm" in command and "-i" in command:
+            return subprocess.CompletedProcess(
+                command, 0, stdout=(content + "\n").encode(), stderr=b""
+            )
+        if command[1] == "run" and "--name" in command and "-d" in command:
+            return subprocess.CompletedProcess(command, 0, stdout="verifier\n", stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+
+    docker_env._materialize_readonly_workspace(
+        "docker", "entrypoint-image", str(tmp_path), expected, "1" * 40, disposable=True
+    )
+
+    populate = next(
+        command
+        for command in calls
+        if command[1] == "run" and "--rm" in command and "-i" in command
+    )
+    verifier = next(
+        command
+        for command in calls
+        if command[1] == "run" and "--name" in command and "-d" in command
+    )
+    assert populate[populate.index("--entrypoint") + 1] == "python3"
+    assert populate[populate.index("entrypoint-image") + 1 :][:2] == ["-I", "-c"]
+    assert verifier[verifier.index("--entrypoint") + 1] == "sleep"
+    assert verifier[verifier.index("entrypoint-image") + 1 :] == ["120"]
+
+
+def test_materialize_reviewer_volume_is_removed_when_verifier_start_fails(
+    monkeypatch, tmp_path
+):
+    calls = []
+
+    monkeypatch.setattr(
+        docker_env,
+        "_readonly_workspace_archive",
+        lambda *_args, **_kwargs: (BytesIO(b"archive"), "f" * 64),
+    )
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[1:3] == ["volume", "inspect"]:
+            return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
+        if command[1:3] == ["volume", "create"]:
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+        if command[1] == "run" and "--rm" in command and "-i" in command:
+            return subprocess.CompletedProcess(command, 0, stdout=("f" * 64 + "\n").encode(), stderr=b"")
+        if command[1] == "run" and "--name" in command and "-d" in command:
+            raise subprocess.TimeoutExpired(command, 120)
+        if command[1:4] == ["rm", "-f", "-v"]:
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+        if command[1:4] == ["volume", "rm", "-f"]:
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+
+    expected: dict[str, object] = {
+        "tree_metadata_sha256": "m",
+        "mounted_content_sha256": "original",
+    }
+    with pytest.raises(subprocess.TimeoutExpired):
+        docker_env._materialize_readonly_workspace(
+            "docker", "image", str(tmp_path), expected,
+            "1" * 40, disposable=True,
+        )
+
+    assert any(command[1:4] == ["volume", "rm", "-f"] for command in calls)
+    assert expected["mounted_content_sha256"] == "original"
+
+
+def test_assigned_sha_requires_git_metadata(tmp_path):
+    project_dir = tmp_path / "not-a-repository"
+    project_dir.mkdir()
+
+    with pytest.raises(ValueError, match="missing Git metadata"):
+        docker_env._verify_git_workspace_provenance(project_dir, "1" * 40)
+
+
+def test_loose_git_object_rejects_oversized_expansion(monkeypatch, tmp_path):
+    import hashlib
+    import zlib
+
+    canonical = b"blob 32\0" + b"x" * 32
+    object_id = hashlib.sha1(canonical).hexdigest()
+    loose = tmp_path / object_id
+    loose.write_bytes(zlib.compress(canonical))
+    monkeypatch.setattr(docker_env, "_MAX_REVIEW_GIT_OBJECT_BYTES", 16)
+
+    with pytest.raises(ValueError, match="exceeds reviewer size limit"):
+        docker_env._validated_loose_git_object_bytes(loose, object_id)
+
+
+def test_reviewer_workspace_rejects_too_many_nodes(monkeypatch, tmp_path):
+    (tmp_path / "one").write_text("1", encoding="utf-8")
+    (tmp_path / "two").write_text("2", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "_MAX_REVIEW_WORKSPACE_NODES", 1)
+
+    with pytest.raises(ValueError, match="node limit"):
+        docker_env._enforce_reviewer_workspace_bounds(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({}, "docker_network=false"),
+        ({"network": False, "forward_env": ["TOKEN"]}, "environment variables"),
+        ({"network": False, "env": {"TOKEN": "secret"}}, "environment variables"),
+        ({"network": False, "volumes": ["data:/data"]}, "configured Docker volumes"),
+        ({"network": False, "extra_args": ["--read-only"]}, "raw Docker arguments"),
+    ],
+)
+def test_assigned_reviewer_workspace_rejects_network_and_host_inputs(options, message):
+    with pytest.raises(ValueError, match=message):
+        _make_dummy_env(expected_git_sha="1" * 40, **options)
+
+
+def test_assigned_reviewer_workspace_omits_automatic_host_data(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    (project_dir / "candidate.txt").write_text("reviewed", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    monkeypatch.setattr(
+        "tools.credential_files.get_credential_file_mounts",
+        lambda: pytest.fail("reviewer must not load credential mounts"),
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_skills_directory_mount",
+        lambda: pytest.fail("reviewer must not load skill mounts"),
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_cache_directory_mounts",
+        lambda: pytest.fail("reviewer must not load cache mounts"),
+    )
+    monkeypatch.setattr(
+        docker_env,
+        "_egress_proxy_args_for_docker",
+        lambda: pytest.fail("reviewer must not load egress credentials"),
+    )
+    monkeypatch.setattr("tools.env_passthrough.get_all_passthrough", lambda: {"REVIEW_SECRET"})
+    monkeypatch.setenv("REVIEW_SECRET", "credential-from-host")
+
+    _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(project_dir),
+        auto_mount_cwd=True,
+        cwd_mount_mode="ro",
+        network=False,
+        persistent_filesystem=True,
+        expected_git_sha="1" * 40,
+        persist_across_processes=True,
+    )
+
+    run_args = [call[0] for call in calls if call[0][1] == "run"][-1]
+    assert "--network=none" in run_args
+    assert run_args[run_args.index("-w") + 1] == "/tmp"
+    assert any(arg.endswith(":/workspace:ro") for arg in run_args)
+    assert not any(arg.startswith("/tmp:") for arg in run_args)
+    assert "/root:rw,exec,size=1g" in run_args
+    assert not any(
+        run_args[index] == "-v" and run_args[index + 1].endswith(":/root")
+        for index in range(len(run_args) - 1)
+    )
+    assert not any(call[0][1:3] == ["ps", "-a"] for call in calls)
+    assert "REVIEW_SECRET" not in repr(calls)
+    assert "credential-from-host" not in repr(calls)
+    copy_call = next(
+        call[0]
+        for call in calls
+        if call[0][1:3] == ["exec", "fake-container-id"]
+        and "/tmp/review" in " ".join(call[0])
+    )
+    assert "shutil.rmtree(target)" in copy_call[-2]
+    assert "source.iterdir()" in copy_call[-2]
+    assert copy_call[-1] == "1" * 40
+
+
+def test_assigned_reviewer_rejects_unexpected_image_writable_volume(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    (project_dir / "candidate.txt").write_text("reviewed", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    original_run = docker_env.subprocess.run
+
+    def _run(cmd, **kwargs):
+        if isinstance(cmd, list) and cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
+            return subprocess.CompletedProcess(
+                cmd, 0,
+                stdout='[{"Destination":"/scratch","RW":true,"Type":"volume"}]\n',
+                stderr="",
+            )
+        return original_run(cmd, **kwargs)
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    with pytest.raises(RuntimeError, match="unexpected writable mount.*scratch"):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+            network=False,
+            expected_git_sha="1" * 40,
+        )
+
+    rejected_rm = [
+        call[0] for call in calls
+        if isinstance(call[0], list) and call[0][1:3] == ["rm", "-f"]
+    ]
+    assert rejected_rm and all("-v" in cmd for cmd in rejected_rm)
+
+
+def test_reviewer_cleanup_removes_snapshot_volume(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    import threading
+    monkeypatch.setattr(threading, "Thread", _FakeThread)
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    env._container_id = "review-container"
+    env._persist_across_processes = False
+    env._persistent = False
+    env._reviewer_mode = True
+    env._docker_exe = "/usr/bin/docker"
+    env._workspace_dir = None
+    env._home_dir = None
+    env._snapshot_volumes = ["hermes-ro-review-snapshot"]
+
+    env.cleanup()
+
+    commands = [call[0] for call in calls if isinstance(call[0], list)]
+    assert ["/usr/bin/docker", "rm", "-f", "-v", "review-container"] in commands
+    assert [
+        "/usr/bin/docker", "volume", "rm", "-f", "hermes-ro-review-snapshot"
+    ] in commands
+
+
+def test_reviewer_init_session_failure_removes_container_and_snapshot(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    (project_dir / "candidate.txt").write_text("reviewed", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "init_session",
+        lambda _self: (_ for _ in ()).throw(RuntimeError("injected init failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="injected init failure"):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+            network=False,
+            expected_git_sha="1" * 40,
+        )
+
+    commands = [call[0] for call in calls if isinstance(call[0], list)]
+    assert ["/usr/bin/docker", "rm", "-f", "-v", "fake-container-id"] in commands
+    assert any(command[1:4] == ["volume", "rm", "-f"] for command in commands)
+
+
+def test_cleanup_without_container_still_removes_snapshot_volume(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    env._container_id = None
+    env._persistent = False
+    env._docker_exe = "/usr/bin/docker"
+    env._workspace_dir = None
+    env._home_dir = None
+    env._snapshot_volumes = ["hermes-ro-unattached-snapshot"]
+
+    env.cleanup()
+
+    commands = [call[0] for call in calls if isinstance(call[0], list)]
+    assert [
+        "/usr/bin/docker", "volume", "rm", "-f", "hermes-ro-unattached-snapshot"
+    ] in commands
+
+
+def test_general_read_only_workspace_retains_live_host_bind(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    (project_dir / "candidate.txt").write_text("authenticated", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(project_dir),
+        auto_mount_cwd=True,
+        cwd_mount_mode="ro",
+    )
+
+    run_args = [call[0] for call in calls if call[0][1] == "run"][-1]
+    workspace_spec = next(
+        run_args[index + 1]
+        for index, arg in enumerate(run_args[:-1])
+        if arg == "-v" and run_args[index + 1].endswith(":/workspace:ro")
+    )
+    assert workspace_spec == f"{project_dir}:/workspace:ro"
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["-v", "/host/source:/data:ro"],
+        ["--volume=/host/source:/data"],
+        ["--mount", "type=bind,source=/host/source,target=/data"],
+        ["--mount=type=bind,src=/host/source,dst=/data"],
+        ["--mount=source=/host/source,target=/data,type=bind"],
+    ],
+)
+def test_extra_args_reject_untracked_host_bind_sources(monkeypatch, extra_args):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="host bind sources"):
+        _make_dummy_env(extra_args=extra_args)
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--security-opt", "seccomp=/host/profile.json"],
+        ["--security-opt=seccomp=relative-profile.json"],
+    ],
+)
+def test_extra_args_reject_host_backed_security_opt_files(monkeypatch, extra_args):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="host-backed security-opt"):
+        _make_dummy_env(extra_args=extra_args)
+
+
+def test_read_only_workspace_mutation_during_authentication_is_fail_closed(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    candidate = project_dir / "candidate.txt"
+    candidate.write_text("reviewed", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    original_digest = docker_env._readonly_tree_digest
+
+    def _mutating_digest(root, **kwargs):
+        result = original_digest(root, **kwargs)
+        candidate.write_text("changed during authentication", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(docker_env, "_readonly_tree_digest", _mutating_digest)
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="changed during authentication"):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+        )
+
+
+def test_mounted_workspace_content_must_match_authenticated_source(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    (project_dir / "candidate.txt").write_text("reviewed", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        docker_env,
+        "_container_tree_digest",
+        lambda *_, **__: "digest-from-swapped-mounted-tree",
+        raising=False,
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="mounted read-only workspace differs"):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+            network=False,
+            tmp_storage="disk",
+            expected_git_sha="1" * 40,
+            persist_across_processes=False,
+        )
+
+    assert ["/usr/bin/docker", "rm", "-f", "-v", "fake-container-id"] in [
+        call[0] for call in calls
+    ]
+
+
+def test_read_only_workspace_snapshot_ignores_later_host_change(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    candidate = project_dir / "candidate.txt"
+    candidate.write_text("reviewed", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(project_dir),
+        auto_mount_cwd=True,
+        cwd_mount_mode="ro",
+    )
+
+    candidate.write_text("changed after mount", encoding="utf-8")
+    monkeypatch.setattr(
+        docker_env.BaseEnvironment,
+        "execute",
+        lambda *args, **kwargs: {"output": "", "returncode": 0},
+    )
+    result = env.execute("true")
+
+    assert result["returncode"] == 0
+
+
+def test_host_mutation_during_command_cannot_change_snapshot(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    candidate = project_dir / "candidate.txt"
+    candidate.write_text("reviewed", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(project_dir),
+        auto_mount_cwd=True,
+        cwd_mount_mode="ro",
+        persist_across_processes=False,
+    )
+
+    def _execute(*args, **kwargs):
+        candidate.write_text("changed during command", encoding="utf-8")
+        return {"output": "apparently successful", "returncode": 0}
+
+    monkeypatch.setattr(docker_env.BaseEnvironment, "execute", _execute)
+    result = env.execute("inspect candidate")
+
+    assert result == {"output": "apparently successful", "returncode": 0}
+
+
+def test_read_only_workspace_resolves_packed_git_head(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    git_dir = project_dir / ".git"
+    git_dir.mkdir()
+    (git_dir / "HEAD").write_text("ref: refs/heads/review\n", encoding="utf-8")
+    first_sha = "1" * 40
+    second_sha = "2" * 40
+    (git_dir / "packed-refs").write_text(
+        f"# pack-refs with: peeled fully-peeled sorted\n{first_sha} refs/heads/review\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    options = {
+        "cwd": "/workspace",
+        "host_cwd": str(project_dir),
+        "auto_mount_cwd": True,
+        "cwd_mount_mode": "ro",
+    }
+
+    _make_dummy_env(**options)
+    first_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    first_label = next(arg for arg in first_run if arg.startswith("hermes-policy="))
+
+    (git_dir / "packed-refs").write_text(
+        f"# pack-refs with: peeled fully-peeled sorted\n{second_sha} refs/heads/review\n",
+        encoding="utf-8",
+    )
+    _make_dummy_env(**options)
+    second_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    second_label = next(arg for arg in second_run if arg.startswith("hermes-policy="))
+
+    assert first_label != second_label
+
+
+def test_read_only_workspace_git_metadata_participates_in_policy(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    git_dir = project_dir / ".git"
+    replace_dir = git_dir / "refs" / "replace"
+    replace_dir.mkdir(parents=True)
+    assigned_sha = "1" * 40
+    (git_dir / "HEAD").write_text(assigned_sha + "\n", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    options = {
+        "cwd": "/workspace",
+        "host_cwd": str(project_dir),
+        "auto_mount_cwd": True,
+        "cwd_mount_mode": "ro",
+    }
+
+    _make_dummy_env(**options)
+    first_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    first_label = next(arg for arg in first_run if arg.startswith("hermes-policy="))
+
+    (replace_dir / assigned_sha).write_text("2" * 40 + "\n", encoding="utf-8")
+    _make_dummy_env(**options)
+    second_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    second_label = next(arg for arg in second_run if arg.startswith("hermes-policy="))
+
+    assert first_label != second_label
+
+
+def test_linked_workspace_external_git_metadata_is_rejected(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    common_git_dir = tmp_path / "repository.git"
+    linked_git_dir = common_git_dir / "worktrees" / "review-target"
+    linked_git_dir.mkdir(parents=True)
+    assigned_sha = "1" * 40
+    (project_dir / ".git").write_text(
+        f"gitdir: {linked_git_dir}\n", encoding="utf-8"
+    )
+    (linked_git_dir / "commondir").write_text("../..\n", encoding="utf-8")
+    (linked_git_dir / "HEAD").write_text(assigned_sha + "\n", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="external Git metadata"):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+        )
+
+
+def test_read_only_workspace_git_symlink_is_rejected(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    external_git_dir = tmp_path / "candidate-selected.git"
+    external_git_dir.mkdir()
+    (external_git_dir / "HEAD").write_text("1" * 40 + "\n", encoding="utf-8")
+    (project_dir / ".git").symlink_to(external_git_dir, target_is_directory=True)
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="external Git metadata"):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+        )
+
+
+@pytest.mark.parametrize("metadata_path", ["HEAD", "packed-refs", "refs/heads/review"])
+def test_read_only_workspace_nested_git_symlink_is_rejected(
+    monkeypatch, tmp_path, metadata_path
+):
+    project_dir = tmp_path / "review-target"
+    git_dir = project_dir / ".git"
+    target = tmp_path / "candidate-selected-metadata"
+    target.write_text("1" * 40 + "\n", encoding="utf-8")
+    link = git_dir / metadata_path
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
+    if metadata_path != "HEAD":
+        (git_dir / "HEAD").write_text("ref: refs/heads/review\n", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="external Git metadata"):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+        )
+
+
+def test_read_only_workspace_git_commondir_is_rejected(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    git_dir = project_dir / ".git"
+    git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("1" * 40 + "\n", encoding="utf-8")
+    (git_dir / "commondir").write_text(str(tmp_path) + "\n", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="external Git metadata"):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+        )
+
+
+def test_container_workspace_digest_uses_isolated_python(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="a" * 64 + "\n", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+
+    assert docker_env._container_tree_digest("docker", "container", "/workspace") == (
+        "a" * 64
+    )
+    assert len(calls) == 1
+    assert calls[0][:9] == [
+        "docker", "exec", "-w", "/", "container", "python3", "-I", "-c", calls[0][8]
+    ]
+    assert calls[0][-1] == "/workspace"
+
+
+def test_read_only_workspace_submount_is_snapshotted(monkeypatch, tmp_path):
+    component_dir = tmp_path / "component"
+    component_dir.mkdir()
+    candidate = component_dir / "candidate.txt"
+    candidate.write_text("reviewed", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(volumes=[f"{component_dir}:/workspace/component:ro"])
+
+    candidate.write_text("changed after mount", encoding="utf-8")
+    monkeypatch.setattr(
+        docker_env.BaseEnvironment,
+        "execute",
+        lambda *args, **kwargs: {"output": "", "returncode": 0},
+    )
+    result = env.execute("true")
+
+    assert result["returncode"] == 0
+
+
+def test_mapped_read_only_workspace_uses_canonical_source_identity(monkeypatch, tmp_path):
+    container_root = tmp_path / "container-data"
+    project_dir = container_root / "review-target"
+    project_dir.mkdir(parents=True)
+    candidate = project_dir / "candidate.txt"
+    candidate.write_text("first candidate", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    monkeypatch.setattr(
+        docker_env,
+        "_container_tree_digest",
+        lambda *_, **__: docker_env._readonly_tree_digest(
+            project_dir, include_root_mode=False
+        ),
+    )
+
+    options = {
+        "cwd": "/workspace",
+        "host_cwd": str(project_dir),
+        "auto_mount_cwd": True,
+        "cwd_mount_mode": "ro",
+        "cwd_path_mappings": {str(container_root): "/docker-host/data"},
+    }
+    _make_dummy_env(**options)
+    first_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    first_label = next(arg for arg in first_run if arg.startswith("hermes-policy="))
+
+    candidate.write_text("second candidate", encoding="utf-8")
+    _make_dummy_env(**options)
+    second_run = [call[0] for call in calls if call[0][1] == "run"][-1]
+    second_label = next(arg for arg in second_run if arg.startswith("hermes-policy="))
+
+    assert first_label != second_label
+
+
+def test_auto_mount_host_cwd_read_only_adds_ro_volume(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(project_dir),
+        auto_mount_cwd=True,
+        cwd_mount_mode="ro",
+    )
+
+    run_args = next(c[0] for c in calls if c[0][1] == "run")
+    assert f"{project_dir}:/workspace:ro" in run_args
+    reuse_probe = next(c[0] for c in calls if c[0][1:3] == ["ps", "-a"])
+    assert any(arg.startswith("label=hermes-workspace=") for arg in reuse_probe)
+
+
+def test_auto_mount_translates_container_path_to_docker_host_path(monkeypatch, tmp_path):
+    container_root = tmp_path / "container-data"
+    project_dir = container_root / "tasks" / "review-target"
+    project_dir.mkdir(parents=True)
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(project_dir),
+        auto_mount_cwd=True,
+        cwd_path_mappings={str(container_root): "/home/ubuntu/.hermes"},
+    )
+
+    run_args = next(c[0] for c in calls if c[0][1] == "run")
+    assert "/home/ubuntu/.hermes/tasks/review-target:/workspace" in run_args
+    assert f"{project_dir}:/workspace" not in run_args
+
+
+def test_auto_mount_rejects_cwd_outside_allowed_roots(monkeypatch, tmp_path):
+    allowed = tmp_path / "allowed"
+    rejected = tmp_path / "rejected"
+    allowed.mkdir()
+    rejected.mkdir()
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="allowed workspace root"):
+        _make_dummy_env(
+            host_cwd=str(rejected),
+            auto_mount_cwd=True,
+            cwd_allowed_roots=[str(allowed)],
+        )
+
+
+def test_auto_mount_rejects_symlink_escape_from_allowed_root(monkeypatch, tmp_path):
+    allowed = tmp_path / "allowed"
+    outside = tmp_path / "outside"
+    allowed.mkdir()
+    outside.mkdir()
+    escaped = allowed / "escaped"
+    escaped.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="allowed workspace root"):
+        _make_dummy_env(
+            host_cwd=str(escaped),
+            auto_mount_cwd=True,
+            cwd_allowed_roots=[str(allowed)],
+        )
+
+
+def test_auto_mount_rejects_cwd_without_required_path_mapping(monkeypatch, tmp_path):
+    project_dir = tmp_path / "project"
+    unrelated = tmp_path / "unrelated"
+    project_dir.mkdir()
+    unrelated.mkdir()
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="path mapping"):
+        _make_dummy_env(
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_path_mappings={str(unrelated): "/docker-host/unrelated"},
+        )
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["-v", "/tmp/override:/workspace"],
+        ["--volume=/tmp/override:/workspace/subdir:ro"],
+        ["--mount", "type=bind,src=/tmp/override,dst=/workspace"],
+        ["--mount=type=bind,src=/tmp/override,target=/workspace/subdir"],
+    ],
+)
+def test_auto_mount_rejects_extra_args_workspace_mounts(monkeypatch, tmp_path, extra_args):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+
+    with pytest.raises(ValueError, match="docker_extra_args mounts /workspace"):
+        _make_dummy_env(
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+            extra_args=extra_args,
+        )
+
+
+def test_forbidden_extra_args_are_rejected_before_image_resolution(monkeypatch, tmp_path):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+
+    def network_must_not_run(*_args, **_kwargs):
+        raise AssertionError("image resolution/pull must not run for invalid local args")
+
+    monkeypatch.setattr(docker_env, "_resolve_image_identity", network_must_not_run)
+    monkeypatch.setattr(docker_env, "_image_uses_init_entrypoint", network_must_not_run)
+
+    with pytest.raises(ValueError, match="docker_extra_args mounts /workspace"):
+        _make_dummy_env(
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+            extra_args=["--mount=type=bind,src=/tmp/override,dst=/workspace"],
+        )
+
+
+@pytest.mark.parametrize(
+    "volume",
+    [
+        "/somewhere/else:/workspace:ro",
+        "/somewhere/else:/workspace/generated",
+        r"C:\review-target:/workspace:ro",
+    ],
+)
+def test_auto_mount_rejects_explicit_workspace_volume(monkeypatch, tmp_path, volume):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="docker_volumes.*workspace"):
+        _make_dummy_env(
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            volumes=[volume],
+        )
 
 
 def test_non_persistent_cleanup_removes_container(monkeypatch):
@@ -421,20 +2631,28 @@ def test_run_command_tags_hermes_agent_label(monkeypatch):
     )
 
 
-def test_label_sanitizer_rejects_invalid_characters():
-    """Docker label values must be alnum + ``_.-`` and ≤63 chars. Profile or
-    task names containing slashes, colons, or unicode would otherwise emit
-    invalid labels that round-trip badly through ``docker ps --filter``."""
+def test_label_sanitizer_rejects_invalid_characters_without_aliasing():
+    """Docker label values must be safe, bounded, and collision-resistant."""
     assert docker_env._sanitize_label_value("plain-name_1.0") == "plain-name_1.0"
-    assert docker_env._sanitize_label_value("with/slash") == "with_slash"
-    assert docker_env._sanitize_label_value("with:colon") == "with_colon"
-    assert docker_env._sanitize_label_value("emoji-😀-here") == "emoji-_-here"
+
+    slash = docker_env._sanitize_label_value("with/slash")
+    colon = docker_env._sanitize_label_value("with:slash")
+    assert slash.startswith("with_slash-")
+    assert colon.startswith("with_slash-")
+    assert slash != colon
+
+    unicode_value = docker_env._sanitize_label_value("emoji-😀-here")
+    assert unicode_value.startswith("emoji-_-here-")
+    assert all(character.isascii() and (character.isalnum() or character in "_.-") for character in unicode_value)
+
     # Empty / non-string inputs must collapse to a queryable token, not "".
     assert docker_env._sanitize_label_value("") == "unknown"
     assert docker_env._sanitize_label_value(None) == "unknown"  # type: ignore[arg-type]
-    # >63 chars must truncate, not error.
+    # >63 chars must remain bounded while differing inputs remain distinguishable.
     long_value = "x" * 100
-    assert len(docker_env._sanitize_label_value(long_value)) == 63
+    sanitized_long = docker_env._sanitize_label_value(long_value)
+    assert len(sanitized_long) == 63
+    assert sanitized_long != docker_env._sanitize_label_value("x" * 99 + "y")
 
 
 def test_run_command_sanitizes_unsafe_task_id(monkeypatch):
@@ -448,10 +2666,9 @@ def test_run_command_sanitizes_unsafe_task_id(monkeypatch):
     _make_dummy_env(task_id="task/with:weird*chars")
 
     labels = _labels_in_run_args(_run_args_from_calls(calls))
-    # Each non-OK character becomes an underscore; the safe chars survive.
-    assert "hermes-task-id=task_with_weird_chars" in labels, (
-        f"sanitized task-id label missing; got: {sorted(labels)}"
-    )
+    task_labels = [label for label in labels if label.startswith("hermes-task-id=")]
+    assert len(task_labels) == 1
+    assert task_labels[0].startswith("hermes-task-id=task_with_weird_chars-")
 
 
 def test_labels_attribute_populated_after_init(monkeypatch):
@@ -469,7 +2686,11 @@ def test_labels_attribute_populated_after_init(monkeypatch):
         "hermes-task-id": "abc",
         "hermes-profile": "default",
         "hermes-egress": "off",
+        "hermes-workspace": "managed-ephemeral",
+        "hermes-tmp-storage": "tmpfs",
+        "hermes-policy": env._labels["hermes-policy"],
     }
+    assert len(env._labels["hermes-policy"]) == 24
 
 
 # ── Cross-process container reuse (issue #20561) ──────────────────
@@ -516,6 +2737,14 @@ def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
                 return subprocess.CompletedProcess(cmd, 0, stdout="reused-cid\n", stderr="")
             if sub == "run":
                 return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
+            if sub == "image" and cmd[2] == "inspect":
+                return subprocess.CompletedProcess(cmd, 0, stdout="sha256:test-image\n", stderr="")
+            if sub == "exec" and cmd[-3:-1] == ["-f", "--"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{cmd[-1]}\n", stderr="")
+            if sub == "inspect" and "{{.HostConfig.NetworkMode}}" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="bridge\n", stderr="")
+            if sub == "inspect" and "{{json .Mounts}}" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="[]\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
@@ -579,6 +2808,14 @@ def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             if sub == "run":
                 return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
+            if sub == "image" and cmd[2] == "inspect":
+                return subprocess.CompletedProcess(cmd, 0, stdout="sha256:test-image\n", stderr="")
+            if sub == "exec" and cmd[-3:-1] == ["-f", "--"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{cmd[-1]}\n", stderr="")
+            if sub == "inspect" and "{{.HostConfig.NetworkMode}}" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="bridge\n", stderr="")
+            if sub == "inspect" and "{{json .Mounts}}" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="[]\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
@@ -593,7 +2830,16 @@ def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):
     assert run_invocations, "egress-enabled containers require a fresh docker run"
 
 
-def test_extra_args_proxy_override_refuses_under_egress(monkeypatch):
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["-e", "HTTPS_PROXY="],
+        ["-eHTTPS_PROXY="],
+        ["-eOPENROUTER_API_KEY"],
+        ["-deOPENROUTER_API_KEY"],
+    ],
+)
+def test_extra_args_proxy_override_refuses_under_egress(monkeypatch, extra_args):
     """docker_extra_args are appended after Hermes args, so egress enforcement
     must reject critical overrides before Docker sees them."""
 
@@ -603,14 +2849,17 @@ def test_extra_args_proxy_override_refuses_under_egress(monkeypatch):
         "_egress_proxy_args_for_docker",
         lambda: (
             [],
-            {"HTTPS_PROXY": "http://host.docker.internal:9090"},
+            {
+                "HTTPS_PROXY": "http://host.docker.internal:9090",
+                "OPENROUTER_API_KEY": "proxy-token",
+            },
             [],
         ),
     )
     _mock_subprocess_run(monkeypatch)
 
-    with pytest.raises(RuntimeError, match="docker_extra_args.*HTTPS_PROXY"):
-        _make_dummy_env(extra_args=["-e", "HTTPS_PROXY="])
+    with pytest.raises(RuntimeError, match="docker_extra_args"):
+        _make_dummy_env(extra_args=extra_args)
 
 
 def test_reuse_starts_stopped_container_before_attaching(monkeypatch):
@@ -651,6 +2900,8 @@ def test_failed_docker_run_cleans_up_orphaned_container(monkeypatch):
             sub = cmd[1]
             if sub == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+            if sub == "image":
+                return subprocess.CompletedProcess(cmd, 0, stdout="sha256:test-image\n", stderr="")
             if sub == "ps":
                 # No reusable container -> fall through to a fresh `docker run`.
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -674,6 +2925,49 @@ def test_failed_docker_run_cleans_up_orphaned_container(monkeypatch):
     assert rm_cmd[3].startswith("hermes-"), "should remove the container by its generated name"
 
 
+def test_failed_reviewer_docker_run_removes_snapshot_volume(monkeypatch, tmp_path):
+    project_dir = tmp_path / "review-target"
+    project_dir.mkdir()
+    (project_dir / "candidate.txt").write_text("reviewed", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "reviewer")
+    monkeypatch.setattr(
+        docker_env,
+        "_materialize_readonly_workspace",
+        lambda *args, **kwargs: "hermes-ro-failed-review",
+    )
+    removed_volumes = []
+
+    def _run(cmd, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 2:
+            sub = cmd[1]
+            if sub == "version":
+                return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+            if sub == "image":
+                return subprocess.CompletedProcess(cmd, 0, stdout="sha256:test-image\n", stderr="")
+            if sub == "run":
+                raise subprocess.CalledProcessError(125, cmd, stderr="start failed")
+            if sub == "volume" and cmd[2:4] == ["rm", "-f"]:
+                removed_volumes.append(cmd[4])
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+    docker_env._cgroup_limits_ok = True
+
+    with pytest.raises(subprocess.CalledProcessError):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(project_dir),
+            auto_mount_cwd=True,
+            cwd_mount_mode="ro",
+            network=False,
+            expected_git_sha="1" * 40,
+        )
+
+    assert removed_volumes == ["hermes-ro-failed-review"]
+
+
 def test_docker_run_timeout_cleans_up_orphaned_container(monkeypatch):
     """When ``docker run`` times out (e.g. slow image pull), the
     partially-created container must be removed. Salvage of #7440
@@ -689,6 +2983,8 @@ def test_docker_run_timeout_cleans_up_orphaned_container(monkeypatch):
             sub = cmd[1]
             if sub == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+            if sub == "image":
+                return subprocess.CompletedProcess(cmd, 0, stdout="sha256:test-image\n", stderr="")
             if sub == "ps":
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             if sub == "run":
@@ -728,6 +3024,10 @@ def test_find_reusable_handles_empty_label_string(monkeypatch):
                     stdout="safe-cid\trunning\t\n",
                     stderr="",
                 )
+            if cmd[1] == "exec" and cmd[-3:-1] == ["-f", "--"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{cmd[-1]}\n", stderr="")
+            if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="[]\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
@@ -1194,9 +3494,15 @@ def _mock_subprocess_run_with_entrypoint(monkeypatch, entrypoint_json):
             if cmd[1] == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
             if cmd[1] == "image" and len(cmd) >= 3 and cmd[2] == "inspect":
+                if "{{.Id}}" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="sha256:test-image\n", stderr="")
                 return subprocess.CompletedProcess(cmd, 0, stdout=entrypoint_json + "\n", stderr="")
             if cmd[1] == "run":
                 return subprocess.CompletedProcess(cmd, 0, stdout="fake-container-id\n", stderr="")
+            if cmd[1] == "exec" and cmd[-3:-1] == ["-f", "--"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{cmd[-1]}\n", stderr="")
+            if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="[]\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)

@@ -40,6 +40,53 @@ def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
     )
 
 
+def test_exact_sha_reviewer_worker_gets_only_task_closure_tools(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_review")
+    monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "a" * 40)
+
+    import tools.kanban_tools  # noqa: F401
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("kanban")), quiet=True)
+    names = {item["function"]["name"] for item in schema}
+
+    assert names == {"kanban_show", "kanban_complete", "kanban_block"}
+
+
+def test_exact_sha_reviewer_cannot_show_another_task(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_review")
+    monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "a" * 40)
+
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_show({"task_id": "t_other"}))
+    assert result["error"].startswith("exact-SHA reviewers may inspect only")
+
+
+def test_exact_sha_reviewer_show_returns_only_own_task(monkeypatch, worker_env):
+    monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "a" * 40)
+
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_show({}))
+    assert set(result) == {"task"}
+    assert result["task"]["id"] == worker_env
+
+
+def test_exact_sha_reviewer_cannot_switch_board(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_review")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "assigned-board")
+    monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "a" * 40)
+
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_show({"board": "other-board"}))
+    assert result["error"].startswith("exact-SHA reviewers may inspect only")
+
+
 # ---------------------------------------------------------------------------
 # Handler happy paths
 # ---------------------------------------------------------------------------

@@ -63,13 +63,22 @@ def _reuse_guard_harness(monkeypatch, *, existing_mode: str, network: bool):
             stderr = ""
             stdout = ""
 
-        if len(cmd) > 1 and cmd[1] == "ps":
+        if len(cmd) > 2 and cmd[1:3] == ["image", "inspect"]:
+            Result.stdout = "sha256:test-image\n"
+        elif len(cmd) > 1 and cmd[1] == "ps":
             # Matches the egress-aware reuse probe: with egress off the
             # format string is ID\tState\tEgressLabel and docker renders a
             # missing label as "<no value>".
             Result.stdout = "existing-container-id\trunning\t<no value>\n"
         elif len(cmd) > 1 and cmd[1] == "inspect":
-            Result.stdout = f"{existing_mode}\n"
+            if "{{.HostConfig.NetworkMode}}" in cmd:
+                Result.stdout = f"{existing_mode}\n"
+            elif "{{json .Mounts}}" in cmd:
+                Result.stdout = "[]\n"
+            else:
+                Result.stdout = "\n"
+        elif len(cmd) > 1 and cmd[1] == "exec":
+            Result.stdout = "/tmp\n"
         elif len(cmd) > 1 and cmd[1] == "run":
             Result.stdout = "fresh-container-id\n"
         return Result()
@@ -106,11 +115,11 @@ def test_reuse_keeps_airgapped_container_when_lockdown_requested(monkeypatch):
     assert not any(cmd[1] == "run" for cmd in commands), "matching container must be reused"
 
 
-def test_reuse_skips_inspect_when_network_enabled(monkeypatch):
+def test_reuse_rejects_airgapped_container_when_network_enabled(monkeypatch):
     commands = _reuse_guard_harness(monkeypatch, existing_mode="none", network=True)
 
-    # Default-network config never churns containers, even air-gapped ones
-    # (operators may have created them via docker_extra_args).
-    assert not any(cmd[1] == "inspect" for cmd in commands)
-    assert not any(cmd[1] == "rm" for cmd in commands)
-    assert not any(cmd[1] == "run" for cmd in commands)
+    # Effective network policy is immutable and checked in both directions.
+    # A stale air-gapped container cannot satisfy a network-enabled request.
+    assert any(cmd[1:3] == ["rm", "-f"] for cmd in commands)
+    run_cmd = next(cmd for cmd in commands if len(cmd) > 2 and cmd[1:3] == ["run", "-d"])
+    assert "--network=none" not in run_cmd

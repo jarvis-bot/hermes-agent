@@ -26,6 +26,17 @@ mirrors the pattern used in tests/hermes_cli/test_config_drift.py.
 import ast
 import inspect
 
+import pytest
+
+from tools import terminal_tool
+
+
+def test_malformed_expected_workspace_sha_fails_closed(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "candidate-branch")
+
+    with pytest.raises(ValueError, match="40 lowercase hex"):
+        terminal_tool._expected_kanban_workspace_sha()
+
 
 def _extract_dict_values(source: str, dict_name: str) -> set[str]:
     """Return the set of *value* strings in `dict_name = { "k": "VALUE", ... }`.
@@ -215,6 +226,230 @@ def test_docker_mount_cwd_to_workspace_is_bridged_everywhere():
     assert "docker_mount_cwd_to_workspace" in _gateway_env_map_keys()
     assert "docker_mount_cwd_to_workspace" in _save_config_env_sync_keys()
     assert "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE" in _terminal_tool_env_var_names()
+
+
+def test_docker_cwd_mount_policy_is_bridged_everywhere():
+    expected = {
+        "docker_cwd_mount_mode": "TERMINAL_DOCKER_CWD_MOUNT_MODE",
+        "docker_cwd_path_mappings": "TERMINAL_DOCKER_CWD_PATH_MAPPINGS",
+        "docker_cwd_allowed_roots": "TERMINAL_DOCKER_CWD_ALLOWED_ROOTS",
+    }
+    for key, env_var in expected.items():
+        assert key in _cli_env_map_keys()
+        assert key in _gateway_env_map_keys()
+        assert key in _save_config_env_sync_keys()
+        assert env_var in _terminal_tool_env_var_names()
+
+
+def test_docker_tmp_storage_is_bridged_everywhere():
+    assert "docker_tmp_storage" in _cli_env_map_keys()
+    assert "docker_tmp_storage" in _gateway_env_map_keys()
+    assert "docker_tmp_storage" in _save_config_env_sync_keys()
+    assert "TERMINAL_DOCKER_TMP_STORAGE" in _terminal_tool_env_var_names()
+
+
+def test_sibling_container_config_sites_carry_docker_tmp_storage():
+    """Every tool path that can create Docker must preserve /tmp policy."""
+    import ast
+    from pathlib import Path
+
+    modules = [
+        "tools/terminal_tool.py",
+        "tools/file_tools.py",
+        "tools/code_execution_tool.py",
+        "agent/prompt_builder.py",
+    ]
+    sites = 0
+    for relative_path in modules:
+        tree = ast.parse(Path(relative_path).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            keys = {key.value for key in node.keys if isinstance(key, ast.Constant)}
+            if "docker_run_as_host_user" in keys:
+                sites += 1
+                assert "docker_tmp_storage" in keys, (
+                    f"{relative_path} builds a container_config without "
+                    f"docker_tmp_storage (line {node.lineno})"
+                )
+    assert sites >= len(modules)
+
+
+def test_execute_code_carries_exact_sha_reviewer_mount_policy():
+    """execute_code must be able to create the same reviewer env as terminal/file."""
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(
+        Path("tools/code_execution_tool.py").read_text(encoding="utf-8")
+    )
+    required = {
+        "docker_mount_cwd_to_workspace",
+        "docker_cwd_mount_mode",
+        "docker_cwd_path_mappings",
+        "docker_cwd_allowed_roots",
+        "docker_forward_env",
+        "docker_env",
+        "docker_extra_args",
+        "docker_network",
+        "docker_tmp_storage",
+    }
+    configs = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        keys = {key.value for key in node.keys if isinstance(key, ast.Constant)}
+        if "docker_tmp_storage" in keys:
+            configs.append(keys)
+    assert configs
+    assert all(required <= keys for keys in configs)
+
+
+def test_terminal_env_config_parses_docker_tmp_storage(monkeypatch):
+    from tools import terminal_tool
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_TMP_STORAGE", "disk")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["docker_tmp_storage"] == "disk"
+
+
+def test_config_yaml_disk_tmp_storage_reaches_docker_constructor(tmp_path, monkeypatch):
+    """Exercise config.yaml through CLI bridging and the terminal factory."""
+    import cli
+    from tools import terminal_tool
+
+    (tmp_path / "config.yaml").write_text(
+        "terminal:\n  backend: docker\n  docker_tmp_storage: disk\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_hermes_home", tmp_path)
+    cli.load_cli_config()
+
+    runtime_config = terminal_tool._get_env_config()
+    captured = {}
+
+    class CapturingDockerEnvironment:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(terminal_tool, "_DockerEnvironment", CapturingDockerEnvironment)
+    monkeypatch.setattr(terminal_tool, "_maybe_reap_docker_orphans", lambda config: None)
+
+    terminal_tool._create_environment(
+        "docker",
+        runtime_config["docker_image"],
+        "/workspace",
+        60,
+        container_config=runtime_config,
+    )
+
+    assert captured["tmp_storage"] == "disk"
+
+
+def test_assigned_workspace_sha_reaches_docker_constructor(monkeypatch):
+    from tools import terminal_tool
+
+    assigned_sha = "a" * 40
+    monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", assigned_sha)
+    captured = {}
+
+    class CapturingDockerEnvironment:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(terminal_tool, "_DockerEnvironment", CapturingDockerEnvironment)
+    monkeypatch.setattr(terminal_tool, "_maybe_reap_docker_orphans", lambda config: None)
+
+    terminal_tool._create_environment(
+        "docker",
+        "python:3.11",
+        "/workspace",
+        60,
+        container_config={},
+    )
+
+    assert captured["expected_git_sha"] == assigned_sha
+
+
+def test_assigned_workspace_sha_rejects_non_docker_backend(monkeypatch):
+    from tools import terminal_tool
+
+    monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "a" * 40)
+
+    with pytest.raises(ValueError, match="requires the docker terminal backend"):
+        terminal_tool._create_environment("local", "", "/workspace", 60)
+
+
+def test_mini_swe_docker_factory_uses_configured_tmp_storage(monkeypatch):
+    import mini_swe_runner
+
+    captured = {}
+    monkeypatch.delenv("TERMINAL_DOCKER_TMP_STORAGE", raising=False)
+
+    class FakeDockerEnvironment:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "tools.environments.docker.DockerEnvironment", FakeDockerEnvironment
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"terminal": {"docker_tmp_storage": "disk"}},
+    )
+
+    mini_swe_runner.create_environment(env_type="docker")
+
+    assert captured["tmp_storage"] == "disk"
+
+
+def test_mini_swe_docker_factory_honors_tmp_storage_env_override(monkeypatch):
+    import mini_swe_runner
+
+    captured = {}
+
+    class FakeDockerEnvironment:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "tools.environments.docker.DockerEnvironment", FakeDockerEnvironment
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"terminal": {"docker_tmp_storage": "tmpfs"}},
+    )
+    monkeypatch.setenv("TERMINAL_DOCKER_TMP_STORAGE", "disk")
+
+    mini_swe_runner.create_environment(env_type="docker")
+
+    assert captured["tmp_storage"] == "disk"
+
+
+def test_terminal_env_config_parses_docker_cwd_mount_policy(monkeypatch):
+    from tools import terminal_tool
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_CWD_MOUNT_MODE", "ro")
+    monkeypatch.setenv(
+        "TERMINAL_DOCKER_CWD_PATH_MAPPINGS",
+        '{"/opt/data": "/home/ubuntu/.hermes"}',
+    )
+    monkeypatch.setenv(
+        "TERMINAL_DOCKER_CWD_ALLOWED_ROOTS",
+        '["/opt/data/reviewer-tasks"]',
+    )
+
+    config = terminal_tool._get_env_config()
+
+    assert config["docker_cwd_mount_mode"] == "ro"
+    assert config["docker_cwd_path_mappings"] == {
+        "/opt/data": "/home/ubuntu/.hermes"
+    }
+    assert config["docker_cwd_allowed_roots"] == ["/opt/data/reviewer-tasks"]
 
 
 def test_docker_env_is_bridged_everywhere():

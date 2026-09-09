@@ -68,6 +68,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
         "branch_name": t.branch_name,
+        "expected_workspace_sha": t.expected_workspace_sha,
         "project_id": t.project_id,
         "created_by": t.created_by,
         "created_at": t.created_at,
@@ -76,6 +77,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
+        "max_runtime_seconds": t.max_runtime_seconds,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
         "session_id": t.session_id,
@@ -91,6 +93,8 @@ def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:
         return None
     if st is None:
         return {}
+    if not isinstance(st, str) or not isinstance(sn, str):
+        return None
     return {"state_type": st, "state_name": sn}
 
 
@@ -350,6 +354,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(default: scratch)")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
+    p_create.add_argument(
+        "--expected-workspace-sha",
+        default=None,
+        help="Expected 40-character lowercase Git commit for a dir workspace",
+    )
     p_create.add_argument("--project", default=None,
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
@@ -448,6 +457,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_list.add_argument("--archived", action="store_true",
                         help="Include archived tasks")
     p_list.add_argument("--json", action="store_true")
+    p_list.add_argument(
+        "--read-only",
+        action="store_true",
+        help="Inspect without schema migration, readiness recompute, or DB writes",
+    )
     p_list.add_argument(
         "--sort",
         default=None,
@@ -1053,7 +1067,10 @@ def kanban_command(args: argparse.Namespace) -> int:
         if action == "capabilities":
             return _cmd_capabilities(args)
         try:
-            kb.init_db()
+            # Read-only list deliberately bypasses schema initialization and
+            # migrations; it must be a pure observation even on old boards.
+            if not (action in {"list", "ls"} and getattr(args, "read_only", False)):
+                kb.init_db()
         except Exception as exc:
             print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
             return 1
@@ -1177,7 +1194,11 @@ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
 
 def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
     action = getattr(args, "kanban_action", None)
-    if action == "boards":
+    # ``list`` historically recomputes readiness and therefore is a mutation.
+    # Delegated children may inspect only through the explicit query-only path.
+    if action in {"list", "ls"} and not getattr(args, "read_only", False):
+        pass
+    elif action == "boards":
         boards_action = getattr(args, "boards_action", None) or "list"
         if boards_action not in _DELEGATED_CHILD_DENIED_BOARD_ACTIONS:
             return False
@@ -1513,6 +1534,22 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if branch_name and ws_kind != "worktree":
         print("kanban: --branch is only valid with --workspace worktree", file=sys.stderr)
         return 2
+    expected_workspace_sha = getattr(args, "expected_workspace_sha", None)
+    if expected_workspace_sha is not None and (
+        len(expected_workspace_sha) != 40
+        or any(char not in "0123456789abcdef" for char in expected_workspace_sha)
+    ):
+        print(
+            "kanban: --expected-workspace-sha must be exactly 40 lowercase hexadecimal characters",
+            file=sys.stderr,
+        )
+        return 2
+    if expected_workspace_sha is not None and ws_kind != "dir":
+        print(
+            "kanban: --expected-workspace-sha is only valid with --workspace dir:PATH",
+            file=sys.stderr,
+        )
+        return 2
     try:
         max_runtime = _parse_duration(getattr(args, "max_runtime", None))
     except ValueError as exc:
@@ -1536,6 +1573,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             workspace_kind=ws_kind,
             workspace_path=ws_path,
             branch_name=branch_name,
+            expected_workspace_sha=expected_workspace_sha,
             project_id=getattr(args, "project", None),
             tenant=args.tenant,
             priority=args.priority,
@@ -1552,6 +1590,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
+    if task is None:  # create_task returning an unreadable id is an invariant breach
+        print(f"error: created task {task_id} could not be read back", file=sys.stderr)
+        return 1
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -1606,10 +1647,13 @@ def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
-    with kb.connect_closing() as conn:
-        # Cheap "mini-dispatch": recompute ready so list output reflects
-        # dependencies that may have cleared since the last dispatcher tick.
-        kb.recompute_ready(conn)
+    read_only = bool(getattr(args, "read_only", False))
+    connector = kb.connect_read_only if read_only else kb.connect
+    with contextlib.closing(connector()) as conn:
+        # Cheap "mini-dispatch" for normal interactive output only. The
+        # explicit read-only path reflects stored state exactly and never writes.
+        if not read_only:
+            kb.recompute_ready(conn)
         tasks = kb.list_tasks(
             conn,
             assignee=assignee,

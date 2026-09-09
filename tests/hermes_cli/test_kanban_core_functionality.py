@@ -52,6 +52,67 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Atomic dependency release
+# ---------------------------------------------------------------------------
+
+
+def test_complete_promotes_all_dependents_in_same_transaction(kanban_home):
+    with kb.connect_closing() as conn:
+        gate = kb.create_task(
+            conn, title="host gate", assignee=None, initial_status="blocked"
+        )
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, gate).status == "blocked"
+        children = [
+            kb.create_task(
+                conn, title=f"review {index}", assignee=f"reviewer-{index}",
+                parents=(gate,),
+            )
+            for index in range(3)
+        ]
+        statements: list[str] = []
+        conn.set_trace_callback(statements.append)
+
+        assert kb.complete_task(conn, gate, result="release") is True
+
+        conn.set_trace_callback(None)
+        assert kb.get_task(conn, gate).status == "done"
+        assert [kb.get_task(conn, child).status for child in children] == [
+            "ready", "ready", "ready"
+        ]
+        boundaries = [
+            statement.strip().upper()
+            for statement in statements
+            if statement.strip().upper().startswith(("BEGIN", "COMMIT"))
+        ]
+        assert boundaries[:2] == ["BEGIN IMMEDIATE", "COMMIT"]
+        first_commit = next(
+            index for index, statement in enumerate(statements)
+            if statement.strip().upper() == "COMMIT"
+        )
+        atomic_sql = "\n".join(statements[:first_commit]).lower()
+        assert "set status       = 'done'" in atomic_sql
+        assert atomic_sql.count("set status = 'ready'") == 3
+
+
+def test_nested_recompute_preserves_delegated_child_guard(kanban_home, monkeypatch):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn, title="waiting", assignee="reviewer", initial_status="blocked"
+        )
+        conn.execute("BEGIN IMMEDIATE")
+        monkeypatch.setattr(
+            kb,
+            "_assert_not_delegated_child_mutation",
+            lambda: (_ for _ in ()).throw(PermissionError("delegated child")),
+        )
+        with pytest.raises(PermissionError, match="delegated child"):
+            kb.recompute_ready(conn)
+        conn.execute("ROLLBACK")
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+
+# ---------------------------------------------------------------------------
 # Idempotency key
 # ---------------------------------------------------------------------------
 
@@ -979,6 +1040,19 @@ def _make_create_ns(**overrides):
     for k, v in overrides.items():
         setattr(ns, k, v)
     return ns
+
+
+def test_cmd_create_reports_invalid_expected_workspace_sha(monkeypatch, capsys):
+    from hermes_cli import kanban as kb_cli
+
+    args = _make_create_ns(
+        workspace="dir:/tmp/reviewer",
+        expected_workspace_sha="not-a-sha",
+    )
+    monkeypatch.setattr(kb_cli.kb, "connect_closing", lambda: pytest.fail("DB must not open"))
+
+    assert kb_cli._cmd_create(args) == 2
+    assert "expected-workspace-sha" in capsys.readouterr().err
 
 
 def test_cli_daemon_help_marks_deprecated():

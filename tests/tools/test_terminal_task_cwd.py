@@ -3,6 +3,7 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 import tools.terminal_tool as terminal_tool
 
 
@@ -13,6 +14,51 @@ def _minimal_terminal_config(cwd="/default"):
         "timeout": 60,
         "lifetime_seconds": 3600,
     }
+
+
+def test_reviewer_runtime_marker_rejects_local_backend(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_REVIEWER_ISOLATION", "1")
+    with pytest.raises(ValueError, match="requires the docker terminal backend"):
+        terminal_tool._create_environment("local", "unused", "/tmp", 60)
+
+
+def test_reviewer_runtime_marker_forces_disposable_credential_free_docker(
+    monkeypatch, tmp_path
+):
+    captured = {}
+    monkeypatch.setenv("HERMES_KANBAN_REVIEWER_ISOLATION", "1")
+    monkeypatch.setattr(terminal_tool, "_maybe_reap_docker_orphans", lambda _cc: None)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_DockerEnvironment",
+        lambda **kwargs: captured.update(kwargs) or SimpleNamespace(),
+    )
+    terminal_tool._create_environment(
+        "docker", "python:3.11", "/workspace", 60,
+        host_cwd=str(tmp_path),
+        container_config={
+            "container_persistent": True,
+            "docker_network": True,
+            "docker_volumes": ["secret:/secret"],
+            "docker_forward_env": ["TOKEN"],
+            "docker_env": {"TOKEN": "secret"},
+            "docker_extra_args": ["--privileged"],
+            "docker_persist_across_processes": True,
+            "docker_mount_cwd_to_workspace": False,
+            "docker_cwd_mount_mode": "rw",
+            "docker_cwd_allowed_roots": [str(tmp_path)],
+        },
+    )
+    assert captured["reviewer_mode"] is True
+    assert captured["persistent_filesystem"] is False
+    assert captured["persist_across_processes"] is False
+    assert captured["network"] is False
+    assert captured["volumes"] == []
+    assert captured["forward_env"] == []
+    assert captured["env"] == {}
+    assert captured["extra_args"] == []
+    assert captured["auto_mount_cwd"] is True
+    assert captured["cwd_mount_mode"] == "ro"
 
 
 def test_foreground_command_uses_registered_task_cwd_for_existing_environment(monkeypatch):
@@ -74,6 +120,85 @@ def test_explicit_workdir_still_wins_over_registered_task_cwd(monkeypatch):
 
     assert result["exit_code"] == 0
     assert calls == [{"timeout": 60, "cwd": "/explicit/workdir", "bounded_capture": True}]
+
+
+def test_exact_sha_reviewer_does_not_remount_recorded_container_cwd(monkeypatch, tmp_path):
+    calls = []
+    ticket = tmp_path / "ticket"
+    ticket.mkdir()
+
+    class FakeEnv:
+        env = {}
+
+        def execute(self, command, **kwargs):
+            calls.append(kwargs)
+            return {"output": "ok", "returncode": 0}
+
+    config = {
+        "env_type": "docker",
+        "cwd": "/workspace",
+        "host_cwd": str(ticket),
+        "docker_image": "python:3.11-slim",
+        "docker_mount_cwd_to_workspace": True,
+        "timeout": 60,
+        "lifetime_seconds": 3600,
+    }
+    monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "a" * 40)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {"default": "/tmp/review"})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+
+    result = json.loads(terminal_tool.terminal_tool(command="pwd", workdir="/tmp"))
+
+    assert result["exit_code"] == 0
+    assert calls == [{"timeout": 60, "cwd": "/tmp", "bounded_capture": True}]
+
+
+def test_exact_sha_reviewer_first_command_uses_writable_review_copy(monkeypatch, tmp_path):
+    calls = []
+    ticket = tmp_path / "ticket"
+    ticket.mkdir()
+
+    class FakeEnv:
+        env = {}
+        cwd = "/tmp/review"
+
+        def execute(self, command, **kwargs):
+            calls.append(kwargs)
+            return {"output": "ok", "returncode": 0}
+
+    config = {
+        "env_type": "docker",
+        "cwd": "/workspace",
+        "host_cwd": str(ticket),
+        "docker_image": "python:3.11-slim",
+        "docker_mount_cwd_to_workspace": True,
+        "timeout": 60,
+        "lifetime_seconds": 3600,
+    }
+    monkeypatch.setenv("HERMES_KANBAN_EXPECTED_WORKSPACE_SHA", "a" * 40)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+
+    result = json.loads(terminal_tool.terminal_tool(command="pwd"))
+
+    assert result["exit_code"] == 0
+    assert calls == [{"timeout": 60, "cwd": "/tmp/review", "bounded_capture": True}]
 
 
 def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monkeypatch):
@@ -141,3 +266,82 @@ def test_safe_getcwd_falls_back_to_home_when_no_terminal_cwd(monkeypatch):
     monkeypatch.delenv("TERMINAL_CWD", raising=False)
     monkeypatch.setattr(terminal_tool.os.path, "expanduser", lambda p: "/home/me")
     assert terminal_tool._safe_getcwd() == "/home/me"
+
+
+def test_resolved_ticket_cwd_becomes_dynamic_docker_mount_source(tmp_path):
+    ticket_cwd = tmp_path / "ticket-149"
+    ticket_cwd.mkdir()
+    config = {
+        "cwd": "/workspace",
+        "host_cwd": "/opt/data",
+        "docker_mount_cwd_to_workspace": True,
+    }
+
+    cwd, host_cwd = terminal_tool.resolve_container_cwd_mount(
+        "docker", str(ticket_cwd), config
+    )
+
+    assert cwd == "/workspace"
+    assert host_cwd == str(ticket_cwd)
+
+
+def test_new_docker_environment_mounts_registered_ticket_cwd(tmp_path, monkeypatch):
+    ticket_cwd = tmp_path / "ticket-149"
+    ticket_cwd.mkdir()
+    task_id = "ticket-149-review"
+    created = {}
+
+    class FakeEnv:
+        env = {}
+
+        def execute(self, command, **kwargs):
+            return {"output": "ok", "returncode": 0}
+
+    config = {
+        "env_type": "docker",
+        "cwd": "/workspace",
+        "host_cwd": str(tmp_path),
+        "docker_image": "python:3.11-slim",
+        "docker_mount_cwd_to_workspace": True,
+        "timeout": 60,
+        "lifetime_seconds": 3600,
+    }
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(
+        terminal_tool, "_task_env_overrides", {task_id: {"cwd": str(ticket_cwd)}}
+    )
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+
+    def fake_create_environment(**kwargs):
+        created.update(kwargs)
+        return FakeEnv()
+
+    monkeypatch.setattr(terminal_tool, "_create_environment", fake_create_environment)
+
+    result = json.loads(terminal_tool.terminal_tool(command="pwd", task_id=task_id))
+
+    assert result["exit_code"] == 0
+    assert created["cwd"] == "/workspace"
+    assert created["host_cwd"] == str(ticket_cwd)
+
+
+def test_container_cwd_resolution_preserves_non_mount_behavior():
+    config = {
+        "cwd": "/root",
+        "host_cwd": None,
+        "docker_mount_cwd_to_workspace": False,
+    }
+
+    cwd, host_cwd = terminal_tool.resolve_container_cwd_mount(
+        "docker", "/home/user/ticket", config
+    )
+
+    assert cwd == "/root"
+    assert host_cwd is None

@@ -445,7 +445,7 @@ When using the `docker` terminal backend, Hermes applies strict security hardeni
 
 ### Docker Security Flags
 
-Every container runs with these flags (defined in `tools/environments/docker.py`):
+Every container runs with these baseline flags (defined in `tools/environments/docker.py`):
 
 ```python
 _BASE_SECURITY_ARGS = [
@@ -454,13 +454,11 @@ _BASE_SECURITY_ARGS = [
     "--cap-add", "CHOWN",                         # Package managers need file ownership
     "--cap-add", "FOWNER",                        # Package managers need file ownership
     "--security-opt", "no-new-privileges",         # Block privilege escalation
-    "--pids-limit", "256",                         # Limit process count
-    "--tmpfs", "/tmp:rw,nosuid,size=512m",         # Size-limited /tmp
     "--tmpfs", "/var/tmp:rw,noexec,nosuid,size=256m",  # No-exec /var/tmp
 ]
 ```
 
-`SETUID`/`SETGID` are **not** in the base list — they're added conditionally when the container starts as root and an init/entrypoint must drop privileges (the s6 privilege-drop path). They're skipped when the container already runs as a non-root `--user`. The `/run` tmpfs is also split out from the base list and mounted per-image (hardened `noexec` by default, `exec` only for s6-overlay images that exec from `/run`).
+The PID limit is added when the host supports the required cgroup controllers. By default `/tmp` is a `rw,nosuid,size=512m` tmpfs; `terminal.docker_tmp_storage: disk` instead leaves `/tmp` on the container writable layer for larger workloads. User-supplied mounts cannot replace `/tmp`, so the reuse-policy label always describes the effective storage. `SETUID`/`SETGID` are **not** in the base list — they're added conditionally when the container starts as root and an init/entrypoint must drop privileges (the s6 privilege-drop path). They're skipped when the container already runs as a non-root `--user`. The `/run` tmpfs is also split out from the base list and mounted per-image (hardened `noexec` by default, `exec` only for s6-overlay images that exec from `/run`).
 
 ### Resource Limits
 

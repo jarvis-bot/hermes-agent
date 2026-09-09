@@ -606,7 +606,7 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 | `boards show` / `boards current` | Print the currently-active board's name, DB path, and task counts. |
 | `boards rename <slug> "<name>"` | Change a board's display name. Slug is immutable. |
 | `boards rm <slug>` | Archive (default) or hard-delete a board. `--delete` skips the archive step. Archived boards move to `boards/_archived/<slug>-<ts>/`. Refused for `default`. |
-| `create "<title>"` | Create a new task on the active board. Flags: `--body`, `--assignee`, `--parent` (repeatable), `--workspace scratch\|worktree\|dir:<path>`, `--tenant`, `--priority`, `--triage`, `--idempotency-key`, `--max-runtime`, `--max-retries`, `--skill` (repeatable). |
+| `create "<title>"` | Create a new task on the active board. Flags: `--body`, `--assignee`, `--parent` (repeatable), `--workspace scratch\|worktree\|dir:<path>`, `--expected-workspace-sha`, `--tenant`, `--priority`, `--triage`, `--idempotency-key`, `--max-runtime`, `--max-retries`, `--skill` (repeatable). |
 | `list` / `ls` | List tasks on the active board. Filter with `--mine`, `--assignee`, `--status`, `--tenant`, `--archived`, `--json`. |
 | `show <id>` | Show a task with comments and events. `--json` for machine output. |
 | `assign <id> <profile>` | Assign or reassign. Use `none` to unassign. Refused while task is running. |
@@ -637,10 +637,24 @@ hermes kanban --board atm10-server create "Restart server" --assignee ops
 hermes kanban boards switch atm10-server
 hermes kanban list                  # shows atm10-server tasks
 
+# Pin a review task to the exact clean commit in an existing checkout.
+hermes kanban create "Review assigned snapshot" \
+  --assignee security-reviewer \
+  --workspace dir:/srv/reviews/project \
+  --expected-workspace-sha 0123456789abcdef0123456789abcdef01234567
+
 # Archive a board (recoverable) or hard-delete it.
 hermes kanban boards rm atm10-server
 hermes kanban boards rm atm10-server --delete
 ```
+
+`--expected-workspace-sha` accepts exactly a lowercase 40-character Git SHA
+and only with `dir:<absolute-path>`. The reviewer profile must use the Docker
+terminal backend with `docker_network: false`; Hermes rejects dirty or
+different Git contents, writable workspace mounting, configured Docker
+volumes/environment/raw arguments, missing image tooling, or any unexpected
+writable image volume. The authenticated snapshot is mounted read-only at
+`/workspace`; reviewer writes go only to disposable container storage.
 
 Board resolution order (highest precedence first): `--board <slug>` flag → `HERMES_KANBAN_BOARD` env var → `~/.hermes/kanban/current` file → `default`.
 

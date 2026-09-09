@@ -285,6 +285,9 @@ DEFAULT_CONFIG = {
         "auto_source_bashrc": True,
         "docker_image": "nikolaik/python-nodejs:python3.11-nodejs20",
         "docker_forward_env": [],
+        # ``tmpfs`` keeps the hardened, size-limited /tmp default. ``disk``
+        # uses the container writable layer for workloads larger than 512 MB.
+        "docker_tmp_storage": "tmpfs",
         # Explicit environment variables to set inside Docker containers.
         # Unlike docker_forward_env (which reads values from the host process),
         # docker_env lets you specify exact key-value pairs — useful when Hermes
@@ -313,6 +316,14 @@ DEFAULT_CONFIG = {
         # Explicit opt-in: mount the host cwd into /workspace for Docker sessions.
         # Default off because passing host directories into a sandbox weakens isolation.
         "docker_mount_cwd_to_workspace": False,
+        # Access mode for the automatic cwd mount. ``rw`` preserves historical
+        # behavior; reviewer profiles can select ``ro``.
+        "docker_cwd_mount_mode": "rw",
+        # Optional container-visible prefix -> Docker-daemon-host prefix map.
+        # Needed when Hermes itself runs in Docker against the host Docker socket.
+        "docker_cwd_path_mappings": {},
+        # Optional canonical container-visible roots from which cwd may be mounted.
+        "docker_cwd_allowed_roots": [],
         # Opt-in egress lockdown for Docker terminal sessions. When false,
         # Docker runs with --network=none so commands cannot reach the network.
         "docker_network": True,
@@ -2157,6 +2168,14 @@ DEFAULT_CONFIG = {
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Fixed, operator-reviewed allowlist for durable supervisor resume
+        # requests. Empty by default: no request can be consumed accidentally.
+        "resume_request_policies": [],
+        # Filesystem capability endpoint. It remains disabled until an absolute
+        # outbox and a dedicated producer UID (different from the gateway UID)
+        # are both configured.
+        "resume_request_outbox": "",
+        "resume_request_producer_uid": None,
         # Auto-block after this many consecutive non-success attempts for the
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.

@@ -10,6 +10,7 @@ import pytest
 from hermes_cli.config import (
     config_command,
     cron_model_drift_guard_enabled,
+    get_env_value,
     set_config_value,
 )
 
@@ -103,6 +104,50 @@ class TestConfigYamlRouting:
         config = _read_config(_isolated_hermes_home)
         assert "python:3.12" in config
 
+    @pytest.mark.parametrize("value", ["DISK", "disk ", "", "true", "512"])
+    def test_terminal_tmp_storage_rejects_invalid_value_before_writing(
+        self, _isolated_hermes_home, value
+    ):
+        with pytest.raises(ValueError, match="exactly 'tmpfs' or 'disk'"):
+            set_config_value("terminal.docker_tmp_storage", value)
+
+        assert "docker_tmp_storage" not in _read_config(_isolated_hermes_home)
+        assert "TERMINAL_DOCKER_TMP_STORAGE" not in _read_env(_isolated_hermes_home)
+
+    @pytest.mark.parametrize("value", ["tmpfs", "disk"])
+    def test_terminal_tmp_storage_accepts_exact_allowed_values(
+        self, _isolated_hermes_home, value
+    ):
+        import yaml
+
+        set_config_value("terminal.docker_tmp_storage", value)
+
+        config = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert config["terminal"]["docker_tmp_storage"] == value
+        assert get_env_value("TERMINAL_DOCKER_TMP_STORAGE") == value
+
+    @pytest.mark.parametrize("value", ["RO", "rw ", "", "true", "write-mostly"])
+    def test_terminal_cwd_mount_mode_rejects_invalid_value_before_writing(
+        self, _isolated_hermes_home, value
+    ):
+        with pytest.raises(ValueError, match="exactly 'ro' or 'rw'"):
+            set_config_value("terminal.docker_cwd_mount_mode", value)
+
+        assert "docker_cwd_mount_mode" not in _read_config(_isolated_hermes_home)
+        assert "TERMINAL_DOCKER_CWD_MOUNT_MODE" not in _read_env(_isolated_hermes_home)
+
+    @pytest.mark.parametrize("value", ["ro", "rw"])
+    def test_terminal_cwd_mount_mode_accepts_exact_allowed_values(
+        self, _isolated_hermes_home, value
+    ):
+        import yaml
+
+        set_config_value("terminal.docker_cwd_mount_mode", value)
+
+        config = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert config["terminal"]["docker_cwd_mount_mode"] == value
+        assert get_env_value("TERMINAL_DOCKER_CWD_MOUNT_MODE") == value
+
     def test_terminal_docker_cwd_mount_flag_goes_to_config_and_env(self, _isolated_hermes_home):
         set_config_value("terminal.docker_mount_cwd_to_workspace", "true")
         config = _read_config(_isolated_hermes_home)
@@ -112,6 +157,39 @@ class TestConfigYamlRouting:
             "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=true" in env_content
             or "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=True" in env_content
         )
+
+    @pytest.mark.parametrize(
+        ("key", "raw", "expected", "env_name"),
+        [
+            (
+                "terminal.docker_cwd_path_mappings",
+                '{"/opt/data":"/home/ubuntu/.hermes"}',
+                {"/opt/data": "/home/ubuntu/.hermes"},
+                "TERMINAL_DOCKER_CWD_PATH_MAPPINGS",
+            ),
+            (
+                "terminal.docker_cwd_allowed_roots",
+                '["/opt/data/tutelara-delivery-runs"]',
+                ["/opt/data/tutelara-delivery-runs"],
+                "TERMINAL_DOCKER_CWD_ALLOWED_ROOTS",
+            ),
+        ],
+    )
+    def test_terminal_structured_values_are_saved_as_structures(
+        self, _isolated_hermes_home, key, raw, expected, env_name
+    ):
+        import yaml
+
+        set_config_value(key, raw)
+
+        config = yaml.safe_load(_read_config(_isolated_hermes_home))
+        leaf = key.rsplit(".", 1)[1]
+        assert config["terminal"][leaf] == expected
+        assert json.loads(get_env_value(env_name)) == expected
+
+    def test_terminal_structured_value_rejects_wrong_json_shape(self):
+        with pytest.raises(ValueError, match="JSON object"):
+            set_config_value("terminal.docker_cwd_path_mappings", "[]")
 
     def test_terminal_vercel_runtime_goes_to_config_and_env(self, _isolated_hermes_home):
         set_config_value("terminal.vercel_runtime", "python3.13")

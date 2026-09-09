@@ -749,6 +749,13 @@ class TestEnvironmentHints:
                     ),
                 }
 
+            def cleanup(self):
+                created["cleaned"] = True
+
+            def wait_for_cleanup(self, timeout):
+                created["cleanup_timeout"] = timeout
+                return True
+
         created = {}
 
         def _fake_create_environment(*, env_type, **kwargs):
@@ -762,9 +769,44 @@ class TestEnvironmentHints:
 
         line = _pb._probe_remote_backend("docker")
         assert created.get("env_type") == "docker"
+        assert created.get("cleaned") is True
+        assert created.get("cleanup_timeout") == 120.0
         assert line is not None
         assert "Linux 6.8.0" in line
         assert "root" in line
+
+    def test_probe_remote_backend_propagates_disabled_docker_network(self, monkeypatch):
+        """The informational probe must honor the configured air gap."""
+        import agent.prompt_builder as _pb
+        import tools.terminal_tool as _tt
+
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("TERMINAL_DOCKER_NETWORK", "false")
+        _pb._clear_backend_probe_cache()
+
+        class _FakeEnv:
+            def execute(self, cmd, timeout=None):
+                return {"returncode": 0, "output": "os=Linux\nkernel=x\nhome=/root\ncwd=/tmp\nuser=root\n"}
+
+            def cleanup(self):
+                created["cleaned"] = True
+
+            def wait_for_cleanup(self, timeout):
+                created["cleanup_timeout"] = timeout
+                return True
+
+        created = {}
+
+        def _fake_create_environment(**kwargs):
+            created.update(kwargs)
+            return _FakeEnv()
+
+        monkeypatch.setattr(_tt, "_create_environment", _fake_create_environment)
+
+        assert _pb._probe_remote_backend("docker") is not None
+        assert created.get("cleaned") is True
+        assert created.get("cleanup_timeout") == 120.0
+        assert created["container_config"]["docker_network"] is False
 
 
     def test_environment_hint_from_env_var_is_appended(self, monkeypatch):

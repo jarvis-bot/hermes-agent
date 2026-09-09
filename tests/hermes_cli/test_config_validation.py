@@ -1,5 +1,7 @@
 """Tests for config.yaml structure validation (validate_config_structure)."""
 
+import pytest
+
 
 from hermes_cli.config import (
     DEFAULT_CONFIG,
@@ -88,6 +90,41 @@ class TestConfigIssueDataclass:
         a = ConfigIssue("error", "msg", "hint")
         b = ConfigIssue("error", "msg", "hint")
         assert a == b
+
+
+class TestDockerCwdMountPolicyValidation:
+    @pytest.mark.parametrize("value", ["DISK", "", "volume", True, None])
+    def test_rejects_invalid_tmp_storage(self, value):
+        issues = validate_config_structure({
+            "terminal": {"docker_tmp_storage": value},
+        })
+        assert any(i.severity == "error" and "docker_tmp_storage" in i.message for i in issues)
+
+    @pytest.mark.parametrize("value", ["tmpfs", "disk"])
+    def test_accepts_valid_tmp_storage(self, value):
+        issues = validate_config_structure({
+            "terminal": {"docker_tmp_storage": value},
+        })
+        assert not any("docker_tmp_storage" in i.message for i in issues)
+
+    @pytest.mark.parametrize("value", ["write-mostly", [], {}, True, None])
+    def test_rejects_invalid_mount_mode(self, value):
+        issues = validate_config_structure({
+            "terminal": {"docker_cwd_mount_mode": value},
+        })
+        assert any(i.severity == "error" and "docker_cwd_mount_mode" in i.message for i in issues)
+
+    def test_rejects_non_absolute_path_mapping(self):
+        issues = validate_config_structure({
+            "terminal": {"docker_cwd_path_mappings": {"relative": "/host"}},
+        })
+        assert any(i.severity == "error" and "docker_cwd_path_mappings" in i.message for i in issues)
+
+    def test_rejects_non_absolute_allowed_root(self):
+        issues = validate_config_structure({
+            "terminal": {"docker_cwd_allowed_roots": ["relative"]},
+        })
+        assert any(i.severity == "error" and "docker_cwd_allowed_roots" in i.message for i in issues)
 
 
 class TestUnknownTopLevelKeys:
